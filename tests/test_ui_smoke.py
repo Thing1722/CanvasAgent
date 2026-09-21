@@ -91,6 +91,96 @@ def test_new_chat_button_creates_a_conversation(monkeypatch, tmp_path):
     assert len(harness.sidebar.button) > before
 
 
+def test_streamlit_markdown_accepts_latex_delimiters():
+    """Streamlit 1.50+ renders $...$ / $$ via KaTeX; this fails if markdown chokes on them."""
+    script = r"""
+import streamlit as st
+st.markdown(r"Inline $E=mc^2$ works.")
+st.markdown("Display:\n\n$$\n\\frac{a}{b}\n$$\n")
+st.write("rendered")
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception
+    bodies = [element.value for element in harness.markdown]
+    assert any("E=mc^2" in str(body) for body in bodies)
+    assert any("frac" in str(body) for body in bodies)
+
+
+def test_app_renders_seeded_math_and_assignment_instructions(monkeypatch, tmp_path):
+    import json
+    import sys
+    from pathlib import Path as P
+
+    sys.path.insert(0, str(P(__file__).resolve().parents[1]))
+    import app
+
+    db_path = tmp_path / "history.db"
+    store = app.ConversationStore(str(db_path))
+    conversation_id = store.create_conversation("Math chat")
+    store.add_message(conversation_id, {"role": "user", "content": "what does the formula mean?"})
+    store.add_message(
+        conversation_id,
+        {"role": "assistant", "content": r"That is the mass-energy relation $E=mc^2$."},
+    )
+    store.add_message(
+        conversation_id,
+        {
+            "role": "tool",
+            "name": "get_assignment_details",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {
+                    "assignment": {
+                        "title": "Homework 4",
+                        "instructions": r"Compute $\frac{1}{2}$ and then $$ \int_0^1 x\,dx $$.",
+                    }
+                }
+            ),
+        },
+    )
+    harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
+    assert not harness.exception
+    rendered = " ".join(str(element.value) for element in harness.markdown)
+    assert "E=mc^2" in rendered
+    assert r"\frac{1}{2}" in rendered or "frac" in rendered
+
+
+def test_content_preview_handles_html_tex_and_unknown_types():
+    """Exercise the shared preview used by open_file and open_url, without Canvas."""
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+app.render_content_preview(
+    b"<h1>Syllabus</h1><p>Grade is \\\\(x^2\\\\).</p>",
+    {{"filename": "s.html", "content_type": "text/html", "url": "https://example.com/s"}},
+    caption="html from example.com",
+    download_key="dl-html",
+)
+app.render_content_preview(
+    br"\\\\frac{{1}}{{2}}",
+    {{"filename": "snip.tex", "content_type": "text/x-tex"}},
+    caption="tex snippet",
+    download_key="dl-tex",
+)
+app.render_content_preview(
+    b"PK binary",
+    {{"filename": "slides.zip", "content_type": "application/zip"}},
+    caption="zip from Canvas",
+    download_key="dl-zip",
+)
+st.write("previewed")
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception
+    rendered = " ".join(str(element.value) for element in harness.markdown)
+    assert "previewed" in rendered
+    assert "$x^2$" in rendered or "x^2" in rendered
+    infos = [str(i.value) for i in harness.info]
+    assert any("cannot be previewed" in info for info in infos)
 def test_sidebar_timezone_defaults_to_pittsburgh(monkeypatch, tmp_path):
     harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
     assert not harness.exception
