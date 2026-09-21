@@ -2004,7 +2004,7 @@ def render_message(message: dict[str, Any], canvas: CanvasClient | None = None) 
         return
     if role == "user" and message.get("content"):
         with st.chat_message("user"):
-            st.markdown(message["content"])
+            st.markdown(to_streamlit_math(message["content"]))
 
 
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
