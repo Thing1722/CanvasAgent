@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -238,6 +240,7 @@ def test_settings_report_missing_env_vars():
     assert settings.missing == ["DEEPSEEK_API_KEY"]
     assert settings.canvas_base_url == app.DEFAULT_CANVAS_BASE_URL
     assert settings.model == "deepseek-flash"
+    assert settings.timezone == "America/New_York"
 
 
 def test_settings_read_base_url_from_env():
@@ -250,6 +253,28 @@ def test_settings_read_base_url_from_env():
     )
     assert settings.missing == []
     assert settings.canvas_base_url == "https://canvas.other.edu"
+
+
+def test_settings_read_timezone_from_env():
+    settings = app.load_settings(
+        {
+            "DEEPSEEK_API_KEY": "sk-test-key-123456",
+            "CANVAS_API_TOKEN": "canvas-test-token-123456",
+            "CANVAS_ASSISTANT_TZ": "America/Los_Angeles",
+        }
+    )
+    assert settings.timezone == "America/Los_Angeles"
+
+
+def test_settings_invalid_timezone_falls_back_to_pittsburgh():
+    settings = app.load_settings(
+        {
+            "DEEPSEEK_API_KEY": "sk-test-key-123456",
+            "CANVAS_API_TOKEN": "canvas-test-token-123456",
+            "CANVAS_ASSISTANT_TZ": "Not/A_Zone",
+        }
+    )
+    assert settings.timezone == "America/New_York"
 
 
 # --- Canvas data shaping ---------------------------------------------------
@@ -360,6 +385,149 @@ def test_parse_canvas_timestamp_handles_z_suffix_and_garbage():
     assert parsed == datetime(2026, 9, 21, 3, 59, tzinfo=timezone.utc)
     assert app.parse_canvas_timestamp("not a date") is None
     assert app.parse_canvas_timestamp(None) is None
+
+
+# --- student timezone (Pittsburgh default, never machine local) ------------
+
+# Canvas 11:59 PM Eastern on Oct 8 2026 is 03:59 UTC on Oct 9.
+PITTSBURGH_DUE = datetime(2026, 10, 9, 3, 59, tzinfo=timezone.utc)
+
+
+def _force_machine_tz(name: str) -> str | None:
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    if hasattr(time, "tzset"):
+        time.tzset()
+    return previous
+
+
+def _restore_machine_tz(previous: str | None) -> None:
+    if previous is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = previous
+    if hasattr(time, "tzset"):
+        time.tzset()
+
+
+@pytest.fixture
+def machine_tz_shanghai():
+    previous = _force_machine_tz("Asia/Shanghai")
+    try:
+        yield
+    finally:
+        _restore_machine_tz(previous)
+
+
+def test_default_timezone_is_pittsburgh_eastern():
+    assert app.DEFAULT_TIMEZONE == "America/New_York"
+    assert app.resolve_timezone_name(None) == "America/New_York"
+    assert app.resolve_timezone_name("") == "America/New_York"
+    assert app.as_zoneinfo(None).key == "America/New_York"
+
+
+def test_describe_due_defaults_to_pittsburgh_not_utc_offset():
+    described = app.describe_due(PITTSBURGH_DUE)
+    assert described["due_at"] == "2026-10-09T03:59:00Z"
+    assert described["due_at_local"] == "Thu Oct 08, 2026 11:59 PM EDT"
+
+
+def test_describe_due_follows_eastern_dst():
+    winter = datetime(2026, 1, 15, 16, 59, tzinfo=timezone.utc)
+    summer = datetime(2026, 7, 15, 15, 59, tzinfo=timezone.utc)
+    assert "EST" in app.describe_due(winter)["due_at_local"]
+    assert "EDT" in app.describe_due(summer)["due_at_local"]
+    assert "11:59 AM" in app.describe_due(winter)["due_at_local"]
+    assert "11:59 AM" in app.describe_due(summer)["due_at_local"]
+
+
+def test_describe_due_switching_zone_changes_local_clock():
+    pittsburgh = app.describe_due(PITTSBURGH_DUE, tz="America/New_York")
+    beijing = app.describe_due(PITTSBURGH_DUE, tz="Asia/Shanghai")
+    pacific = app.describe_due(PITTSBURGH_DUE, tz="America/Los_Angeles")
+    assert pittsburgh["due_at"] == beijing["due_at"] == pacific["due_at"] == "2026-10-09T03:59:00Z"
+    assert pittsburgh["due_at_local"] == "Thu Oct 08, 2026 11:59 PM EDT"
+    assert beijing["due_at_local"] == "Fri Oct 09, 2026 11:59 AM CST"
+    assert "PDT" in pacific["due_at_local"] or "PST" in pacific["due_at_local"]
+    assert pacific["due_at_local"] != pittsburgh["due_at_local"]
+
+
+def test_describe_due_ignores_machine_timezone_when_set_to_shanghai(machine_tz_shanghai):
+    machine_local = PITTSBURGH_DUE.astimezone().strftime("%a %b %d, %Y %I:%M %p %Z").strip()
+    assert "CST" in machine_local or "GMT+8" in machine_local or "Oct 09" in machine_local
+
+    described = app.describe_due(PITTSBURGH_DUE)
+    assert described["due_at_local"] == "Thu Oct 08, 2026 11:59 PM EDT"
+    assert described["due_at_local"] != machine_local
+    assert "CST" not in described["due_at_local"]
+    prompt = app.build_system_prompt(PITTSBURGH_DUE)
+    assert "America/New_York" in prompt
+    assert "EDT" in prompt
+    assert "Asia/Shanghai" not in prompt
+    assert "CST" not in prompt
+
+
+def test_days_until_is_relative_to_now_in_the_student_zone():
+    # Naive "now" is interpreted in the student zone, so the same clock reading
+    # is a different instant in Pittsburgh vs Beijing.
+    noon = datetime(2026, 10, 8, 12, 0)
+    pittsburgh = app.describe_due(PITTSBURGH_DUE, now=noon, tz="America/New_York")
+    beijing = app.describe_due(PITTSBURGH_DUE, now=noon, tz="Asia/Shanghai")
+    assert 0 < pittsburgh["days_until"] < 1
+    assert beijing["days_until"] > pittsburgh["days_until"]
+    aware_now = datetime(2026, 10, 8, 16, 0, tzinfo=timezone.utc)
+    assert (
+        app.describe_due(PITTSBURGH_DUE, now=aware_now, tz="America/New_York")["days_until"]
+        == app.describe_due(PITTSBURGH_DUE, now=aware_now, tz="Asia/Shanghai")["days_until"]
+    )
+
+
+def test_system_prompt_uses_student_timezone_not_machine(machine_tz_shanghai):
+    # 02:00 UTC on Sep 21 is still Sep 20 evening in Pittsburgh, already Sep 21 in Beijing.
+    now = datetime(2026, 9, 21, 2, 0, tzinfo=timezone.utc)
+    default_prompt = app.build_system_prompt(now)
+    assert "Sunday, September 20, 2026" in default_prompt
+    assert "America/New_York" in default_prompt
+    assert "EDT" in default_prompt
+
+    beijing_prompt = app.build_system_prompt(now, tz="Asia/Shanghai")
+    assert "Monday, September 21, 2026" in beijing_prompt
+    assert "Asia/Shanghai" in beijing_prompt
+    assert beijing_prompt != default_prompt
+
+
+def test_canvas_client_due_dates_follow_configured_timezone(client_factory):
+    client, _ = client_factory(
+        [
+            [{"id": 1, "name": "76-101"}],
+            [
+                {
+                    "id": 31,
+                    "name": "Homework 4",
+                    "due_at": "2026-10-09T03:59:00Z",
+                    "submission": {},
+                }
+            ],
+        ]
+    )
+    assert client.tz.key == "America/New_York"
+    matches = client.find_due_dates("Homework 4")
+    assert matches[0]["due_at"] == "2026-10-09T03:59:00Z"
+    assert matches[0]["due_at_local"] == "Thu Oct 08, 2026 11:59 PM EDT"
+
+    client.set_timezone("Asia/Shanghai")
+    switched = client._describe_due(app.parse_canvas_timestamp("2026-10-09T03:59:00Z"))
+    assert switched["due_at"] == "2026-10-09T03:59:00Z"
+    assert switched["due_at_local"] == "Fri Oct 09, 2026 11:59 AM CST"
+
+
+def test_store_persists_timezone_setting(tmp_path):
+    store = app.ConversationStore(str(tmp_path / "history.db"))
+    assert store.get_setting("timezone") is None
+    store.set_setting("timezone", "Asia/Shanghai")
+    assert store.get_setting("timezone") == "Asia/Shanghai"
+    again = app.ConversationStore(str(tmp_path / "history.db"))
+    assert again.get_setting("timezone") == "Asia/Shanghai"
 
 
 # --- course files ----------------------------------------------------------
@@ -684,7 +852,7 @@ def test_get_assignment_details_returns_prompt_and_submission_type(client_factor
     assert details["attached_files"] == [{"file_id": 4242, "filename": "CGA prompt"}]
     assert details["submission_status"]["workflow_state"] == "unsubmitted"
     assert [item["criterion"] for item in details["rubric"]] == ["Analysis", "Prose"]
-    assert details["due_at_local"]
+    assert details["due_at_local"] == "Thu Oct 08, 2026 11:59 PM EDT"
 
 
 def test_get_assignment_details_scans_courses_when_course_id_is_missing(client_factory):
@@ -842,7 +1010,7 @@ def test_store_schema_tables_exist(tmp_path):
     with sqlite3.connect(db_path) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
-    assert {"conversations", "messages"} <= tables
+    assert {"conversations", "messages", "settings"} <= tables
     assert {"conversation_id", "role", "content", "tool_calls", "tool_call_id", "name", "created_at"} <= columns
 
 
@@ -892,7 +1060,18 @@ def test_agent_turn_executes_tool_calls_then_answers(client_factory):
     assert json.loads(produced[1]["content"])["count"] == 1
     assert produced[-1]["content"] == "You are enrolled in Course A."
     assert deepseek.calls[0]["messages"][0]["role"] == "system"
+    assert "America/New_York" in deepseek.calls[0]["messages"][0]["content"]
     assert deepseek.calls[0]["tools"] == app.TOOL_SCHEMAS
+
+
+def test_agent_turn_system_prompt_follows_canvas_timezone(client_factory):
+    client, _ = client_factory([[]])
+    client.set_timezone("Asia/Shanghai")
+    deepseek = ScriptedDeepSeek([{"role": "assistant", "content": "hi"}])
+    app.run_agent_turn(deepseek, client, [{"role": "user", "content": "hi"}])
+    prompt = deepseek.calls[0]["messages"][0]["content"]
+    assert "Asia/Shanghai" in prompt
+    assert "America/New_York" not in prompt
 
 
 def test_agent_turn_stops_after_max_tool_rounds(client_factory):
@@ -1003,3 +1182,5 @@ def test_system_prompt_states_read_only_and_date():
     prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
     assert "read-only" in prompt
     assert "September 21, 2026" in prompt
+    assert "America/New_York" in prompt
+    assert "the machine's local timezone" not in prompt
