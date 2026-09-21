@@ -3193,6 +3193,14 @@ def render_file_panel(
     st.session_state.opened_files = files
     st.session_state.opened_files_cid = conversation_id
 
+    # Widget value from the iframe click is already in session_state on this
+    # rerun; apply it before we pass `collapsed` back as component args.
+    apply_files_rail_value(
+        st.session_state.get(files_rail.COMPONENT_KEY),
+        conversation_id=conversation_id,
+        files=files,
+    )
+
     chosen = sync_files_sidebar_selection(conversation_id, files)
     current = panel_entry_for_choice(chosen, files) if files else None
     collapsed = bool(st.session_state.get("files_sidebar_collapsed", False))
@@ -3216,6 +3224,9 @@ def render_file_panel(
         empty_copy=FILE_PANEL_EMPTY,
     )
     apply_files_rail_value(value, conversation_id=conversation_id, files=files)
+    if bool(st.session_state.get("files_sidebar_collapsed", False)) != collapsed:
+        st.rerun()
+
 
 
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
