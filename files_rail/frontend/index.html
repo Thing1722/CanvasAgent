@@ -92,7 +92,7 @@
             "; }\n" +
             '[data-testid="stHeader"], [data-testid="stToolbar"] {' +
             " padding-right: var(--canvas-files-rail-width) !important; }\n" +
-            '[data-testid="stMain"] {' +
+            '[data-testid="stAppScrollToBottomContainer"] {' +
             " padding-right: var(--canvas-files-rail-width) !important; }\n" +
             '[data-testid="stBottom"] {' +
             " right: var(--canvas-files-rail-width) !important; }\n" +
@@ -141,17 +141,13 @@
             vars.primary +
             "; font-size: 0.9rem; }\n" +
             "#canvas-files-rail-host .files-rail-toggle {" +
-            " pointer-events: auto; position: absolute; top: 50%; width: 18px; height: 56px;" +
+            " pointer-events: auto; position: fixed; top: 50%; right: 0; left: auto; width: 18px; height: 56px;" +
             " padding: 0; margin: 0; border: none; background: " +
-            vars.background +
+            vars.secondary +
             "; color: " +
             vars.text +
             "; cursor: pointer; display: flex; align-items: center; justify-content: center;" +
-            " transform: translateY(-50%); }\n" +
-            "#canvas-files-rail-host[data-collapsed='false'] .files-rail-toggle { left: -18px; right: auto; }\n" +
-            "#canvas-files-rail-host[data-collapsed='true'] .files-rail-toggle { right: 0; left: auto; background: " +
-            vars.secondary +
-            "; }\n" +
+            " transform: translateY(-50%); z-index: 1000021; }\n" +
             "#canvas-files-rail-host .files-rail-chevron {" +
             " width: 0; height: 0; border-top: 7px solid transparent; border-bottom: 7px solid transparent; }\n" +
             "#canvas-files-rail-host[data-collapsed='false'] .files-rail-chevron {" +

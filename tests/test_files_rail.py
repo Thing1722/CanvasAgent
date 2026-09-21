@@ -42,6 +42,7 @@ def test_frontend_is_a_declare_component_iframe():
     assert files_rail.HOST_ID in html
     assert files_rail.STYLE_ID in html
     assert "position: fixed" in html
+    assert "stAppScrollToBottomContainer" in html
     assert "doc.body.appendChild(host)" in html
     assert "st-key-files-sidebar" not in html
     assert "AppViewContainer" not in html
