@@ -20,6 +20,7 @@ in this file can submit an assignment, send a message or change Canvas state.
 
 from __future__ import annotations
 
+import hashlib
 import html as html_module
 import io
 import ipaddress
@@ -1931,6 +1932,22 @@ SCHEMA_STATEMENTS = (
         value TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS conversation_files (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        identity        TEXT NOT NULL,
+        kind            TEXT NOT NULL,
+        file_id         INTEGER,
+        url             TEXT,
+        filename        TEXT,
+        content_type    TEXT,
+        tool_call_id    TEXT,
+        created_at      TEXT NOT NULL,
+        UNIQUE (conversation_id, identity)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_conversation_files ON conversation_files (conversation_id, id)",
 )
 
 
@@ -1977,6 +1994,7 @@ class ConversationStore:
 
     def delete_conversation(self, conversation_id: int) -> None:
         with self._connect() as conn:
+            conn.execute("DELETE FROM conversation_files WHERE conversation_id = ?", (conversation_id,))
             conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
             conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
 
@@ -2042,6 +2060,45 @@ class ConversationStore:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    def add_opened_file(self, conversation_id: int, entry: dict[str, Any]) -> None:
+        """Remember a file opened in this chat. Same identity is stored once."""
+        identity = entry.get("identity")
+        if not identity:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO conversation_files (
+                    conversation_id, identity, kind, file_id, url, filename,
+                    content_type, tool_call_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    str(identity),
+                    entry.get("kind") or "file",
+                    entry.get("file_id"),
+                    entry.get("url"),
+                    entry.get("filename"),
+                    entry.get("content_type"),
+                    entry.get("tool_call_id"),
+                    _utcnow(),
+                ),
+            )
+
+    def list_opened_files(self, conversation_id: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT identity, kind, file_id, url, filename, content_type, tool_call_id
+                FROM conversation_files
+                WHERE conversation_id = ?
+                ORDER BY id
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -2247,6 +2304,9 @@ def run_agent_turn(
 # ---------------------------------------------------------------------------
 
 PAGE_TITLE = "CMU Canvas Study Assistant"
+FILE_PANEL_KEY_SUFFIX = "panel"
+FILE_PANEL_EMPTY = "No files opened in this chat yet."
+PANEL_URL_PREVIEW_TYPES = ("application/pdf", "image/")
 
 
 @st.cache_resource(show_spinner=False)
@@ -2291,17 +2351,22 @@ def render_tex_preview(source: str) -> None:
 _file_preview_seq = 0
 
 
-def next_file_preview_id(tool_call_id: str | None = None) -> str:
+def next_file_preview_id(tool_call_id: str | None = None, *, key_suffix: str = "") -> str:
     """Id for one file-preview instance in this Streamlit script run.
 
     Streamlit re-executes the file on every interaction, so the counter starts
     at 0 again. Pairing it with the tool message's ``tool_call_id`` keeps
     download / PDF widgets unique when the same Canvas file is opened twice
     (two tool messages, or history replay plus a new ``open_file``).
+    ``key_suffix`` distinguishes the right-hand file panel from in-chat previews
+    of the same file.
     """
     global _file_preview_seq
     _file_preview_seq += 1
     call = re.sub(r"[^A-Za-z0-9_-]", "_", str(tool_call_id or "nocall"))[:80]
+    suffix = re.sub(r"[^A-Za-z0-9_-]", "_", key_suffix)[:32]
+    if suffix:
+        return f"{call}-{_file_preview_seq}-{suffix}"
     return f"{call}-{_file_preview_seq}"
 
 
@@ -2355,6 +2420,7 @@ def render_file_preview(
     payload: dict[str, Any],
     *,
     tool_call_id: str | None = None,
+    key_suffix: str = "",
 ) -> None:
     """Show a Canvas file inline. Called on every rerun, hence the cache."""
     described = payload.get("file") or {}
@@ -2368,7 +2434,7 @@ def render_file_preview(
         return
 
     filename = described.get("filename") or f"file-{file_id}"
-    preview_id = next_file_preview_id(tool_call_id)
+    preview_id = next_file_preview_id(tool_call_id, key_suffix=key_suffix)
     render_content_preview(
         content,
         described,
@@ -2382,6 +2448,7 @@ def render_url_preview(
     payload: dict[str, Any],
     *,
     tool_call_id: str | None = None,
+    key_suffix: str = "",
 ) -> None:
     """Re-fetch and show an open_url result the same way Canvas files are shown."""
     described = payload.get("resource") or {}
@@ -2395,7 +2462,7 @@ def render_url_preview(
         return
     filename = described.get("filename") or filename_from_url(str(url), described.get("content_type") or "")
     host = urlparse(str(described.get("url") or url)).netloc
-    preview_id = next_file_preview_id(tool_call_id)
+    preview_id = next_file_preview_id(tool_call_id, key_suffix=key_suffix)
     render_content_preview(
         content,
         described,
@@ -2451,6 +2518,107 @@ def _tool_payload(message: dict[str, Any]) -> Any:
         return json.loads(message.get("content") or "{}")
     except json.JSONDecodeError:
         return None
+
+
+def _canvas_file_panel_entry(
+    file_dict: dict[str, Any], *, tool_call_id: str | None = None
+) -> dict[str, Any] | None:
+    file_id = file_dict.get("file_id")
+    if file_id in (None, ""):
+        return None
+    try:
+        file_id_int = int(file_id)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "kind": "file",
+        "identity": f"file:{file_id_int}",
+        "file_id": file_id_int,
+        "url": None,
+        "filename": file_dict.get("filename") or f"file-{file_id_int}",
+        "content_type": file_dict.get("content_type"),
+        "tool_call_id": tool_call_id,
+    }
+
+
+def _url_panel_entry(
+    resource: dict[str, Any],
+    url: str | None,
+    *,
+    tool_call_id: str | None = None,
+) -> dict[str, Any] | None:
+    raw = str(url or resource.get("url") or "").strip()
+    if not raw:
+        return None
+    ctype = (resource.get("content_type") or "").split(";")[0].strip().lower()
+    if not (ctype == "application/pdf" or ctype.startswith("image/")):
+        return None
+    filename = resource.get("filename") or filename_from_url(raw, ctype)
+    return {
+        "kind": "url",
+        "identity": f"url:{raw}",
+        "file_id": None,
+        "url": raw,
+        "filename": filename,
+        "content_type": resource.get("content_type"),
+        "tool_call_id": tool_call_id,
+    }
+
+
+def opened_file_entries_from_tool_message(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Files this chat opened: Canvas files, URL PDFs/images, submission attachments."""
+    if message.get("role") != "tool":
+        return []
+    payload = _tool_payload(message)
+    if not isinstance(payload, dict) or payload.get("error"):
+        return []
+    name = message.get("name")
+    tool_call_id = message.get("tool_call_id")
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(entry: dict[str, Any] | None) -> None:
+        if not entry or entry["identity"] in seen:
+            return
+        seen.add(entry["identity"])
+        entries.append(entry)
+
+    if payload.get("file") and name in {"open_file", "open_url"}:
+        add(_canvas_file_panel_entry(payload["file"], tool_call_id=tool_call_id))
+    elif name == "open_url" and isinstance(payload.get("resource"), dict):
+        add(
+            _url_panel_entry(
+                payload["resource"],
+                payload.get("url"),
+                tool_call_id=tool_call_id,
+            )
+        )
+    elif name == "get_my_submission" and isinstance(payload.get("submission"), dict):
+        submission = payload["submission"]
+        for attachment in submission.get("attachments") or []:
+            if isinstance(attachment, dict):
+                add(_canvas_file_panel_entry(attachment, tool_call_id=tool_call_id))
+        for comment in submission.get("comments") or []:
+            if not isinstance(comment, dict):
+                continue
+            for attachment in comment.get("attachments") or []:
+                if isinstance(attachment, dict):
+                    add(_canvas_file_panel_entry(attachment, tool_call_id=tool_call_id))
+    return entries
+
+
+def remember_opened_files(
+    store: ConversationStore, conversation_id: int, message: dict[str, Any]
+) -> None:
+    for entry in opened_file_entries_from_tool_message(message):
+        store.add_opened_file(conversation_id, entry)
+
+
+def remember_opened_files_from_messages(
+    store: ConversationStore, conversation_id: int, messages: list[dict[str, Any]]
+) -> None:
+    for message in messages:
+        remember_opened_files(store, conversation_id, message)
 
 
 def assistant_is_user_facing(message: dict[str, Any]) -> bool:
@@ -2633,6 +2801,85 @@ def render_conversation(
         render_agent_turn(turn, canvas)
 
 
+def panel_button_key(conversation_id: int, identity: str) -> str:
+    digest = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:12]
+    return f"panel-pick-{conversation_id}-{digest}"
+
+
+def render_panel_file(canvas: CanvasClient, entry: dict[str, Any]) -> None:
+    """Preview the selected file in the right-hand panel (separate widget keys)."""
+    suffix = FILE_PANEL_KEY_SUFFIX
+    tool_call_id = entry.get("tool_call_id")
+    if entry.get("kind") == "url":
+        render_url_preview(
+            canvas,
+            {
+                "url": entry.get("url"),
+                "resource": {
+                    "url": entry.get("url"),
+                    "filename": entry.get("filename"),
+                    "content_type": entry.get("content_type"),
+                },
+            },
+            tool_call_id=tool_call_id,
+            key_suffix=suffix,
+        )
+        return
+    render_file_preview(
+        canvas,
+        {
+            "file": {
+                "file_id": entry.get("file_id"),
+                "filename": entry.get("filename"),
+                "content_type": entry.get("content_type"),
+            }
+        },
+        tool_call_id=tool_call_id,
+        key_suffix=suffix,
+    )
+
+
+def render_file_panel(
+    store: ConversationStore,
+    conversation_id: int,
+    canvas: CanvasClient | None = None,
+) -> None:
+    """Right-hand list of files opened in this conversation; chat is unchanged."""
+    files = store.list_opened_files(conversation_id)
+    st.session_state.opened_files = files
+    st.session_state.opened_files_cid = conversation_id
+    st.subheader("Files")
+    if not files:
+        st.caption(FILE_PANEL_EMPTY)
+        return
+    if st.session_state.get("panel_selected_cid") != conversation_id:
+        st.session_state.panel_selected = None
+        st.session_state.panel_selected_cid = conversation_id
+    selected = st.session_state.get("panel_selected")
+    for entry in files:
+        identity = entry["identity"]
+        label = entry.get("filename") or identity
+        is_selected = identity == selected
+        if st.button(
+            ("● " if is_selected else "") + str(label),
+            key=panel_button_key(conversation_id, identity),
+            width="stretch",
+            type="primary" if is_selected else "secondary",
+        ):
+            st.session_state.panel_selected = identity
+            st.session_state.panel_selected_cid = conversation_id
+            st.rerun()
+    current = next((entry for entry in files if entry["identity"] == selected), None)
+    if current is None or canvas is None:
+        return
+    st.divider()
+    try:
+        render_panel_file(canvas, current)
+    except Exception as exc:
+        logger.exception("Failed to render file panel preview")
+        st.error(redact(exc))
+
+
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
     with st.sidebar:
         st.subheader("Configuration")
@@ -2691,7 +2938,7 @@ def main() -> None:
     load_dotenv()
     settings = load_settings()
 
-    st.set_page_config(page_title=PAGE_TITLE, page_icon="📚", layout="centered")
+    st.set_page_config(page_title=PAGE_TITLE, page_icon="📚", layout="wide")
     st.title(PAGE_TITLE)
     st.caption(
         "Ask about your courses, upcoming work, due dates, files and links. "
@@ -2721,37 +2968,43 @@ def main() -> None:
     deepseek = get_deepseek_client(settings, f"{settings.deepseek_base_url}:{settings.model}")
 
     history = store.get_messages(conversation_id)
-    render_conversation(history, canvas)
+    remember_opened_files_from_messages(store, conversation_id, history)
 
-    prompt = st.chat_input("What's due this week?")
-    if not prompt:
-        return
+    chat_col, files_col = st.columns([2, 1], gap="large")
+    with chat_col:
+        render_conversation(history, canvas)
+        prompt = st.chat_input("What's due this week?")
+        if prompt:
+            user_message = {"role": "user", "content": prompt}
+            store.add_message(conversation_id, user_message)
+            if not history:
+                store.set_title(conversation_id, prompt.strip().splitlines()[0])
+            render_message(user_message)
+            history.append(user_message)
 
-    user_message = {"role": "user", "content": prompt}
-    store.add_message(conversation_id, user_message)
-    if not history:
-        store.set_title(conversation_id, prompt.strip().splitlines()[0])
-    render_message(user_message)
-    history.append(user_message)
+            produced: list[dict[str, Any]] = []
 
-    produced: list[dict[str, Any]] = []
+            def persist_and_render(message: dict[str, Any]) -> None:
+                # Keep the full tool loop in SQLite so get_messages can rebuild DeepSeek
+                # context. Student-facing bubbles wait until the turn finishes so the
+                # final answer appears first (spinner already covers in-flight progress).
+                store.add_message(conversation_id, message)
+                remember_opened_files(store, conversation_id, message)
+                produced.append(message)
 
-    def persist_and_render(message: dict[str, Any]) -> None:
-        # Keep the full tool loop in SQLite so get_messages can rebuild DeepSeek
-        # context. Student-facing bubbles wait until the turn finishes so the
-        # final answer appears first (spinner already covers in-flight progress).
-        store.add_message(conversation_id, message)
-        produced.append(message)
+            with st.spinner("Checking Canvas..."):
+                try:
+                    run_agent_turn(deepseek, canvas, history, on_message=persist_and_render)
+                except Exception as exc:
+                    # Same Streamlit rerun issue as dispatch_tool: a cached client may
+                    # raise an exception class from a previous script run.
+                    st.error(redact(exc))
 
-    with st.spinner("Checking Canvas..."):
-        try:
-            run_agent_turn(deepseek, canvas, history, on_message=persist_and_render)
-        except Exception as exc:
-            # Same Streamlit rerun issue as dispatch_tool: a cached client may
-            # raise an exception class from a previous script run.
-            st.error(redact(exc))
+            render_agent_turn(produced, canvas)
 
-    render_agent_turn(produced, canvas)
+    with files_col:
+        with st.container(border=True):
+            render_file_panel(store, conversation_id, canvas)
 
 
 if __name__ == "__main__":
