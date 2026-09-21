@@ -2503,12 +2503,6 @@ FILE_PANEL_KEY_SUFFIX = "panel"
 FILE_PANEL_EMPTY = "No files opened in this chat yet."
 PANEL_URL_PREVIEW_TYPES = ("application/pdf", "image/")
 FILES_SIDEBAR_KEY = "files-sidebar"
-FILES_SIDEBAR_CSS_CLASS = f"st-key-{FILES_SIDEBAR_KEY}"
-FILES_SIDEBAR_DEFAULT_PX = 320
-FILES_SIDEBAR_MIN_PX = 240
-FILES_SIDEBAR_MAX_PX = 720
-FILES_SIDEBAR_COLLAPSED_PX = 0
-FILES_SIDEBAR_TOGGLE_MS = 300
 FILES_SIDEBAR_COLLAPSE_ICON = ":material/keyboard_double_arrow_right:"
 FILES_SIDEBAR_EXPAND_ICON = ":material/keyboard_double_arrow_left:"
 
@@ -3051,182 +3045,6 @@ def sync_files_sidebar_selection(conversation_id: int, files: list[dict[str, Any
     return chosen
 
 
-def files_sidebar_css(collapsed: bool) -> str:
-    """CSS that overlays the keyed files container and insets the whole main pane.
-
-    The previous right-rail attempt padded ``.block-container`` and pinned the
-    nearest ``stVerticalBlock``. That shoved the transcript into the rail
-    (the main column is a VerticalBlock) and left the sticky chat input
-    stretching across the gap (``stBottom`` is a sibling of the block
-    container, not inside it). Inset ``stAppViewContainer`` instead, and pin
-    only ``.st-key-files-sidebar``. Collapse matches the left Streamlit
-    sidebar: double-arrow icon and a 300ms slide.
-    """
-    gutter = FILES_SIDEBAR_COLLAPSED_PX if collapsed else FILES_SIDEBAR_DEFAULT_PX
-    transform = "translateX(100%)" if collapsed else "translateX(0)"
-    ms = FILES_SIDEBAR_TOGGLE_MS
-    return f"""
-<style>
-@property --files-sidebar-width {{
-  syntax: "<length>";
-  inherits: true;
-  initial-value: {FILES_SIDEBAR_DEFAULT_PX}px;
-}}
-:root {{
-  --files-sidebar-width: {gutter}px;
-  --files-sidebar-panel: {FILES_SIDEBAR_DEFAULT_PX}px;
-}}
-[data-testid="stAppViewContainer"] {{
-  padding-right: var(--files-sidebar-width) !important;
-  transition: padding-right {ms}ms;
-}}
-.{FILES_SIDEBAR_CSS_CLASS}:not(:has([data-testid="stChatMessage"])) {{
-  position: fixed !important;
-  top: 0;
-  right: 0;
-  height: 100vh;
-  width: var(--files-sidebar-panel) !important;
-  max-width: var(--files-sidebar-panel) !important;
-  min-width: 0 !important;
-  background: var(--secondary-background-color);
-  border-left: 1px solid rgba(49, 51, 63, 0.2);
-  z-index: 100001;
-  overflow-x: hidden;
-  overflow-y: auto;
-  padding: 3.75rem 0.85rem 2rem 0.85rem !important;
-  box-sizing: border-box;
-  transform: {transform};
-  transition: transform {ms}ms, min-width {ms}ms, max-width {ms}ms;
-  opacity: 1 !important;
-  pointer-events: auto !important;
-}}
-.{FILES_SIDEBAR_CSS_CLASS} [data-stale="true"] {{
-  opacity: 1 !important;
-  pointer-events: auto !important;
-}}
-.{FILES_SIDEBAR_CSS_CLASS} [data-testid="stHtml"],
-.{FILES_SIDEBAR_CSS_CLASS} [data-testid="stIFrame"],
-.{FILES_SIDEBAR_CSS_CLASS} iframe {{
-  display: none !important;
-  height: 0 !important;
-  width: 0 !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  overflow: hidden !important;
-  position: absolute !important;
-  border: 0 !important;
-}}
-.st-key-files-sidebar-expand {{
-  position: fixed !important;
-  top: 0.45rem;
-  right: 0.35rem;
-  z-index: 100002;
-  width: auto !important;
-  min-width: 0 !important;
-  max-width: none !important;
-}}
-.st-key-files-sidebar-collapse,
-.st-key-files-sidebar-expand {{
-  background: transparent !important;
-}}
-.files-sidebar-resizer {{
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 6px;
-  height: 100%;
-  cursor: col-resize;
-  z-index: 2;
-}}
-.files-sidebar-resizer:hover {{
-  background: rgba(151, 166, 195, 0.35);
-}}
-</style>
-"""
-
-
-def files_sidebar_script(collapsed: bool) -> str:
-    """JS to restore the dragged width and attach a resize handle to the keyed host."""
-    return """
-<script>
-(function () {
-  const doc = window.parent.document;
-  const STORAGE = "canvasAssistantFilesSidebarWidth";
-  const MIN = __MIN__;
-  const MAX = __MAX__;
-  const DEF = __DEF__;
-  const COLLAPSED = __COLLAPSED_PX__;
-  const collapsed = __COLLAPSED__;
-  const HOST_SEL = ".__HOST__";
-  function apply(px) {
-    const width = Math.max(MIN, Math.min(MAX, Math.round(px)));
-    doc.documentElement.style.setProperty("--files-sidebar-panel", width + "px");
-    if (!collapsed) {
-      doc.documentElement.style.setProperty("--files-sidebar-width", width + "px");
-    }
-    try { localStorage.setItem(STORAGE, String(width)); } catch (err) {}
-  }
-  const stored = parseInt(localStorage.getItem(STORAGE) || DEF, 10);
-  const restored = Number.isFinite(stored) ? stored : DEF;
-  apply(restored);
-  if (collapsed) {
-    doc.documentElement.style.setProperty("--files-sidebar-width", COLLAPSED + "px");
-  }
-  function findHost() {
-    const host = doc.querySelector(HOST_SEL);
-    if (!host) return null;
-    if (host.querySelector("[data-testid='stChatMessage']")) return null;
-    return host;
-  }
-  function mount() {
-    const host = findHost();
-    if (!host) return;
-    let handle = host.querySelector(":scope > .files-sidebar-resizer");
-    if (collapsed) {
-      if (handle) handle.remove();
-      return;
-    }
-    if (!handle) {
-      handle = doc.createElement("div");
-      handle.className = "files-sidebar-resizer";
-      host.insertBefore(handle, host.firstChild);
-      handle.addEventListener("mousedown", function (event) {
-        event.preventDefault();
-        const startX = event.clientX;
-        const startW = parseInt(
-    getComputedStyle(doc.documentElement).getPropertyValue("--files-sidebar-panel"),
-          10
-        ) || DEF;
-        function move(ev) { apply(startW + (startX - ev.clientX)); }
-        function up() {
-          doc.removeEventListener("mousemove", move);
-          doc.removeEventListener("mouseup", up);
-        }
-        doc.addEventListener("mousemove", move);
-        doc.addEventListener("mouseup", up);
-      });
-    }
-  }
-  mount();
-  const observer = new MutationObserver(mount);
-  observer.observe(doc.body, { childList: true, subtree: true });
-})();
-</script>
-""".replace("__MIN__", str(FILES_SIDEBAR_MIN_PX)).replace(
-        "__MAX__", str(FILES_SIDEBAR_MAX_PX)
-    ).replace("__DEF__", str(FILES_SIDEBAR_DEFAULT_PX)).replace(
-        "__COLLAPSED_PX__", str(FILES_SIDEBAR_COLLAPSED_PX)
-    ).replace("__COLLAPSED__", "true" if collapsed else "false").replace(
-        "__HOST__", FILES_SIDEBAR_CSS_CLASS
-    )
-
-
-def inject_files_sidebar_chrome(collapsed: bool) -> None:
-    """Match the left Streamlit sidebar: fixed rail, collapse, drag-to-resize."""
-    st.html(files_sidebar_css(collapsed))
-    st.iframe(files_sidebar_script(collapsed), height=1, width=1)
-
-
 def render_panel_file(canvas: CanvasClient, entry: dict[str, Any]) -> None:
     """Preview the selected file in the right-hand panel (separate widget keys)."""
     suffix = FILE_PANEL_KEY_SUFFIX
@@ -3265,61 +3083,60 @@ def render_file_panel(
     conversation_id: int,
     canvas: CanvasClient | None = None,
 ) -> None:
-    """Right-hand files sidebar (collapsible/resizable); chat transcript is unchanged."""
+    """Right-hand files column; chat transcript is unchanged."""
     collapsed = bool(st.session_state.get("files_sidebar_collapsed", False))
 
     files = store.list_opened_files(conversation_id)
     st.session_state.opened_files = files
     st.session_state.opened_files_cid = conversation_id
 
-    with st.container(key=FILES_SIDEBAR_KEY):
-        inject_files_sidebar_chrome(collapsed)
-        if not collapsed:
-            header_title, header_collapse = st.columns([6, 1])
-            with header_title:
-                st.subheader("Files")
-            with header_collapse:
-                if st.button(
-                    FILES_SIDEBAR_COLLAPSE_ICON,
-                    key="files-sidebar-collapse",
-                    type="tertiary",
-                    help="Hide files sidebar",
-                ):
-                    st.session_state.files_sidebar_collapsed = True
-                    st.rerun()
-
-            if not files:
-                st.caption(FILE_PANEL_EMPTY)
-            else:
-                lookup = {entry["identity"]: entry for entry in files}
-                identities = [entry["identity"] for entry in files]
-                sync_files_sidebar_selection(conversation_id, files)
-                chosen = st.selectbox(
-                    "Opened files",
-                    options=identities,
-                    format_func=lambda ident: files_sidebar_label(lookup[ident]),
-                    key=panel_select_key(conversation_id),
-                    label_visibility="collapsed",
-                    help="Files opened in this chat. The newest file is selected automatically.",
-                )
-                st.session_state.panel_selected = chosen
-                current = panel_entry_for_choice(chosen, files)
-                if current is not None and canvas is not None:
-                    try:
-                        render_panel_file(canvas, current)
-                    except Exception as exc:
-                        logger.exception("Failed to render file panel preview")
-                        st.error(redact(exc))
-
     if collapsed:
         if st.button(
             FILES_SIDEBAR_EXPAND_ICON,
             key="files-sidebar-expand",
             type="tertiary",
-            help="Show files sidebar",
+            help="Show files panel",
         ):
             st.session_state.files_sidebar_collapsed = False
             st.rerun()
+        return
+
+    with st.container(key=FILES_SIDEBAR_KEY, border=True):
+        header_title, header_collapse = st.columns([6, 1])
+        with header_title:
+            st.subheader("Files")
+        with header_collapse:
+            if st.button(
+                FILES_SIDEBAR_COLLAPSE_ICON,
+                key="files-sidebar-collapse",
+                type="tertiary",
+                help="Hide files panel",
+            ):
+                st.session_state.files_sidebar_collapsed = True
+                st.rerun()
+
+        if not files:
+            st.caption(FILE_PANEL_EMPTY)
+        else:
+            lookup = {entry["identity"]: entry for entry in files}
+            identities = [entry["identity"] for entry in files]
+            sync_files_sidebar_selection(conversation_id, files)
+            chosen = st.selectbox(
+                "Opened files",
+                options=identities,
+                format_func=lambda ident: files_sidebar_label(lookup[ident]),
+                key=panel_select_key(conversation_id),
+                label_visibility="collapsed",
+                help="Files opened in this chat. The newest file is selected automatically.",
+            )
+            st.session_state.panel_selected = chosen
+            current = panel_entry_for_choice(chosen, files)
+            if current is not None and canvas is not None:
+                try:
+                    render_panel_file(canvas, current)
+                except Exception as exc:
+                    logger.exception("Failed to render file panel preview")
+                    st.error(redact(exc))
 
 
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
@@ -3412,13 +3229,9 @@ def main() -> None:
     history = store.get_messages(conversation_id)
     remember_opened_files_from_messages(store, conversation_id, history)
 
-    # Draw the files rail before any blocking work so Streamlit does not mark
-    # it stale (white / unclickable) while the agent spinner is running.
-    render_file_panel(store, conversation_id, canvas)
-
-    render_conversation(history, canvas)
-    prompt = st.chat_input("What's due this week?")
-    if prompt:
+    def handle_prompt(prompt: str | None) -> None:
+        if not prompt:
+            return
         user_message = {"role": "user", "content": prompt}
         store.add_message(conversation_id, user_message)
         if not history:
@@ -3449,6 +3262,24 @@ def main() -> None:
         after = [entry["identity"] for entry in store.list_opened_files(conversation_id)]
         if after != before:
             st.rerun()
+
+    collapsed = bool(st.session_state.get("files_sidebar_collapsed", False))
+    # Native columns (not JS-docked widgets). Moving a Streamlit block into
+    # AppViewContainer duplicated the rail on every rerun. Draw the files
+    # column first so a spinner in the chat column cannot mark it stale.
+    if collapsed:
+        _, expand_col = st.columns([12, 1])
+        with expand_col:
+            render_file_panel(store, conversation_id, canvas)
+        render_conversation(history, canvas)
+        handle_prompt(st.chat_input("What's due this week?"))
+    else:
+        chat_col, files_col = st.columns([2, 1], gap="large")
+        with files_col:
+            render_file_panel(store, conversation_id, canvas)
+        with chat_col:
+            render_conversation(history, canvas)
+            handle_prompt(st.chat_input("What's due this week?"))
 
 
 if __name__ == "__main__":
