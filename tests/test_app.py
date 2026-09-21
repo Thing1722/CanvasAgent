@@ -1189,6 +1189,8 @@ def test_system_prompt_states_read_only_and_date():
     prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
     assert "read-only" in prompt
     assert "September 21, 2026" in prompt
+    assert "America/New_York" in prompt
+    assert "the machine's local timezone" not in prompt
     assert "open_url" in prompt
     assert "$...$" in prompt
 
@@ -1448,6 +1450,3 @@ def test_canvas_file_id_from_url_only_matches_configured_origin():
     assert app.canvas_file_id_from_url(f"{BASE_URL}/files/99/download", BASE_URL) == 99
     assert app.canvas_file_id_from_url("https://evil.example.com/files/99", BASE_URL) is None
     assert app.canvas_file_id_from_url("https://example.com/midterm.pdf", BASE_URL) is None
-
-    assert "America/New_York" in prompt
-    assert "the machine's local timezone" not in prompt
