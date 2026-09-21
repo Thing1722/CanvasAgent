@@ -191,10 +191,6 @@ Chats are stored in a local SQLite database (`canvas_assistant.db` next to `app.
 wherever `CANVAS_ASSISTANT_DB` points). Nothing leaves your machine. Delete individual chats with
 the ✕ in the sidebar, or delete the `.db` file to wipe everything. The file is git-ignored.
 
-Opened files for the current chat appear in a **right-hand sidebar** (same idea as the left
-config sidebar: collapse it, drag the edge to resize). A dropdown lists those files and
-selects the newest one automatically; the transcript still shows previews inline.
-
 ## Tests
 
 No Canvas or DeepSeek credentials are needed — Canvas HTTP traffic is faked at the transport layer

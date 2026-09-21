@@ -20,6 +20,7 @@ in this file can submit an assignment, send a message or change Canvas state.
 
 from __future__ import annotations
 
+import hashlib
 import html as html_module
 import io
 import ipaddress
@@ -2502,10 +2503,6 @@ PAGE_TITLE = "CMU Canvas Study Assistant"
 FILE_PANEL_KEY_SUFFIX = "panel"
 FILE_PANEL_EMPTY = "No files opened in this chat yet."
 PANEL_URL_PREVIEW_TYPES = ("application/pdf", "image/")
-FILES_SIDEBAR_DEFAULT_PX = 320
-FILES_SIDEBAR_MIN_PX = 240
-FILES_SIDEBAR_MAX_PX = 720
-FILES_SIDEBAR_COLLAPSED_PX = 36
 
 
 @st.cache_resource(show_spinner=False)
@@ -3000,163 +2997,14 @@ def render_conversation(
         render_agent_turn(turn, canvas)
 
 
-def panel_select_key(conversation_id: int) -> str:
-    return f"files-sidebar-choice-{int(conversation_id)}"
+def panel_button_key(conversation_id: int, identity: str) -> str:
+    digest = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:12]
+    return f"panel-pick-{conversation_id}-{digest}"
 
 
-def files_sidebar_label(entry: dict[str, Any]) -> str:
-    return str(entry.get("filename") or entry.get("url") or entry.get("identity") or "file")
-
-
-def panel_entry_for_choice(
-    chosen: str | None, files: list[dict[str, Any]]
-) -> dict[str, Any] | None:
-    """Resolve a selectbox value that may be an identity or a display label."""
-    if not chosen:
-        return None
-    for entry in files:
-        if entry.get("identity") == chosen:
-            return entry
-    matches = [entry for entry in files if files_sidebar_label(entry) == chosen]
-    return matches[-1] if matches else None
-
-
-def sync_files_sidebar_selection(conversation_id: int, files: list[dict[str, Any]]) -> str | None:
-    """Point the dropdown at the newest file when one is added or the chat changes."""
-    if not files:
-        st.session_state.panel_selected = None
-        st.session_state.panel_selected_cid = conversation_id
-        st.session_state.panel_latest_seen = None
-        return None
-    identities = [entry["identity"] for entry in files]
-    latest = identities[-1]
-    widget_key = panel_select_key(conversation_id)
-    chat_changed = st.session_state.get("panel_selected_cid") != conversation_id
-    new_file = st.session_state.get("panel_latest_seen") != latest
-    if chat_changed or new_file or widget_key not in st.session_state:
-        st.session_state[widget_key] = latest
-        st.session_state.panel_selected = latest
-        st.session_state.panel_selected_cid = conversation_id
-        st.session_state.panel_latest_seen = latest
-    chosen = st.session_state.get(widget_key) or latest
-    if chosen not in identities:
-        chosen = latest
-        st.session_state[widget_key] = latest
-    st.session_state.panel_selected = chosen
-    return chosen
-
-
-def inject_files_sidebar_chrome(collapsed: bool) -> None:
-    """Match the left Streamlit sidebar: fixed rail, collapse, drag-to-resize."""
-
-    width = FILES_SIDEBAR_COLLAPSED_PX if collapsed else FILES_SIDEBAR_DEFAULT_PX
-    st.markdown(
-        f"""
-<style>
-:root {{
-  --files-sidebar-width: {width}px;
-}}
-[data-testid="stAppViewContainer"] .main .block-container {{
-  padding-right: calc(var(--files-sidebar-width) + 1.25rem) !important;
-}}
-.files-sidebar-root {{
-  display: none;
-}}
-.files-right-sidebar {{
-  position: fixed !important;
-  top: 0;
-  right: 0;
-  height: 100vh;
-  width: var(--files-sidebar-width) !important;
-  max-width: var(--files-sidebar-width) !important;
-  background: var(--secondary-background-color);
-  border-left: 1px solid rgba(49, 51, 63, 0.2);
-  z-index: 100;
-  overflow-x: hidden;
-  overflow-y: auto;
-  padding: 3.75rem 0.85rem 2rem 0.85rem !important;
-  box-sizing: border-box;
-}}
-.files-sidebar-resizer {{
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 6px;
-  height: 100%;
-  cursor: ew-resize;
-  z-index: 2;
-}}
-.files-sidebar-resizer:hover {{
-  background: rgba(151, 166, 195, 0.35);
-}}
-</style>
-""",
-        unsafe_allow_html=True,
-    )
-    collapsed_js = "true" if collapsed else "false"
-    st.iframe(
-        f"""<!DOCTYPE html><html><body>
-<script>
-(function () {{
-  const doc = window.parent.document;
-  const STORAGE = "canvasAssistantFilesSidebarWidth";
-  const MIN = {FILES_SIDEBAR_MIN_PX};
-  const MAX = {FILES_SIDEBAR_MAX_PX};
-  const DEF = {FILES_SIDEBAR_DEFAULT_PX};
-  const collapsed = {collapsed_js};
-  function apply(px) {{
-    const width = Math.max(MIN, Math.min(MAX, Math.round(px)));
-    doc.documentElement.style.setProperty("--files-sidebar-width", width + "px");
-    try {{ localStorage.setItem(STORAGE, String(width)); }} catch (err) {{}}
-  }}
-  if (!collapsed) {{
-    const stored = parseInt(localStorage.getItem(STORAGE) || DEF, 10);
-    apply(Number.isFinite(stored) ? stored : DEF);
-  }} else {{
-    doc.documentElement.style.setProperty("--files-sidebar-width", "{FILES_SIDEBAR_COLLAPSED_PX}px");
-  }}
-  function mount() {{
-    const root = doc.querySelector(".files-sidebar-root");
-    if (!root) return;
-    const host = root.closest("[data-testid='stVerticalBlock']");
-    if (!host) return;
-    host.classList.add("files-right-sidebar");
-    let handle = host.querySelector(":scope > .files-sidebar-resizer");
-    if (collapsed) {{
-      if (handle) handle.remove();
-      return;
-    }}
-    if (!handle) {{
-      handle = doc.createElement("div");
-      handle.className = "files-sidebar-resizer";
-      host.insertBefore(handle, host.firstChild);
-      handle.addEventListener("mousedown", function (event) {{
-        event.preventDefault();
-        const startX = event.clientX;
-        const startW = parseInt(
-          getComputedStyle(doc.documentElement).getPropertyValue("--files-sidebar-width"),
-          10
-        ) || DEF;
-        function move(ev) {{ apply(startW + (startX - ev.clientX)); }}
-        function up() {{
-          doc.removeEventListener("mousemove", move);
-          doc.removeEventListener("mouseup", up);
-        }}
-        doc.addEventListener("mousemove", move);
-        doc.addEventListener("mouseup", up);
-      }});
-    }}
-  }}
-  mount();
-  const observer = new MutationObserver(mount);
-  observer.observe(doc.body, {{ childList: true, subtree: true }});
-}})();
-</script>
-</body></html>
-""",
-        height=1,
-        width=1,
-    )
+def _select_panel_file(identity: str, conversation_id: int) -> None:
+    st.session_state.panel_selected = identity
+    st.session_state.panel_selected_cid = conversation_id
 
 
 def render_panel_file(canvas: CanvasClient, entry: dict[str, Any]) -> None:
@@ -3197,48 +3045,35 @@ def render_file_panel(
     conversation_id: int,
     canvas: CanvasClient | None = None,
 ) -> None:
-    """Right-hand files sidebar (collapsible/resizable); chat transcript is unchanged."""
-    collapsed = bool(st.session_state.get("files_sidebar_collapsed", False))
-    inject_files_sidebar_chrome(collapsed)
-    st.markdown('<div class="files-sidebar-root"></div>', unsafe_allow_html=True)
-
+    """Right-hand list of files opened in this conversation; chat is unchanged."""
     files = store.list_opened_files(conversation_id)
     st.session_state.opened_files = files
     st.session_state.opened_files_cid = conversation_id
-
-    if collapsed:
-        if st.button("‹", key="files-sidebar-expand", help="Show files sidebar"):
-            st.session_state.files_sidebar_collapsed = False
-            st.rerun()
-        return
-
-    header_title, header_collapse = st.columns([6, 1])
-    with header_title:
-        st.subheader("Files")
-    with header_collapse:
-        if st.button("›", key="files-sidebar-collapse", help="Hide files sidebar"):
-            st.session_state.files_sidebar_collapsed = True
-            st.rerun()
-
+    st.subheader("Files")
     if not files:
         st.caption(FILE_PANEL_EMPTY)
         return
-
-    identities = [entry["identity"] for entry in files]
-    lookup = {entry["identity"]: entry for entry in files}
-    sync_files_sidebar_selection(conversation_id, files)
-    chosen = st.selectbox(
-        "Opened files",
-        options=identities,
-        format_func=lambda ident: files_sidebar_label(lookup[ident]),
-        key=panel_select_key(conversation_id),
-        label_visibility="collapsed",
-        help="Files opened in this chat. The newest file is selected automatically.",
-    )
-    st.session_state.panel_selected = chosen
-    current = panel_entry_for_choice(chosen, files)
+    if st.session_state.get("panel_selected_cid") != conversation_id:
+        st.session_state.panel_selected = None
+        st.session_state.panel_selected_cid = conversation_id
+    for entry in files:
+        identity = entry["identity"]
+        label = entry.get("filename") or identity
+        is_selected = identity == st.session_state.get("panel_selected")
+        if st.button(
+            ("● " if is_selected else "") + str(label),
+            key=panel_button_key(conversation_id, identity),
+            width="stretch",
+            type="primary" if is_selected else "secondary",
+            on_click=_select_panel_file,
+            args=(identity, conversation_id),
+        ):
+            _select_panel_file(identity, conversation_id)
+    selected = st.session_state.get("panel_selected")
+    current = next((entry for entry in files if entry["identity"] == selected), None)
     if current is None or canvas is None:
         return
+    st.divider()
     try:
         render_panel_file(canvas, current)
     except Exception as exc:
@@ -3336,37 +3171,41 @@ def main() -> None:
     history = store.get_messages(conversation_id)
     remember_opened_files_from_messages(store, conversation_id, history)
 
-    render_conversation(history, canvas)
-    prompt = st.chat_input("What's due this week?")
-    if prompt:
-        user_message = {"role": "user", "content": prompt}
-        store.add_message(conversation_id, user_message)
-        if not history:
-            store.set_title(conversation_id, prompt.strip().splitlines()[0])
-        render_message(user_message)
-        history.append(user_message)
+    chat_col, files_col = st.columns([2, 1], gap="large")
+    with chat_col:
+        render_conversation(history, canvas)
+        prompt = st.chat_input("What's due this week?")
+        if prompt:
+            user_message = {"role": "user", "content": prompt}
+            store.add_message(conversation_id, user_message)
+            if not history:
+                store.set_title(conversation_id, prompt.strip().splitlines()[0])
+            render_message(user_message)
+            history.append(user_message)
 
-        produced: list[dict[str, Any]] = []
+            produced: list[dict[str, Any]] = []
 
-        def persist_and_render(message: dict[str, Any]) -> None:
-            # Keep the full tool loop in SQLite so get_messages can rebuild DeepSeek
-            # context. Student-facing bubbles wait until the turn finishes so the
-            # final answer appears first (spinner already covers in-flight progress).
-            store.add_message(conversation_id, message)
-            remember_opened_files(store, conversation_id, message)
-            produced.append(message)
+            def persist_and_render(message: dict[str, Any]) -> None:
+                # Keep the full tool loop in SQLite so get_messages can rebuild DeepSeek
+                # context. Student-facing bubbles wait until the turn finishes so the
+                # final answer appears first (spinner already covers in-flight progress).
+                store.add_message(conversation_id, message)
+                remember_opened_files(store, conversation_id, message)
+                produced.append(message)
 
-        with st.spinner("Checking Canvas..."):
-            try:
-                run_agent_turn(deepseek, canvas, history, on_message=persist_and_render)
-            except Exception as exc:
-                # Same Streamlit rerun issue as dispatch_tool: a cached client may
-                # raise an exception class from a previous script run.
-                st.error(redact(exc))
+            with st.spinner("Checking Canvas..."):
+                try:
+                    run_agent_turn(deepseek, canvas, history, on_message=persist_and_render)
+                except Exception as exc:
+                    # Same Streamlit rerun issue as dispatch_tool: a cached client may
+                    # raise an exception class from a previous script run.
+                    st.error(redact(exc))
 
-        render_agent_turn(produced, canvas)
+            render_agent_turn(produced, canvas)
 
-    render_file_panel(store, conversation_id, canvas)
+    with files_col:
+        with st.container(border=True):
+            render_file_panel(store, conversation_id, canvas)
 
 
 if __name__ == "__main__":
