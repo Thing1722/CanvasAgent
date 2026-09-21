@@ -724,6 +724,11 @@ def test_html_to_text_and_links():
     assert links == [(77, "handout.pdf")]
 
 
+def test_html_to_text_keeps_bullets_on_consecutive_lines():
+    text, _ = app.html_to_text_and_links("<ul><li>1200 words</li><li>MLA format</li></ul>")
+    assert "- 1200 words\n- MLA format" in text
+
+
 def test_html_to_text_truncates_very_long_prompts():
     text, _ = app.html_to_text_and_links("<p>" + "word " * 5000 + "</p>")
     assert text.endswith("[truncated]")

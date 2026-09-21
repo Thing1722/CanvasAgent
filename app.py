@@ -258,7 +258,9 @@ class _HtmlExtractor(HTMLParser):
         if tag in ("script", "style"):
             self._skip_depth = max(0, self._skip_depth - 1)
             return
-        if tag in self.BLOCK_TAGS:
+        # Not li/br: the next list item opens with its own newline, and closing
+        # both ends would put a blank line between every bullet.
+        if tag in self.BLOCK_TAGS - {"li", "br"}:
             self.parts.append("\n")
         if tag == "a":
             if self._href:
