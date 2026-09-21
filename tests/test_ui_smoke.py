@@ -377,6 +377,227 @@ def test_sidebar_timezone_honors_env_override(monkeypatch, tmp_path):
     assert harness.sidebar.selectbox[0].value == "America/Los_Angeles"
 
 
+def _default_visible_text(block) -> str:
+    """Markdown, captions, and chat text a student sees without expanding widgets."""
+    parts: list[str] = []
+    for name in ("markdown", "caption", "title", "text", "code", "info", "warning", "error"):
+        for element in getattr(block, name, []) or []:
+            parts.append(str(element.value))
+    for message in getattr(block, "chat_message", []) or []:
+        parts.append(_default_visible_text(message))
+    return "\n".join(parts)
+
+
+def _expander_labels(harness) -> list[str]:
+    labels = []
+    for expander in getattr(harness, "expander", []) or []:
+        label = getattr(expander, "label", None) or getattr(expander, "value", "")
+        labels.append(str(label))
+    return labels
+
+
+def test_replay_hides_tool_traces_and_shows_final_answer(monkeypatch, tmp_path):
+    """On replay, SQLite still has the tool loop but the student only sees the answer."""
+    import json
+    import sys
+    from pathlib import Path as P
+
+    sys.path.insert(0, str(P(__file__).resolve().parents[1]))
+    import app
+
+    db_path = tmp_path / "history.db"
+    store = app.ConversationStore(str(db_path))
+    conversation_id = store.create_conversation("Due dates")
+    store.add_message(conversation_id, {"role": "user", "content": "when is homework 4 due?"})
+    store.add_message(
+        conversation_id,
+        {
+            "role": "assistant",
+            "content": "Let me search Canvas for that.",
+            "reasoning_content": "I should call find_due_dates next.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "find_due_dates",
+                        "arguments": '{"query": "ZZZ_TOOL_ARG", "course_id": 4242}',
+                    },
+                }
+            ],
+        },
+    )
+    store.add_message(
+        conversation_id,
+        {
+            "role": "tool",
+            "name": "find_due_dates",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {
+                    "count": 1,
+                    "secret_dump": "ZZZ_TOOL_JSON",
+                    "assignments": [{"title": "Homework 4", "due_at": "Friday"}],
+                }
+            ),
+        },
+    )
+    store.add_message(
+        conversation_id,
+        {"role": "assistant", "content": "Homework 4 is due Friday."},
+    )
+
+    harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
+    assert not harness.exception, harness.exception
+    visible = _default_visible_text(harness)
+    assert "Homework 4 is due Friday." in visible
+    assert "when is homework 4 due?" in visible
+    assert "Calling" not in visible
+    assert "Canvas lookup" not in visible
+    assert "ZZZ_TOOL_ARG" not in visible
+    assert "ZZZ_TOOL_JSON" not in visible
+    assert "Let me search Canvas for that." not in visible
+    assert "I should call find_due_dates" not in visible
+    assert "find_due_dates" not in visible
+    assert '{"query"' not in visible
+    assert not any("Canvas lookup" in label for label in _expander_labels(harness))
+
+    replayed = app.ConversationStore(str(db_path)).get_messages(conversation_id)
+    assert [m["role"] for m in replayed] == ["user", "assistant", "tool", "assistant"]
+    assert replayed[1]["tool_calls"][0]["function"]["name"] == "find_due_dates"
+    assert "ZZZ_TOOL_JSON" in replayed[2]["content"]
+
+
+def test_scripted_turn_hides_tool_traces_in_app_test():
+    """AppTest after run_agent_turn + render: final answer only, no Calling/lookup/JSON."""
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+
+class ScriptedDeepSeek:
+    def __init__(self, replies):
+        self.replies = list(replies)
+
+    def complete(self, messages, tools=None, temperature=0.2):
+        return self.replies.pop(0)
+
+class FakeCanvas:
+    tz = None
+
+    def list_courses(self, include_concluded=False):
+        return [{{"id": 1, "name": "Course A"}}]
+
+deepseek = ScriptedDeepSeek(
+    [
+        {{
+            "role": "assistant",
+            "content": "Let me look that up.",
+            "reasoning_content": "Call list_my_courses with ZZZ_TOOL_ARG.",
+            "tool_calls": [
+                {{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {{
+                        "name": "list_my_courses",
+                        "arguments": '{{"ZZZ_TOOL_ARG": 4242}}',
+                    }},
+                }}
+            ],
+        }},
+        {{"role": "assistant", "content": "You are enrolled in Course A."}},
+    ]
+)
+history = [{{"role": "user", "content": "what courses am I in?"}}]
+produced = app.run_agent_turn(deepseek, FakeCanvas(), history)
+assert [m["role"] for m in produced] == ["assistant", "tool", "assistant"]
+assert "list_my_courses" in (produced[0].get("tool_calls") or [{{}}])[0].get("function", {{}}).get("name", "")
+app.render_conversation(history + produced, FakeCanvas())
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    visible = _default_visible_text(harness)
+    assert "You are enrolled in Course A." in visible
+    assert "what courses am I in?" in visible
+    assert "Calling" not in visible
+    assert "Canvas lookup" not in visible
+    assert "ZZZ_TOOL_ARG" not in visible
+    assert "Let me look that up." not in visible
+    assert "Call list_my_courses" not in visible
+    assert "list_my_courses" not in visible
+    assert '{"ZZZ_TOOL_ARG"' not in visible
+    assert not any("Canvas lookup" in label for label in _expander_labels(harness))
+
+
+def test_open_file_preview_still_renders_without_lookup_expander():
+    """open_file must still show the file; the Canvas lookup JSON expander must not."""
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import json
+import sys
+sys.path.insert(0, {repo!r})
+import app
+
+class FakeCanvas:
+    def download_file(self, file_id, max_bytes=None):
+        return (
+            b"Office hours are Friday.",
+            {{
+                "file_id": file_id,
+                "filename": "notes.txt",
+                "content_type": "text/plain",
+                "size_readable": "24 B",
+            }},
+        )
+
+turn = [
+    {{
+        "role": "assistant",
+        "content": "Searching.",
+        "tool_calls": [
+            {{
+                "id": "call_file",
+                "type": "function",
+                "function": {{
+                    "name": "open_file",
+                    "arguments": '{{"file_id": 14814596}}',
+                }},
+            }}
+        ],
+    }},
+    {{
+        "role": "tool",
+        "name": "open_file",
+        "tool_call_id": "call_file",
+        "content": json.dumps({{"file": {{"file_id": 14814596, "filename": "notes.txt"}}}}),
+    }},
+    {{"role": "assistant", "content": "The notes say Friday."}},
+]
+app.render_conversation(
+    [{{"role": "user", "content": "open notes.txt"}}] + turn,
+    FakeCanvas(),
+)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    visible = _default_visible_text(harness)
+    assert "The notes say Friday." in visible
+    assert "open notes.txt" in visible
+    assert "Calling" not in visible
+    assert "Canvas lookup" not in visible
+    assert "Searching." not in visible
+    assert "14814596" not in visible
+    assert '{"file_id"' not in visible
+    keys = [button.key for button in harness.download_button]
+    assert len(keys) == 1
+    assert keys[0].startswith("download-")
+    assert "call_file" in keys[0]
+    assert not any("Canvas lookup" in label for label in _expander_labels(harness))
+    # Preview body still includes the file text (code/markdown), not the tool JSON.
+    assert "Office hours are Friday." in visible or "notes.txt" in visible
+
+
 def test_sidebar_timezone_select_persists_across_reruns(monkeypatch, tmp_path):
     harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
     harness.sidebar.selectbox[0].select("Asia/Shanghai").run()

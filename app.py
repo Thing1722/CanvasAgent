@@ -2434,47 +2434,62 @@ def render_own_submission(
                         )
 
 
-def render_tool_message(message: dict[str, Any], canvas: CanvasClient | None = None) -> None:
+def _tool_payload(message: dict[str, Any]) -> Any:
     try:
-        payload = json.loads(message.get("content") or "{}")
+        return json.loads(message.get("content") or "{}")
     except json.JSONDecodeError:
-        payload = None
+        return None
 
+
+def assistant_is_user_facing(message: dict[str, Any]) -> bool:
+    """True when this assistant row should appear as a student-facing bubble.
+
+    Intermediate model rows (tool_calls, reasoning_content, empty content) stay
+    in SQLite for DeepSeek but are not rendered in the main transcript.
+    """
+    if message.get("role") != "assistant":
+        return False
+    if message.get("tool_calls"):
+        return False
+    content = message.get("content")
+    return bool(content and str(content).strip())
+
+
+def render_tool_message(message: dict[str, Any], canvas: CanvasClient | None = None) -> None:
+    """Show student-facing artifacts from a tool row; never dump the JSON payload."""
+    payload = _tool_payload(message)
     name = message.get("name")
     tool_call_id = message.get("tool_call_id")
-    if canvas and isinstance(payload, dict) and not payload.get("error"):
-        if payload.get("file") and name in {"open_file", "open_url"}:
-            render_file_preview(canvas, payload, tool_call_id=tool_call_id)
-        elif name == "open_url" and payload.get("assignment"):
-            render_assignment_instructions(payload["assignment"])
-        elif name == "open_url" and payload.get("url"):
-            render_url_preview(canvas, payload, tool_call_id=tool_call_id)
-        elif name == "get_assignment_details" and (payload.get("assignment") or {}).get("instructions"):
-            render_assignment_instructions(payload["assignment"])
-        elif name == "get_my_submission" and payload.get("submission"):
-            render_own_submission(canvas, payload["submission"], tool_call_id=tool_call_id)
-
-    with st.expander(f"Canvas lookup: {message.get('name', 'tool')}", expanded=False):
-        if payload is None:
-            st.code(message.get("content") or "")
-        else:
-            st.json(payload)
+    if not canvas or not isinstance(payload, dict) or payload.get("error"):
+        return
+    if payload.get("file") and name in {"open_file", "open_url"}:
+        render_file_preview(canvas, payload, tool_call_id=tool_call_id)
+    elif name == "open_url" and payload.get("assignment"):
+        render_assignment_instructions(payload["assignment"])
+    elif name == "open_url" and payload.get("url"):
+        render_url_preview(canvas, payload, tool_call_id=tool_call_id)
+    elif name == "get_assignment_details" and (payload.get("assignment") or {}).get("instructions"):
+        render_assignment_instructions(payload["assignment"])
+    elif name == "get_my_submission" and payload.get("submission"):
+        render_own_submission(canvas, payload["submission"], tool_call_id=tool_call_id)
 
 
 def render_message(message: dict[str, Any], canvas: CanvasClient | None = None) -> None:
-    """Show one chat message. A failure here must not kill the rest of the page."""
+    """Show one student-facing chat row. A failure here must not kill the page.
+
+    Tool-call captions, reasoning, retry text, and Canvas JSON dumps stay out of
+    the main transcript. File previews still render from tool rows.
+    """
     try:
         role = message.get("role")
         if role == "tool":
             render_tool_message(message, canvas)
             return
         if role == "assistant":
-            for call in message.get("tool_calls") or []:
-                function = call.get("function") or {}
-                st.caption(f"Calling `{function.get('name')}` with `{function.get('arguments')}`")
-            if message.get("content"):
-                with st.chat_message("assistant"):
-                    st.markdown(to_streamlit_math(message["content"]))
+            if not assistant_is_user_facing(message):
+                return
+            with st.chat_message("assistant"):
+                st.markdown(to_streamlit_math(message["content"]))
             return
         if role == "user" and message.get("content"):
             with st.chat_message("user"):
@@ -2484,6 +2499,35 @@ def render_message(message: dict[str, Any], canvas: CanvasClient | None = None) 
         # widgets in this message; later history still renders.
         logger.exception("Failed to render a %s message", message.get("role"))
         st.error(redact(exc))
+
+
+def render_agent_turn(
+    turn: list[dict[str, Any]], canvas: CanvasClient | None = None
+) -> None:
+    """Render one model turn: final answer first, then file / submission previews."""
+    for message in turn:
+        if assistant_is_user_facing(message):
+            render_message(message, canvas)
+    for message in turn:
+        if message.get("role") == "tool":
+            render_message(message, canvas)
+
+
+def render_conversation(
+    messages: list[dict[str, Any]], canvas: CanvasClient | None = None
+) -> None:
+    """Replay stored history without showing tool traces as normal bubbles."""
+    index = 0
+    while index < len(messages):
+        if messages[index].get("role") == "user":
+            render_message(messages[index], canvas)
+            index += 1
+            continue
+        turn: list[dict[str, Any]] = []
+        while index < len(messages) and messages[index].get("role") != "user":
+            turn.append(messages[index])
+            index += 1
+        render_agent_turn(turn, canvas)
 
 
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
@@ -2574,8 +2618,7 @@ def main() -> None:
     deepseek = get_deepseek_client(settings, f"{settings.deepseek_base_url}:{settings.model}")
 
     history = store.get_messages(conversation_id)
-    for message in history:
-        render_message(message, canvas)
+    render_conversation(history, canvas)
 
     prompt = st.chat_input("What's due this week?")
     if not prompt:
@@ -2588,9 +2631,14 @@ def main() -> None:
     render_message(user_message)
     history.append(user_message)
 
+    produced: list[dict[str, Any]] = []
+
     def persist_and_render(message: dict[str, Any]) -> None:
+        # Keep the full tool loop in SQLite so get_messages can rebuild DeepSeek
+        # context. Student-facing bubbles wait until the turn finishes so the
+        # final answer appears first (spinner already covers in-flight progress).
         store.add_message(conversation_id, message)
-        render_message(message, canvas)
+        produced.append(message)
 
     with st.spinner("Checking Canvas..."):
         try:
@@ -2599,6 +2647,8 @@ def main() -> None:
             # Same Streamlit rerun issue as dispatch_tool: a cached client may
             # raise an exception class from a previous script run.
             st.error(redact(exc))
+
+    render_agent_turn(produced, canvas)
 
 
 if __name__ == "__main__":
