@@ -1536,6 +1536,22 @@ def test_next_file_preview_id_panel_suffix_differs_from_chat():
     assert "call_1" in chat and "call_1" in panel
 
 
+def test_files_sidebar_label_prefers_filename():
+    assert app.files_sidebar_label({"filename": "notes.txt", "identity": "file:1"}) == "notes.txt"
+    assert app.files_sidebar_label({"url": "https://example.com/a.pdf", "identity": "url:x"}) == (
+        "https://example.com/a.pdf"
+    )
+
+
+def test_panel_entry_for_choice_accepts_identity_or_label():
+    files = [
+        {"identity": "file:1", "filename": "notes.txt"},
+        {"identity": "file:2", "filename": "syllabus.pdf"},
+    ]
+    assert app.panel_entry_for_choice("file:2", files)["filename"] == "syllabus.pdf"
+    assert app.panel_entry_for_choice("notes.txt", files)["identity"] == "file:1"
+
+
 def test_assistant_is_user_facing_hides_tool_calls_and_reasoning():
     assert app.assistant_is_user_facing(
         {"role": "assistant", "content": "Homework 4 is due Friday."}

@@ -674,8 +674,7 @@ def test_file_panel_empty_state_on_new_chat(monkeypatch, tmp_path):
     visible = captions + " " + markdown
     assert "No files opened in this chat yet." in visible
     assert len(harness.chat_input) == 1
-    panel_keys = [button.key for button in harness.button if (button.key or "").startswith("panel-pick-")]
-    assert panel_keys == []
+    assert not any("files-sidebar-choice" in (box.key or "") for box in harness.selectbox)
 
 
 def test_file_panel_keys_differ_from_chat_and_answer_still_shows():
@@ -799,22 +798,11 @@ app.render_file_panel(store, cid, FakeCanvas())
 """
     harness = AppTest.from_string(script, default_timeout=30).run()
     assert not harness.exception, harness.exception
-    panel_buttons = [button for button in harness.button if (button.key or "").startswith("panel-pick-")]
-    assert len(panel_buttons) == 2
-    labels = [str(button.label) for button in panel_buttons]
-    assert any("notes.txt" in label for label in labels)
-    assert any("syllabus.pdf" in label for label in labels)
-    assert harness.download_button == [] or len(harness.download_button) == 0
-
-    panel_buttons[0].click().run()
-    assert not harness.exception, harness.exception
-    keys = [button.key for button in harness.download_button]
-    assert len(keys) == 1
-    assert "-panel" in keys[0]
-
-    panel_buttons = [button for button in harness.button if (button.key or "").startswith("panel-pick-")]
-    panel_buttons[1].click().run()
-    assert not harness.exception, harness.exception
+    pickers = [box for box in harness.selectbox if (box.key or "").startswith("files-sidebar-choice-")]
+    assert len(pickers) == 1
+    picker = pickers[0]
+    assert picker.options == ["notes.txt", "syllabus.pdf"]
+    assert picker.value in {"file:9002", "syllabus.pdf"}
     keys = [button.key for button in harness.download_button]
     assert len(keys) == 1
     assert "-panel" in keys[0]
@@ -822,6 +810,58 @@ app.render_file_panel(store, cid, FakeCanvas())
     rendered += " ".join(str(element.value) for element in harness.caption)
     rendered += " ".join(str(element.value) for element in harness.code)
     assert "syllabus.pdf" in rendered or "body-9002" in rendered
+
+    picker.select_index(0).run()
+    assert not harness.exception, harness.exception
+    pickers = [box for box in harness.selectbox if (box.key or "").startswith("files-sidebar-choice-")]
+    assert pickers[0].value in {"file:9001", "notes.txt"}
+    keys = [button.key for button in harness.download_button]
+    assert len(keys) == 1
+    assert "-panel" in keys[0]
+    rendered = " ".join(str(element.value) for element in harness.markdown)
+    rendered += " ".join(str(element.value) for element in harness.caption)
+    rendered += " ".join(str(element.value) for element in harness.code)
+    assert "notes.txt" in rendered or "body-9001" in rendered
+
+
+def test_files_sidebar_collapse_hides_dropdown(tmp_path):
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = tmp_path / "panel.db"
+    script = f"""
+import json
+import sys
+sys.path.insert(0, {repo!r})
+import app
+
+class FakeCanvas:
+    def download_file(self, file_id, max_bytes=None):
+        return b"x", {{"file_id": file_id, "filename": "notes.txt", "content_type": "text/plain"}}
+
+store = app.ConversationStore({str(db_path)!r})
+cid = store.create_conversation("files")
+app.remember_opened_files(
+    store,
+    cid,
+    {{
+        "role": "tool",
+        "name": "open_file",
+        "tool_call_id": "call_a",
+        "content": json.dumps({{"file": {{"file_id": 9001, "filename": "notes.txt"}}}}),
+    }},
+)
+app.render_file_panel(store, cid, FakeCanvas())
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    assert any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
+    collapse = next(button for button in harness.button if button.key == "files-sidebar-collapse")
+    collapse.click().run()
+    assert not harness.exception, harness.exception
+    assert not any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
+    expand = next(button for button in harness.button if button.key == "files-sidebar-expand")
+    expand.click().run()
+    assert not harness.exception, harness.exception
+    assert any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
 
 
 def test_file_panel_isolated_when_switching_conversations(monkeypatch, tmp_path):
@@ -857,7 +897,7 @@ def test_file_panel_isolated_when_switching_conversations(monkeypatch, tmp_path)
     assert "Hi — what should we look up?" in visible
     captions = " ".join(str(element.value) for element in harness.caption)
     assert "No files opened in this chat yet." in captions + visible
-    assert not any((button.key or "").startswith("panel-pick-") for button in harness.button)
+    assert not any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
 
     opened = None
     for button in harness.sidebar.button:
@@ -869,9 +909,9 @@ def test_file_panel_isolated_when_switching_conversations(monkeypatch, tmp_path)
     assert not harness.exception, harness.exception
     visible = _default_visible_text(harness)
     assert "The notes say Friday." in visible
-    panel_buttons = [button for button in harness.button if (button.key or "").startswith("panel-pick-")]
-    assert len(panel_buttons) == 1
-    assert "notes.txt" in str(panel_buttons[0].label)
+    pickers = [box for box in harness.selectbox if (box.key or "").startswith("files-sidebar-choice-")]
+    assert len(pickers) == 1
+    assert pickers[0].value in {"file:9001", "notes.txt"}
     captions = " ".join(str(element.value) for element in harness.caption)
     assert "No files opened in this chat yet." not in captions
 
