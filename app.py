@@ -3090,13 +3090,19 @@ def files_sidebar_css(collapsed: bool) -> str:
   min-width: 0 !important;
   background: var(--secondary-background-color);
   border-left: 1px solid rgba(49, 51, 63, 0.2);
-  z-index: 100;
+  z-index: 100001;
   overflow-x: hidden;
   overflow-y: auto;
   padding: 3.75rem 0.85rem 2rem 0.85rem !important;
   box-sizing: border-box;
   transform: {transform};
   transition: transform {ms}ms, min-width {ms}ms, max-width {ms}ms;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+}}
+.{FILES_SIDEBAR_CSS_CLASS} [data-stale="true"] {{
+  opacity: 1 !important;
+  pointer-events: auto !important;
 }}
 .{FILES_SIDEBAR_CSS_CLASS} [data-testid="stHtml"],
 .{FILES_SIDEBAR_CSS_CLASS} [data-testid="stIFrame"],
@@ -3406,6 +3412,10 @@ def main() -> None:
     history = store.get_messages(conversation_id)
     remember_opened_files_from_messages(store, conversation_id, history)
 
+    # Draw the files rail before any blocking work so Streamlit does not mark
+    # it stale (white / unclickable) while the agent spinner is running.
+    render_file_panel(store, conversation_id, canvas)
+
     render_conversation(history, canvas)
     prompt = st.chat_input("What's due this week?")
     if prompt:
@@ -3435,8 +3445,10 @@ def main() -> None:
                 st.error(redact(exc))
 
         render_agent_turn(produced, canvas)
-
-    render_file_panel(store, conversation_id, canvas)
+        before = [entry["identity"] for entry in st.session_state.get("opened_files") or []]
+        after = [entry["identity"] for entry in store.list_opened_files(conversation_id)]
+        if after != before:
+            st.rerun()
 
 
 if __name__ == "__main__":
