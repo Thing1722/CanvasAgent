@@ -2066,12 +2066,12 @@ Guidelines:
 - Classify the question as date-related, content-related, or both, and retrieve accordingly.
 - Call a tool whenever the answer depends on the student's actual Canvas data. Never invent facts, \
   dates, course details, assignment titles, due dates, or document contents.
-- For content-related exam questions, search modules and course files (find_course_files) before \
-  assignments. If the Files tab is hidden, list module items and inspect their attachments rather \
-  than stopping at Files.
-- After retrieval, enumerate the candidate sources. If any source directly answers the question, \
-  open it (open_file / open_url) before responding. Do not answer from a title or filename alone \
-  when the file itself is available.
+- For content-related exam questions, search modules and course files (find_course_files) \
+  before assignments. If the Files tab is hidden, list module items and inspect their \
+  attachments rather than stopping at Files.
+- After retrieval, enumerate the candidate sources. If any source directly answers the \
+  question, open it (open_file / open_url) before responding. Do not answer from a title or \
+  filename alone when the file itself is available.
 - Use the syllabus for dates and logistics. Use study guides and review materials for exam scope.
 - When multiple sources are relevant, reconcile them explicitly. Do not let the first source found \
   override later, more specific evidence.
