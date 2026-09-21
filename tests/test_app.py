@@ -1268,7 +1268,7 @@ def test_store_schema_tables_exist(tmp_path):
     with sqlite3.connect(db_path) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
-    assert {"conversations", "messages", "settings"} <= tables
+    assert {"conversations", "messages", "settings", "conversation_files"} <= tables
     assert {"conversation_id", "role", "content", "tool_calls", "tool_call_id", "name", "created_at"} <= columns
 
 
@@ -1283,6 +1283,185 @@ def test_store_lists_and_deletes_conversations(tmp_path):
     store.delete_conversation(first)
     assert [c["id"] for c in store.list_conversations()] == [second]
     assert store.get_messages(first) == []
+
+
+def _open_file_tool_message(file_id=9001, filename="notes.txt", call_id="call_file"):
+    return {
+        "role": "tool",
+        "name": "open_file",
+        "tool_call_id": call_id,
+        "content": json.dumps({"file": {"file_id": file_id, "filename": filename, "content_type": "text/plain"}}),
+    }
+
+
+def test_opened_file_entries_from_open_file():
+    entries = app.opened_file_entries_from_tool_message(_open_file_tool_message())
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "file"
+    assert entries[0]["file_id"] == 9001
+    assert entries[0]["filename"] == "notes.txt"
+    assert entries[0]["identity"] == "file:9001"
+    assert entries[0]["tool_call_id"] == "call_file"
+    assert app.opened_file_entries_from_tool_message({"role": "assistant", "content": "hi"}) == []
+    assert app.opened_file_entries_from_tool_message(
+        {"role": "tool", "name": "open_file", "content": json.dumps({"error": "nope"})}
+    ) == []
+
+
+def test_opened_file_entries_from_open_url_pdf_and_image_not_html():
+    pdf = {
+        "role": "tool",
+        "name": "open_url",
+        "tool_call_id": "call_pdf",
+        "content": json.dumps(
+            {
+                "url": "https://cs.example.edu/midterm.pdf",
+                "resource": {
+                    "url": "https://cs.example.edu/midterm.pdf",
+                    "filename": "midterm.pdf",
+                    "content_type": "application/pdf",
+                },
+            }
+        ),
+    }
+    image = {
+        "role": "tool",
+        "name": "open_url",
+        "tool_call_id": "call_img",
+        "content": json.dumps(
+            {
+                "url": "https://cs.example.edu/plot.png",
+                "resource": {
+                    "url": "https://cs.example.edu/plot.png",
+                    "filename": "plot.png",
+                    "content_type": "image/png",
+                },
+            }
+        ),
+    }
+    html = {
+        "role": "tool",
+        "name": "open_url",
+        "tool_call_id": "call_html",
+        "content": json.dumps(
+            {
+                "url": "https://cs.example.edu/syllabus.html",
+                "resource": {
+                    "url": "https://cs.example.edu/syllabus.html",
+                    "filename": "syllabus.html",
+                    "content_type": "text/html",
+                },
+            }
+        ),
+    }
+    canvas_file = {
+        "role": "tool",
+        "name": "open_url",
+        "tool_call_id": "call_via_file",
+        "content": json.dumps(
+            {
+                "opened_via": "open_file",
+                "file": {"file_id": 4242, "filename": "handout.pdf", "content_type": "application/pdf"},
+                "url": "https://canvas.example.edu/files/4242/download",
+            }
+        ),
+    }
+    pdf_entries = app.opened_file_entries_from_tool_message(pdf)
+    assert pdf_entries[0]["kind"] == "url"
+    assert pdf_entries[0]["filename"] == "midterm.pdf"
+    assert pdf_entries[0]["identity"].startswith("url:")
+    image_entries = app.opened_file_entries_from_tool_message(image)
+    assert image_entries[0]["content_type"] == "image/png"
+    assert app.opened_file_entries_from_tool_message(html) == []
+    via_file = app.opened_file_entries_from_tool_message(canvas_file)
+    assert via_file[0]["identity"] == "file:4242"
+    assert via_file[0]["filename"] == "handout.pdf"
+
+
+def test_opened_file_entries_from_submission_attachments():
+    message = {
+        "role": "tool",
+        "name": "get_my_submission",
+        "tool_call_id": "call_sub",
+        "content": json.dumps(
+            {
+                "submission": {
+                    "title": "Homework 4",
+                    "attachments": [
+                        {"file_id": 8801, "filename": "cga-final.pdf"},
+                        {"file_id": 8802, "filename": "notes.txt"},
+                    ],
+                    "comments": [
+                        {
+                            "author": "TA",
+                            "attachments": [{"file_id": 8803, "filename": "rubric.pdf"}],
+                        }
+                    ],
+                }
+            }
+        ),
+    }
+    entries = app.opened_file_entries_from_tool_message(message)
+    assert [e["file_id"] for e in entries] == [8801, 8802, 8803]
+    assert [e["filename"] for e in entries] == ["cga-final.pdf", "notes.txt", "rubric.pdf"]
+
+
+def test_store_records_opened_files_per_conversation(tmp_path):
+    store = app.ConversationStore(str(tmp_path / "history.db"))
+    first = store.create_conversation("with files")
+    second = store.create_conversation("empty")
+    app.remember_opened_files(store, first, _open_file_tool_message())
+    app.remember_opened_files(
+        store,
+        first,
+        {
+            "role": "tool",
+            "name": "open_url",
+            "tool_call_id": "call_pdf",
+            "content": json.dumps(
+                {
+                    "url": "https://cs.example.edu/midterm.pdf",
+                    "resource": {
+                        "url": "https://cs.example.edu/midterm.pdf",
+                        "filename": "midterm.pdf",
+                        "content_type": "application/pdf",
+                    },
+                }
+            ),
+        },
+    )
+    names = [entry["filename"] for entry in store.list_opened_files(first)]
+    assert names == ["notes.txt", "midterm.pdf"]
+    assert store.list_opened_files(second) == []
+    assert store.list_opened_files(store.create_conversation("brand new")) == []
+
+    app.remember_opened_files(store, first, _open_file_tool_message())
+    assert [entry["filename"] for entry in store.list_opened_files(first)] == ["notes.txt", "midterm.pdf"]
+
+    store.delete_conversation(first)
+    assert store.list_opened_files(first) == []
+    assert store.list_opened_files(second) == []
+
+
+def test_remember_opened_files_from_existing_messages(tmp_path):
+    """Chats that already had open_file rows populate the panel table on sync."""
+    store = app.ConversationStore(str(tmp_path / "history.db"))
+    conversation_id = store.create_conversation("old chat")
+    store.add_message(conversation_id, {"role": "user", "content": "open notes"})
+    store.add_message(conversation_id, _open_file_tool_message())
+    assert store.list_opened_files(conversation_id) == []
+    app.remember_opened_files_from_messages(store, conversation_id, store.get_messages(conversation_id))
+    assert [entry["filename"] for entry in store.list_opened_files(conversation_id)] == ["notes.txt"]
+
+
+def test_next_file_preview_id_panel_suffix_differs_from_chat():
+    app._file_preview_seq = 0
+    chat = app.next_file_preview_id("call_1")
+    panel = app.next_file_preview_id("call_1", key_suffix=app.FILE_PANEL_KEY_SUFFIX)
+    assert chat != panel
+    assert panel.endswith("-panel")
+    assert not chat.endswith("-panel")
+    assert "call_1" in chat and "call_1" in panel
 
 
 def test_assistant_is_user_facing_hides_tool_calls_and_reasoning():

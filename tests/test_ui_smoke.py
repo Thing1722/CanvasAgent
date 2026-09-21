@@ -664,3 +664,214 @@ def test_sidebar_timezone_select_persists_across_reruns(monkeypatch, tmp_path):
     restarted = run_app(monkeypatch, tmp_path, DUMMY_ENV)
     assert not restarted.exception
     assert restarted.sidebar.selectbox[0].value == "Asia/Shanghai"
+
+
+def test_file_panel_empty_state_on_new_chat(monkeypatch, tmp_path):
+    harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
+    assert not harness.exception, harness.exception
+    captions = " ".join(str(element.value) for element in harness.caption)
+    markdown = " ".join(str(element.value) for element in harness.markdown)
+    visible = captions + " " + markdown
+    assert "No files opened in this chat yet." in visible
+    assert len(harness.chat_input) == 1
+    panel_keys = [button.key for button in harness.button if (button.key or "").startswith("panel-pick-")]
+    assert panel_keys == []
+
+
+def test_file_panel_keys_differ_from_chat_and_answer_still_shows():
+    """In-chat preview keys stay unique from the right-hand panel of the same file."""
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import json
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+class FakeCanvas:
+    def download_file(self, file_id, max_bytes=None):
+        return (
+            b"Office hours are Friday.",
+            {{
+                "file_id": file_id,
+                "filename": "notes.txt",
+                "content_type": "text/plain",
+                "size_readable": "24 B",
+            }},
+        )
+
+payload = {{"file": {{"file_id": 14814596, "filename": "notes.txt"}}}}
+canvas = FakeCanvas()
+chat_col, files_col = st.columns([2, 1])
+with chat_col:
+    app.render_conversation(
+        [
+            {{"role": "user", "content": "open notes.txt"}},
+            {{
+                "role": "assistant",
+                "content": "Searching.",
+                "tool_calls": [
+                    {{
+                        "id": "call_file",
+                        "type": "function",
+                        "function": {{"name": "open_file", "arguments": '{{"file_id": 14814596}}'}},
+                    }}
+                ],
+            }},
+            {{
+                "role": "tool",
+                "name": "open_file",
+                "tool_call_id": "call_file",
+                "content": json.dumps(payload),
+            }},
+            {{"role": "assistant", "content": "The notes say Friday."}},
+        ],
+        canvas,
+    )
+with files_col:
+    app.render_file_preview(canvas, payload, tool_call_id="call_file", key_suffix=app.FILE_PANEL_KEY_SUFFIX)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    visible = _default_visible_text(harness)
+    assert "The notes say Friday." in visible
+    assert "open notes.txt" in visible
+    keys = [button.key for button in harness.download_button]
+    assert len(keys) == 2
+    assert len(set(keys)) == 2
+    panel_keys = [key for key in keys if key.endswith("-panel") or "-panel" in key]
+    chat_keys = [key for key in keys if key not in panel_keys]
+    assert len(panel_keys) == 1
+    assert len(chat_keys) == 1
+    assert panel_keys[0] != chat_keys[0]
+
+
+def test_file_panel_click_switches_preview(tmp_path):
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = tmp_path / "panel.db"
+    script = f"""
+import json
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+class FakeCanvas:
+    def download_file(self, file_id, max_bytes=None):
+        names = {{9001: "notes.txt", 9002: "syllabus.pdf"}}
+        return (
+            f"body-{{file_id}}".encode(),
+            {{
+                "file_id": file_id,
+                "filename": names[file_id],
+                "content_type": "text/plain",
+                "size_readable": "8 B",
+            }},
+        )
+
+store = app.ConversationStore({str(db_path)!r})
+existing = store.list_conversations()
+if existing:
+    cid = existing[0]["id"]
+else:
+    cid = store.create_conversation("files")
+    app.remember_opened_files(
+        store,
+        cid,
+        {{
+            "role": "tool",
+            "name": "open_file",
+            "tool_call_id": "call_a",
+            "content": json.dumps({{"file": {{"file_id": 9001, "filename": "notes.txt"}}}}),
+        }},
+    )
+    app.remember_opened_files(
+        store,
+        cid,
+        {{
+            "role": "tool",
+            "name": "open_file",
+            "tool_call_id": "call_b",
+            "content": json.dumps({{"file": {{"file_id": 9002, "filename": "syllabus.pdf"}}}}),
+        }},
+    )
+app.render_file_panel(store, cid, FakeCanvas())
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    panel_buttons = [button for button in harness.button if (button.key or "").startswith("panel-pick-")]
+    assert len(panel_buttons) == 2
+    labels = [str(button.label) for button in panel_buttons]
+    assert any("notes.txt" in label for label in labels)
+    assert any("syllabus.pdf" in label for label in labels)
+    assert harness.download_button == [] or len(harness.download_button) == 0
+
+    panel_buttons[0].click().run()
+    assert not harness.exception, harness.exception
+    keys = [button.key for button in harness.download_button]
+    assert len(keys) == 1
+    assert "-panel" in keys[0]
+
+    panel_buttons = [button for button in harness.button if (button.key or "").startswith("panel-pick-")]
+    panel_buttons[1].click().run()
+    assert not harness.exception, harness.exception
+    keys = [button.key for button in harness.download_button]
+    assert len(keys) == 1
+    assert "-panel" in keys[0]
+    rendered = " ".join(str(element.value) for element in harness.markdown)
+    rendered += " ".join(str(element.value) for element in harness.caption)
+    rendered += " ".join(str(element.value) for element in harness.code)
+    assert "syllabus.pdf" in rendered or "body-9002" in rendered
+
+
+def test_file_panel_isolated_when_switching_conversations(monkeypatch, tmp_path):
+    import json
+    import sys
+    from pathlib import Path as P
+
+    sys.path.insert(0, str(P(__file__).resolve().parents[1]))
+    import app
+
+    db_path = tmp_path / "history.db"
+    store = app.ConversationStore(str(db_path))
+    with_files = store.create_conversation("Has files")
+    store.add_message(with_files, {"role": "user", "content": "open notes.txt"})
+    store.add_message(
+        with_files,
+        {
+            "role": "tool",
+            "name": "open_file",
+            "tool_call_id": "call_file",
+            "content": json.dumps({"file": {"file_id": 9001, "filename": "notes.txt"}}),
+        },
+    )
+    store.add_message(with_files, {"role": "assistant", "content": "The notes say Friday."})
+    empty = store.create_conversation("Empty chat")
+    store.add_message(empty, {"role": "user", "content": "hello"})
+    store.add_message(empty, {"role": "assistant", "content": "Hi — what should we look up?"})
+
+    harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
+    assert not harness.exception, harness.exception
+    # Newest chat is Empty chat; panel must not list notes.txt.
+    visible = _default_visible_text(harness)
+    assert "Hi — what should we look up?" in visible
+    captions = " ".join(str(element.value) for element in harness.caption)
+    assert "No files opened in this chat yet." in captions + visible
+    assert not any((button.key or "").startswith("panel-pick-") for button in harness.button)
+
+    opened = None
+    for button in harness.sidebar.button:
+        if "Has files" in str(button.label):
+            opened = button
+            break
+    assert opened is not None
+    opened.click().run()
+    assert not harness.exception, harness.exception
+    visible = _default_visible_text(harness)
+    assert "The notes say Friday." in visible
+    panel_buttons = [button for button in harness.button if (button.key or "").startswith("panel-pick-")]
+    assert len(panel_buttons) == 1
+    assert "notes.txt" in str(panel_buttons[0].label)
+    captions = " ".join(str(element.value) for element in harness.caption)
+    assert "No files opened in this chat yet." not in captions
+
