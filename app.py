@@ -579,8 +579,12 @@ class CanvasClient:
         include_past: bool = False,
     ) -> list[dict[str, Any]]:
         term = (query or "").strip()
-        if len(term) < 2:
-            raise CanvasError("Search text must be at least 2 characters long.")
+        if not term:
+            raise CanvasError(
+                "A search query is required. Pass something from the assignment "
+                "title, such as 'Homework 4' or '4', or call list_upcoming_assignments "
+                "to list everything due soon."
+            )
         now = datetime.now(timezone.utc)
         matches: list[dict[str, Any]] = []
         for course in self._course_lookup(course_id):
@@ -849,7 +853,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Text to search for in assignment titles (at least 2 characters).",
+                        "description": (
+                            "Text to search for in assignment titles, for example "
+                            "'Homework 4', '4', or 'midterm'."
+                        ),
                     },
                     "course_id": {
                         "type": "integer",
@@ -1040,7 +1047,12 @@ def dispatch_tool(client: CanvasClient, name: str, arguments: dict[str, Any]) ->
                 result["text_excerpt"] = text
                 result["text_truncated"] = truncated
             return result
-    except (CanvasError, ReadOnlyViolation, ValueError, TypeError) as exc:
+    except Exception as exc:
+        # Streamlit re-executes this file on every chat turn while
+        # @st.cache_resource keeps the previous CanvasClient. That client's
+        # methods raise a CanvasError class from the previous run, which is
+        # not isinstance of the CanvasError bound here — catching only
+        # CanvasError used to let the error crash the page.
         return {"error": redact(exc)}
     return {"error": f"Unknown tool {name!r}. Available tools: {', '.join(TOOL_NAMES)}."}
 
@@ -1316,7 +1328,10 @@ def run_agent_turn(
                 arguments = json.loads(function.get("arguments") or "{}")
             except json.JSONDecodeError:
                 arguments = {}
-            result = dispatch_tool(canvas, name, arguments)
+            try:
+                result = dispatch_tool(canvas, name, arguments)
+            except Exception as exc:
+                result = {"error": redact(exc)}
             emit(
                 {
                     "role": "tool",
@@ -1528,7 +1543,9 @@ def main() -> None:
     with st.spinner("Checking Canvas..."):
         try:
             run_agent_turn(deepseek, canvas, history, on_message=persist_and_render)
-        except (DeepSeekError, CanvasError, ReadOnlyViolation) as exc:
+        except Exception as exc:
+            # Same Streamlit rerun issue as dispatch_tool: a cached client may
+            # raise an exception class from a previous script run.
             st.error(redact(exc))
 
 
