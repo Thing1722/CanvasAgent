@@ -4,3 +4,5 @@ streamlit[pdf]>=1.50,<2.0
 requests>=2.32,<3.0
 python-dotenv>=1.0,<2.0
 pypdf>=5.0,<7.0
+# IANA tz database for zoneinfo on Windows; harmless where the OS already has it.
+tzdata>=2024.1

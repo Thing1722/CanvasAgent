@@ -30,7 +30,7 @@ def clean_streamlit_caches():
 
 
 def run_app(monkeypatch, tmp_path, env: dict[str, str]) -> AppTest:
-    for name in ("DEEPSEEK_API_KEY", "CANVAS_API_TOKEN", "CANVAS_BASE_URL"):
+    for name in ("DEEPSEEK_API_KEY", "CANVAS_API_TOKEN", "CANVAS_BASE_URL", "CANVAS_ASSISTANT_TZ"):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -89,3 +89,35 @@ def test_new_chat_button_creates_a_conversation(monkeypatch, tmp_path):
     harness.sidebar.button[0].click().run()
     assert not harness.exception
     assert len(harness.sidebar.button) > before
+
+
+def test_sidebar_timezone_defaults_to_pittsburgh(monkeypatch, tmp_path):
+    harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
+    assert not harness.exception
+    assert len(harness.sidebar.selectbox) == 1
+    box = harness.sidebar.selectbox[0]
+    assert box.value == "America/New_York"
+    assert "America/New_York" in box.options
+    assert "Asia/Shanghai" in box.options
+    assert "UTC" in box.options
+    captions = " ".join(str(element.value) for element in harness.sidebar.caption)
+    assert "America/New_York" in captions
+
+
+def test_sidebar_timezone_honors_env_override(monkeypatch, tmp_path):
+    harness = run_app(
+        monkeypatch, tmp_path, {**DUMMY_ENV, "CANVAS_ASSISTANT_TZ": "America/Los_Angeles"}
+    )
+    assert not harness.exception
+    assert harness.sidebar.selectbox[0].value == "America/Los_Angeles"
+
+
+def test_sidebar_timezone_select_persists_across_reruns(monkeypatch, tmp_path):
+    harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
+    harness.sidebar.selectbox[0].select("Asia/Shanghai").run()
+    assert not harness.exception
+    assert harness.sidebar.selectbox[0].value == "Asia/Shanghai"
+
+    restarted = run_app(monkeypatch, tmp_path, DUMMY_ENV)
+    assert not restarted.exception
+    assert restarted.sidebar.selectbox[0].value == "Asia/Shanghai"
