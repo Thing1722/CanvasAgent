@@ -3101,7 +3101,7 @@ def files_sidebar_css(collapsed: bool) -> str:
   left: 0;
   width: 6px;
   height: 100%;
-  cursor: ew-resize;
+  cursor: col-resize;
   z-index: 2;
 }}
 .files-sidebar-resizer:hover {{
