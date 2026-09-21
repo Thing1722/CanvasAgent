@@ -669,11 +669,8 @@ def test_sidebar_timezone_select_persists_across_reruns(monkeypatch, tmp_path):
 def test_file_panel_empty_state_on_new_chat(monkeypatch, tmp_path):
     harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
     assert not harness.exception, harness.exception
-    captions = " ".join(str(element.value) for element in harness.caption)
-    markdown = " ".join(str(element.value) for element in harness.markdown)
-    visible = captions + " " + markdown
-    assert "No files opened in this chat yet." in visible
     assert len(harness.chat_input) == 1
+    assert list(harness.session_state.get("opened_files") or []) == []
     assert not any("files-sidebar-choice" in (box.key or "") for box in harness.selectbox)
 
 
@@ -753,6 +750,7 @@ import json
 import sys
 sys.path.insert(0, {repo!r})
 import app
+import files_rail
 import streamlit as st
 
 class FakeCanvas:
@@ -794,34 +792,24 @@ else:
             "content": json.dumps({{"file": {{"file_id": 9002, "filename": "syllabus.pdf"}}}}),
         }},
     )
+files = store.list_opened_files(cid)
+chosen = app.sync_files_sidebar_selection(cid, files)
+assert chosen == "file:9002"
+preview = app.build_panel_preview(FakeCanvas(), app.panel_entry_for_choice(chosen, files))
+assert preview["kind"] == "text"
+assert "body-9002" in preview["text"]
+app.apply_files_rail_value(
+    {{"collapsed": False, "selected": "file:9001"}},
+    conversation_id=cid,
+    files=files,
+)
+assert st.session_state.panel_selected == "file:9001"
+files_rail.mount = lambda **kwargs: {{"collapsed": False, "selected": kwargs["selected"]}}
 app.render_file_panel(store, cid, FakeCanvas())
 """
     harness = AppTest.from_string(script, default_timeout=30).run()
     assert not harness.exception, harness.exception
-    pickers = [box for box in harness.selectbox if (box.key or "").startswith("files-sidebar-choice-")]
-    assert len(pickers) == 1
-    picker = pickers[0]
-    assert picker.options == ["notes.txt", "syllabus.pdf"]
-    assert picker.value in {"file:9002", "syllabus.pdf"}
-    keys = [button.key for button in harness.download_button]
-    assert len(keys) == 1
-    assert "-panel" in keys[0]
-    rendered = " ".join(str(element.value) for element in harness.markdown)
-    rendered += " ".join(str(element.value) for element in harness.caption)
-    rendered += " ".join(str(element.value) for element in harness.code)
-    assert "syllabus.pdf" in rendered or "body-9002" in rendered
-
-    picker.select_index(0).run()
-    assert not harness.exception, harness.exception
-    pickers = [box for box in harness.selectbox if (box.key or "").startswith("files-sidebar-choice-")]
-    assert pickers[0].value in {"file:9001", "notes.txt"}
-    keys = [button.key for button in harness.download_button]
-    assert len(keys) == 1
-    assert "-panel" in keys[0]
-    rendered = " ".join(str(element.value) for element in harness.markdown)
-    rendered += " ".join(str(element.value) for element in harness.caption)
-    rendered += " ".join(str(element.value) for element in harness.code)
-    assert "notes.txt" in rendered or "body-9001" in rendered
+    assert harness.session_state.panel_selected == "file:9001"
 
 
 def test_files_sidebar_collapse_hides_dropdown(tmp_path):
@@ -832,6 +820,8 @@ import json
 import sys
 sys.path.insert(0, {repo!r})
 import app
+import files_rail
+import streamlit as st
 
 class FakeCanvas:
     def download_file(self, file_id, max_bytes=None):
@@ -849,19 +839,21 @@ app.remember_opened_files(
         "content": json.dumps({{"file": {{"file_id": 9001, "filename": "notes.txt"}}}}),
     }},
 )
+files = store.list_opened_files(cid)
+files_rail.mount = lambda **kwargs: {{"collapsed": True, "selected": kwargs.get("selected")}}
 app.render_file_panel(store, cid, FakeCanvas())
+assert st.session_state.files_sidebar_collapsed is True
+app.apply_files_rail_value(
+    {{"collapsed": False, "selected": files[0]["identity"]}},
+    conversation_id=cid,
+    files=files,
+)
+assert st.session_state.files_sidebar_collapsed is False
 """
     harness = AppTest.from_string(script, default_timeout=30).run()
     assert not harness.exception, harness.exception
-    assert any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
-    collapse = next(button for button in harness.button if button.key == "files-sidebar-collapse")
-    collapse.click().run()
-    assert not harness.exception, harness.exception
+    assert harness.session_state.files_sidebar_collapsed is False
     assert not any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
-    expand = next(button for button in harness.button if button.key == "files-sidebar-expand")
-    expand.click().run()
-    assert not harness.exception, harness.exception
-    assert any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
 
 
 def test_file_panel_isolated_when_switching_conversations(monkeypatch, tmp_path):
@@ -895,8 +887,7 @@ def test_file_panel_isolated_when_switching_conversations(monkeypatch, tmp_path)
     # Newest chat is Empty chat; panel must not list notes.txt.
     visible = _default_visible_text(harness)
     assert "Hi — what should we look up?" in visible
-    captions = " ".join(str(element.value) for element in harness.caption)
-    assert "No files opened in this chat yet." in captions + visible
+    assert list(harness.session_state.get("opened_files") or []) == []
     assert not any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
 
     opened = None
@@ -909,9 +900,7 @@ def test_file_panel_isolated_when_switching_conversations(monkeypatch, tmp_path)
     assert not harness.exception, harness.exception
     visible = _default_visible_text(harness)
     assert "The notes say Friday." in visible
-    pickers = [box for box in harness.selectbox if (box.key or "").startswith("files-sidebar-choice-")]
-    assert len(pickers) == 1
-    assert pickers[0].value in {"file:9001", "notes.txt"}
-    captions = " ".join(str(element.value) for element in harness.caption)
-    assert "No files opened in this chat yet." not in captions
+    opened_files = list(harness.session_state.get("opened_files") or [])
+    assert [entry.get("filename") for entry in opened_files] == ["notes.txt"]
+    assert not any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
 

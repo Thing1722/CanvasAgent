@@ -1552,30 +1552,34 @@ def test_panel_entry_for_choice_accepts_identity_or_label():
     assert app.panel_entry_for_choice("notes.txt", files)["identity"] == "file:1"
 
 
-def test_files_sidebar_uses_native_columns_not_js_dock():
-    """JS-docking a Streamlit block onto AppViewContainer duplicated the rail
-    on rerun (orphan + new host). Chat | files is a native st.columns split,
-    with chat_input inside the chat column so it cannot span a gap.
+def test_files_sidebar_uses_custom_component_not_js_dock():
+    """Native columns cannot pin a rail. JS-docking Streamlit widgets duplicated
+    hosts. The files UI is a declare_component iframe that paints one body host.
     """
     import inspect
 
+    import files_rail
+
     main_src = inspect.getsource(app.main)
     panel_src = inspect.getsource(app.render_file_panel)
-    assert "st.columns([2, 1]" in main_src
-    assert "with files_col:" in main_src
-    assert "with chat_col:" in main_src
-    files_block = main_src[main_src.find("with files_col:"): main_src.find("with chat_col:")]
-    assert "render_file_panel" in files_block
-    chat_block = main_src[main_src.find("with chat_col:"):]
-    assert "st.chat_input" in chat_block
-    assert "render_conversation" in chat_block
+    frontend = (files_rail.FRONTEND_DIR / "index.html").read_text()
+    assert "files_rail.mount" in panel_src
+    assert "render_file_panel" in main_src
+    assert "st.chat_input" in main_src
+    assert "st.columns([2, 1]" not in main_src
+    assert "with files_col:" not in main_src
     assert "appendChild" not in main_src
     assert "appendChild" not in panel_src
-    assert "FILES_SIDEBAR_KEY" in panel_src
-    assert "keyboard_double_arrow_right" in app.FILES_SIDEBAR_COLLAPSE_ICON
-    assert "keyboard_double_arrow_left" in app.FILES_SIDEBAR_EXPAND_ICON
+    assert "inject_files_sidebar_css" not in panel_src
+    assert "position: sticky" not in panel_src
     assert not hasattr(app, "files_sidebar_script")
     assert not hasattr(app, "inject_files_sidebar_chrome")
+    assert not hasattr(app, "inject_files_sidebar_css")
+    assert files_rail.HOST_ID in frontend
+    assert "streamlit:componentReady" in frontend
+    assert "streamlit:setComponentValue" in frontend
+    assert 'doc.body.appendChild(host)' in frontend
+    assert "st-key-files-sidebar" not in frontend
 
 
 def test_assistant_is_user_facing_hides_tool_calls_and_reasoning():
