@@ -1003,3 +1003,22 @@ def test_system_prompt_states_read_only_and_date():
     prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
     assert "read-only" in prompt
     assert "September 21, 2026" in prompt
+
+
+def test_file_preview_ids_are_unique_per_widget_instance():
+    app._file_preview_seq = 0
+    first = app.next_file_preview_id("call_hist")
+    second = app.next_file_preview_id("call_hist")
+    third = app.next_file_preview_id("call_new")
+    missing = app.next_file_preview_id(None)
+    assert len({first, second, third, missing}) == 4
+    assert first.startswith("call_hist-")
+    assert second.startswith("call_hist-")
+    assert third.startswith("call_new-")
+    assert missing.startswith("nocall-")
+    # Filename hashing is not part of uniqueness — these ids must not look
+    # like the old download-{file_id}-{hash%10000} scheme.
+    for preview_id in (first, second, third, missing):
+        assert "14814596" not in preview_id
+        parts = preview_id.rsplit("-", 1)
+        assert parts[-1].isdigit()

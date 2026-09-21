@@ -89,3 +89,84 @@ def test_new_chat_button_creates_a_conversation(monkeypatch, tmp_path):
     harness.sidebar.button[0].click().run()
     assert not harness.exception
     assert len(harness.sidebar.button) > before
+
+
+def test_two_open_file_messages_for_the_same_file_do_not_collide():
+    """Opening the same Canvas file twice used to raise StreamlitDuplicateElementKey
+    because download buttons keyed only on file_id plus a 4-digit filename hash."""
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import json
+import sys
+sys.path.insert(0, {repo!r})
+import app
+
+class FakeCanvas:
+    def download_file(self, file_id, max_bytes=None):
+        return (
+            b"Homework 4 notes",
+            {{
+                "file_id": file_id,
+                "filename": "notes.txt",
+                "content_type": "text/plain",
+                "size_readable": "16 B",
+            }},
+        )
+
+payload = {{"file": {{"file_id": 14814596, "filename": "notes.txt"}}}}
+canvas = FakeCanvas()
+for call_id in ("call_hist", "call_new"):
+    app.render_tool_message(
+        {{
+            "role": "tool",
+            "name": "open_file",
+            "tool_call_id": call_id,
+            "content": json.dumps(payload),
+        }},
+        canvas,
+    )
+# Missing tool_call_id must still uniquify (counter, not filename hash).
+app.render_file_preview(canvas, payload)
+app.render_file_preview(canvas, payload)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    keys = [button.key for button in harness.download_button]
+    assert len(keys) == 4
+    assert len(set(keys)) == 4
+    assert all(key and key.startswith("download-") for key in keys)
+
+
+def test_two_pdf_previews_for_the_same_file_do_not_collide(tmp_path):
+    from test_app import make_pdf
+
+    pdf_path = tmp_path / "syllabus.pdf"
+    pdf_path.write_bytes(make_pdf("Syllabus week 1"))
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+
+class FakeCanvas:
+    def download_file(self, file_id, max_bytes=None):
+        return (
+            open({str(pdf_path)!r}, "rb").read(),
+            {{
+                "file_id": file_id,
+                "filename": "syllabus.pdf",
+                "content_type": "application/pdf",
+                "size_readable": "1 KB",
+            }},
+        )
+
+payload = {{"file": {{"file_id": 14814596, "filename": "syllabus.pdf"}}}}
+canvas = FakeCanvas()
+app.render_file_preview(canvas, payload, tool_call_id="call_a")
+app.render_file_preview(canvas, payload, tool_call_id="call_b")
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    keys = [button.key for button in harness.download_button]
+    assert len(keys) == 2
+    assert len(set(keys)) == 2
