@@ -1606,6 +1606,12 @@ def test_files_sidebar_uses_custom_component_not_js_dock():
     assert "st-key-files-sidebar" not in frontend
     assert "files-rail-toggle" in frontend
     assert "files-rail-chevron" in frontend
+    assert "files-rail-resize" in frontend
+    assert "col-resize" in frontend
+    assert "button.files-rail-download" in frontend
+    assert "a.files-rail-download" not in frontend
+    assert "bottom: 0" in frontend
+    assert "100dvh" in frontend
     assert "position: sticky" not in frontend
     assert '[data-testid="stColumn"]' not in frontend
     assert "chevron_right" not in frontend
