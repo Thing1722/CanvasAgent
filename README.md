@@ -30,7 +30,7 @@ in `app.py`, a `requests.Session` subclass that raises `ReadOnlyViolation` unles
    cannot be sent somewhere else, and redirects are re-checked one hop at a time.
 
 Both the high-level `request()` path and the low-level `send()` path are checked, so there is no
-way to reach Canvas without passing the guard. The seven tools exposed to the model are
+way to reach Canvas without passing the guard. The eight tools exposed to the model are
 read-only lookups; the model cannot invoke arbitrary endpoints, and unknown tool names are rejected.
 `tests/test_app.py` covers all of this.
 
@@ -133,6 +133,7 @@ Each new terminal session needs the virtual environment activated again
 - "Show me the 21-241 syllabus."
 - "Pull up the lecture 5 slides and tell me what's on them."
 - "What exactly does the Comparative Genre Analysis ask for, and how do I submit it?"
+- "What did I turn in for Homework 4?" / "Did I upload the right PDF?"
 - "Open this PDF: https://..."
 - "What does this assignment formula mean?"
 
@@ -177,6 +178,10 @@ as written by the instructor (HTML stripped to readable text, with math kept), h
 submitted (file upload, text entry, a URL, on paper), which file extensions are allowed, how many
 attempts you get, the rubric, any files attached to the prompt, other http(s) links in the prompt,
 and whether you've submitted yet. Attached files and linked URLs can be opened from there.
+
+Ask what you turned in and the assistant GETs only **your** submission (`/submissions/self`): text
+entry, the URL you posted, uploaded files (openable in chat), grader/self comments, and your
+grade/status. It cannot list classmates' work or submit/comment.
 
 ## Conversation history
 
