@@ -2,11 +2,13 @@
 
 A local chat assistant that answers questions about your Canvas courses, assignments and
 deadlines — "what's due this week?", "when is Homework 4 due?", "what am I enrolled in?" — and
-that can pull up course files, showing PDFs, images and handouts right in the chat.
+that can pull up course files and https links, showing PDFs, images, pages and math right in the chat.
 
 It runs entirely on your own machine: a Streamlit web UI in your browser, conversation history in a
-local SQLite file, and **read-only** access to Canvas. The only data that leaves your machine goes
-to the Canvas instance you configure and to the DeepSeek API that powers the chat.
+local SQLite file, and **read-only** access to Canvas. Data that leaves your machine goes to the
+Canvas instance you configure, to the DeepSeek API that powers the chat, and — only when you ask
+the assistant to open a link — to that public https URL. The Canvas token is never sent off the
+Canvas origin (redirects included).
 
 - UI: [Streamlit](https://streamlit.io/)
 - LLM: DeepSeek (`deepseek-flash`), with function/tool calling
@@ -28,12 +30,18 @@ in `app.py`, a `requests.Session` subclass that raises `ReadOnlyViolation` unles
    cannot be sent somewhere else, and redirects are re-checked one hop at a time.
 
 Both the high-level `request()` path and the low-level `send()` path are checked, so there is no
-way to reach the network without passing the guard. The six tools exposed to the model are
+way to reach Canvas without passing the guard. The seven tools exposed to the model are
 read-only lookups; the model cannot invoke arbitrary endpoints, and unknown tool names are rejected.
 `tests/test_app.py` covers all of this.
 
-File downloads are the one place where traffic leaves the Canvas host, because Canvas answers a
-file request with a redirect to its storage backend. Those downloads use a second session that is
+Opening a non-Canvas https URL uses a **separate** GET-only session that never has the Canvas
+token. Localhost, private RFC1918, link-local, and metadata addresses are blocked, as are `http`,
+`file:`, and `javascript:` URLs. Redirects are followed one hop at a time and re-checked, so a
+public page cannot bounce the request onto a private host. Only https is allowed: cleartext http
+is an easy SSRF/mixed-content footgun, and Canvas itself already requires https.
+
+File downloads are the one place where Canvas traffic leaves the Canvas host, because Canvas answers
+a file request with a redirect to its storage backend. Those downloads use a second session that is
 still GET-only, must *start* at your Canvas origin, requires https, and strips the `Authorization`
 header the moment the host changes — so your Canvas token is never sent to the storage host.
 Downloaded files are held in memory for the preview and are never written to disk.
@@ -119,15 +127,27 @@ Each new terminal session needs the virtual environment activated again
 - "Show me the 21-241 syllabus."
 - "Pull up the lecture 5 slides and tell me what's on them."
 - "What exactly does the Comparative Genre Analysis ask for, and how do I submit it?"
+- "Open this PDF: https://..."
+- "What does this assignment formula mean?"
 
 It cannot submit work, upload files or message anyone; ask it and it will tell you to do that in
-Canvas yourself.
+Canvas yourself. JavaScript-heavy sites and Google Drive / login walls will show as HTML or an
+error, not as a rendered app.
 
 ### Viewing course files
 
 Ask for a file by name and the assistant searches your courses, then displays it inline: PDFs in a
 built-in viewer, images as images, text and code as text. Anything else — a `.pptx`, a `.zip` —
 comes with a Download button instead. There is a download button on every preview.
+
+Paste an https link (a Canvas file URL, an assignment page, or an ordinary PDF/webpage) and the
+assistant fetches it with `open_url`. Canvas file URLs reuse the same download path as `open_file`.
+HTML is stripped to readable text (math included); PDFs are shown with the same viewer.
+
+Math in assignment prompts and in the assistant's replies is rendered with Streamlit's built-in
+KaTeX support (`$...$` inline, `$$` on its own lines for display). Canvas MathJax (`\(...\)`,
+`\[...\]`, math spans) is converted before display. Short `.tex` snippets are rendered; a full
+paper is shown as source plus an excerpt.
 
 Files are found in three places, because courses publish them differently:
 
@@ -147,10 +167,10 @@ locked — the app respects whatever Canvas says you may see.
 ### Assignment details
 
 Ask what an assignment actually requires and the assistant pulls the full record: the instructions
-as written by the instructor (HTML stripped to readable text), how it must be submitted (file
-upload, text entry, a URL, on paper), which file extensions are allowed, how many attempts you
-get, the rubric, any files attached to the prompt, and whether you've submitted yet. Attached files
-can be opened straight from there.
+as written by the instructor (HTML stripped to readable text, with math kept), how it must be
+submitted (file upload, text entry, a URL, on paper), which file extensions are allowed, how many
+attempts you get, the rubric, any files attached to the prompt, other http(s) links in the prompt,
+and whether you've submitted yet. Attached files and linked URLs can be opened from there.
 
 ## Conversation history
 
@@ -178,8 +198,14 @@ python -m pytest
   credit.
 - **It can't find a file you know exists** — the assistant searches Files, then Modules, and finds
   assignment attachments through the assignment itself. A file linked only from a Page or an
-  Announcement still won't be found. Naming the course ("in 76-101") narrows the search, and asking
-  about the assignment ("what's attached to the CGA?") reaches attachments directly.
+  Announcement still won't be found unless you paste the URL. Naming the course ("in 76-101")
+  narrows the search, and asking about the assignment ("what's attached to the CGA?") reaches
+  attachments directly.
+- **A pasted link fails** — only public https URLs are fetched. Localhost, private IPs, and http
+  are blocked on purpose. Sites that need a Google login or are mostly JavaScript will not look
+  like they do in a browser; try a direct PDF link instead.
+- **Math shows as raw TeX** — Streamlit 1.50+ renders `$...$` / `$$`. Reinstall with
+  `pip install -r requirements.txt` if the UI is older.
 - **Port already in use** — run `streamlit run app.py --server.port 8502`.
 - **Changes to `.env` don't apply** — restart the app; environment variables are read at startup.
 

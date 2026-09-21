@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -566,6 +567,7 @@ def test_tool_schemas_are_well_formed():
         "find_course_files",
         "open_file",
         "get_assignment_details",
+        "open_url",
     }
     for schema in app.TOOL_SCHEMAS:
         assert schema["type"] == "function"
@@ -662,6 +664,7 @@ ASSIGNMENT_ROW = {
         "<ul><li>1200-1500 words</li><li>MLA format</li></ul>"
         "<p>See the "
         '<a href="/courses/1/files/4242/download?wrap=1">CGA prompt</a> for details.</p>'
+        '<p>Read <a href="https://www.cs.cmu.edu/~handout.pdf">the extra PDF</a>.</p>'
         "<script>ignore me</script>"
     ),
     "rubric": [{"description": "Analysis", "points": 60}, {"description": "Prose", "points": 40}],
@@ -682,6 +685,9 @@ def test_get_assignment_details_returns_prompt_and_submission_type(client_factor
     assert "ignore me" not in details["instructions"]
     assert "<p>" not in details["instructions"]
     assert details["attached_files"] == [{"file_id": 4242, "filename": "CGA prompt"}]
+    assert details["linked_urls"] == [
+        {"url": "https://www.cs.cmu.edu/~handout.pdf", "label": "the extra PDF"}
+    ]
     assert details["submission_status"]["workflow_state"] == "unsubmitted"
     assert [item["criterion"] for item in details["rubric"]] == ["Analysis", "Prose"]
     assert details["due_at_local"]
@@ -733,29 +739,30 @@ def test_assignment_listings_now_include_submission_types(client_factory):
 
 
 def test_html_to_text_and_links():
-    text, links = app.html_to_text_and_links(
+    text, links, urls = app.html_to_text_and_links(
         "<h2>Prompt</h2><p>Compare &amp; contrast.</p>"
         '<p><a href="https://canvas.example.edu/courses/1/files/77">handout.pdf</a></p>'
         '<p><a href="https://example.com/other">not a canvas file</a></p>'
     )
     assert "Prompt" in text and "Compare & contrast." in text
     assert links == [(77, "handout.pdf")]
+    assert urls == [{"url": "https://example.com/other", "label": "not a canvas file"}]
 
 
 def test_html_to_text_keeps_bullets_on_consecutive_lines():
-    text, _ = app.html_to_text_and_links("<ul><li>1200 words</li><li>MLA format</li></ul>")
+    text, *_ = app.html_to_text_and_links("<ul><li>1200 words</li><li>MLA format</li></ul>")
     assert "- 1200 words\n- MLA format" in text
 
 
 def test_html_to_text_truncates_very_long_prompts():
-    text, _ = app.html_to_text_and_links("<p>" + "word " * 5000 + "</p>")
+    text, *_ = app.html_to_text_and_links("<p>" + "word " * 5000 + "</p>")
     assert text.endswith("[truncated]")
     assert len(text) <= app.MAX_DESCRIPTION_CHARS + 20
 
 
 def test_html_to_text_handles_empty_description():
-    assert app.html_to_text_and_links("") == ("", [])
-    assert app.html_to_text_and_links(None) == ("", [])
+    assert app.html_to_text_and_links("") == ("", [], [])
+    assert app.html_to_text_and_links(None) == ("", [], [])
 
 
 def test_matches_all_words():
@@ -1003,3 +1010,263 @@ def test_system_prompt_states_read_only_and_date():
     prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
     assert "read-only" in prompt
     assert "September 21, 2026" in prompt
+    assert "open_url" in prompt
+    assert "$...$" in prompt
+
+
+# --- math / LaTeX conversion ------------------------------------------------
+
+
+def test_to_streamlit_math_converts_mathjax_delimiters():
+    converted = app.to_streamlit_math(r"Inline \(E=mc^2\) and display \[\int_0^1 x\,dx\].")
+    assert "$E=mc^2$" in converted
+    assert "$$\n\\int_0^1 x\\,dx\n$$" in converted
+
+
+def test_html_math_survives_conversion():
+    text, files, urls = app.html_to_text_and_links(
+        "<p>Compute \\(\\frac{a}{b}\\) then "
+        "\\[\\sum_{n=1}^{N} n\\].</p>"
+        '<script type="math/tex">E=mc^2</script>'
+        '<script type="math/tex; mode=display">x^2+y^2=z^2</script>'
+        '<span class="math">\\log n</span>'
+        '<div class="math">\\int_0^1 x\\,dx</div>'
+        '<p>Also $$\\sqrt{2}$$ in the prompt.</p>'
+        "<script>alert(1)</script>"
+    )
+    assert files == [] and urls == []
+    assert r"$\frac{a}{b}$" in text
+    assert r"\sum_{n=1}^{N} n" in text
+    assert "$$" in text
+    assert "$E=mc^2$" in text
+    assert r"$x^2+y^2=z^2$" not in text  # display math uses $$
+    assert r"x^2+y^2=z^2" in text
+    assert r"$\log n$" in text
+    assert r"\int_0^1 x\,dx" in text
+    assert r"\sqrt{2}" in text
+    assert "alert" not in text
+
+
+def test_extract_text_strips_html_and_keeps_math():
+    html = (
+        b"<html><body><h1>Syllabus</h1><p>Grade is \\(x^2\\).</p>"
+        b'<a href="https://example.com/rubric">rubric</a></body></html>'
+    )
+    text, truncated = app.extract_text(html, "text/html; charset=utf-8", base_url="https://example.com/s")
+    assert truncated is False
+    assert "Syllabus" in text
+    assert "<h1>" not in text
+    assert "$x^2$" in text
+
+
+def test_extract_text_reads_tex_as_text():
+    source = rb"\frac{1}{2} + \alpha"
+    text, truncated = app.extract_text(source, "text/x-tex", filename="snippet.tex")
+    assert text == source.decode()
+    assert truncated is False
+
+
+# --- open_url --------------------------------------------------------------
+
+PUBLIC_ADDRINFO = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+
+@pytest.fixture
+def public_dns():
+    with mock.patch.object(app.socket, "getaddrinfo", return_value=PUBLIC_ADDRINFO):
+        yield
+
+
+def test_external_session_blocks_non_get():
+    session = app.ExternalGetSession()
+    with pytest.raises(app.ReadOnlyViolation):
+        session.post("https://example.com/")
+    prepared = requests.Request("PUT", "https://example.com/").prepare()
+    with pytest.raises(app.ReadOnlyViolation):
+        session.send(prepared)
+
+
+def test_external_session_strips_authorization_header():
+    session = app.ExternalGetSession()
+    prepared = requests.Request(
+        "GET", "https://example.com/notes.txt", headers={"Authorization": f"Bearer {TOKEN}"}
+    ).prepare()
+    sent = {}
+
+    def capture(self, request, **kwargs):
+        sent["headers"] = dict(request.headers)
+        return make_response([], url=request.url)
+
+    with mock.patch.object(requests.Session, "send", autospec=True, side_effect=capture):
+        session.send(prepared)
+    assert "Authorization" not in sent["headers"]
+    assert "Cookie" not in sent["headers"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com/x",
+        "https://localhost/secret",
+        "https://127.0.0.1/",
+        "https://[::1]/",
+        "https://10.0.0.5/admin",
+        "https://192.168.1.8/",
+        "https://172.16.0.1/",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://metadata.google.internal/",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "https://user:pass@example.com/x",
+    ],
+)
+def test_open_url_rejects_ssrf_and_non_https(client_factory, url):
+    client, fake = client_factory([])
+    result = app.dispatch_tool(client, "open_url", {"url": url})
+    assert "error" in result
+    assert fake.requests == []
+    assert TOKEN not in json.dumps(result)
+
+
+def test_open_url_rejects_hostname_that_resolves_privately(client_factory):
+    client, fake = client_factory([])
+    private = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.1.2.3", 0))]
+    with mock.patch.object(app.socket, "getaddrinfo", return_value=private):
+        result = app.dispatch_tool(client, "open_url", {"url": "https://evil.example.com/flag"})
+    assert "error" in result
+    assert "private" in result["error"].lower() or "Blocked" in result["error"]
+    assert fake.requests == []
+
+
+def test_open_url_requires_a_url(client_factory):
+    client, fake = client_factory([])
+    result = app.dispatch_tool(client, "open_url", {})
+    assert "https URL" in result["error"]
+    assert fake.requests == []
+
+
+def test_open_url_html(client_factory, public_dns):
+    html = b"<html><body><h1>Syllabus</h1><p>Week 1: stacks.</p></body></html>"
+    client, fake = client_factory([make_binary_response(html, "text/html")])
+    result = app.dispatch_tool(client, "open_url", {"url": "https://cs.example.edu/syllabus.html"})
+    assert result["displayed_to_student"] is True
+    assert result["resource"]["content_type"] == "text/html"
+    assert "Week 1: stacks." in result["text_excerpt"]
+    assert "<h1>" not in result["text_excerpt"]
+    assert "Authorization" not in fake.requests[0].headers
+    assert TOKEN not in fake.requests[0].url
+    json.dumps(result)
+
+
+def test_open_url_plain_text(client_factory, public_dns):
+    client, fake = client_factory([make_binary_response(b"Office hours: Friday", "text/plain")])
+    result = app.dispatch_tool(client, "open_url", {"url": "https://cs.example.edu/hours.txt"})
+    assert result["text_excerpt"] == "Office hours: Friday"
+    assert "Authorization" not in fake.requests[0].headers
+
+
+def test_open_url_pdf(client_factory, public_dns):
+    pytest.importorskip("pypdf")
+    pdf = make_pdf("Midterm is October 9")
+    client, fake = client_factory([make_binary_response(pdf, "application/pdf")])
+    result = app.dispatch_tool(client, "open_url", {"url": "https://cs.example.edu/midterm.pdf"})
+    assert "Midterm is October 9" in result["text_excerpt"]
+    assert result["resource"]["content_type"] == "application/pdf"
+    assert "Authorization" not in fake.requests[0].headers
+
+
+def test_open_url_other_types_do_not_dump_binary(client_factory, public_dns):
+    client, _ = client_factory([make_binary_response(b"PK\x03\x04binaryzip", "application/zip")])
+    result = app.dispatch_tool(client, "open_url", {"url": "https://cs.example.edu/slides.zip"})
+    assert "text_excerpt" not in result
+    dumped = json.dumps(result)
+    assert "PK" not in dumped
+    assert result["displayed_to_student"] is True
+
+
+def test_open_url_canvas_file_routes_to_download(client_factory):
+    pytest.importorskip("pypdf")
+    pdf = make_pdf("Syllabus week 1")
+    client, fake = client_factory([FILE_ROW, make_binary_response(pdf, "application/pdf")])
+    result = app.dispatch_tool(
+        client, "open_url", {"url": f"{BASE_URL}/courses/1/files/9001/download?wrap=1"}
+    )
+    assert result["opened_via"] == "open_file"
+    assert result["file"]["file_id"] == 9001
+    assert "Syllabus week 1" in result["text_excerpt"]
+    assert "verifier" not in json.dumps(result)
+    assert fake.requests[0].headers["Authorization"] == f"Bearer {TOKEN}"
+    assert "/files/9001" in fake.requests[0].url
+
+
+def test_open_url_canvas_assignment_url_uses_details(client_factory):
+    client, fake = client_factory([[{"id": 1, "name": "76-101"}], ASSIGNMENT_ROW])
+    result = app.dispatch_tool(
+        client, "open_url", {"url": f"{BASE_URL}/courses/1/assignments/3100"}
+    )
+    assert result["opened_via"] == "get_assignment_details"
+    assert result["assignment"]["title"] == "Comparative Genre Analysis"
+    assert "comparative genre analysis" in result["assignment"]["instructions"]
+    assert fake.requests[0].headers["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_open_url_does_not_follow_redirect_onto_private_host(client_factory, public_dns):
+    redirect = make_response({}, status=302, headers={"Location": "https://10.0.0.5/secret"})
+    client, fake = client_factory([redirect])
+    result = app.dispatch_tool(client, "open_url", {"url": "https://cs.example.edu/bounce"})
+    assert "error" in result
+    assert len(fake.requests) == 1
+    assert "Authorization" not in fake.requests[0].headers
+
+
+def test_open_url_redirect_does_not_attach_canvas_token(client_factory, public_dns):
+    redirect = make_response(
+        {}, status=302, headers={"Location": "https://cdn.example.edu/notes.txt"}
+    )
+    client, fake = client_factory(
+        [redirect, make_binary_response(b"notes body", "text/plain")]
+    )
+    result = app.dispatch_tool(client, "open_url", {"url": "https://cs.example.edu/go"})
+    assert result["text_excerpt"] == "notes body"
+    assert len(fake.requests) == 2
+    for request in fake.requests:
+        assert "Authorization" not in request.headers
+        assert TOKEN not in request.url
+
+
+def test_agent_turn_open_url_does_not_crash(client_factory, public_dns):
+    client, _ = client_factory([make_binary_response(b"<p>Hello</p>", "text/html")])
+    deepseek = ScriptedDeepSeek(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "open_url",
+                            "arguments": '{"url": "https://cs.example.edu/hello.html"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "The page says Hello. $a=b$."},
+        ]
+    )
+    produced = app.run_agent_turn(
+        deepseek, client, [{"role": "user", "content": "open https://cs.example.edu/hello.html"}]
+    )
+    assert [m["role"] for m in produced] == ["assistant", "tool", "assistant"]
+    payload = json.loads(produced[1]["content"])
+    assert payload["displayed_to_student"] is True
+    assert "Hello" in payload["text_excerpt"]
+    assert produced[-1]["content"] == "The page says Hello. $a=b$."
+
+
+def test_canvas_file_id_from_url_only_matches_configured_origin():
+    assert app.canvas_file_id_from_url(f"{BASE_URL}/files/99/download", BASE_URL) == 99
+    assert app.canvas_file_id_from_url("https://evil.example.com/files/99", BASE_URL) is None
+    assert app.canvas_file_id_from_url("https://example.com/midterm.pdf", BASE_URL) is None
+

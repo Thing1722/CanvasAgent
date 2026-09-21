@@ -6,29 +6,34 @@ courses, assignments and due dates. Run it with:
     streamlit run app.py
 
 Everything is local: the Streamlit UI, the SQLite conversation history and the
-Canvas API calls. The only outbound traffic is to the Canvas host you configure
-and to the DeepSeek API.
+Canvas API calls. Outbound traffic goes to the Canvas host you configure, to
+the DeepSeek API, and — only when the model calls open_url — to a public https
+URL, with no Canvas token attached.
 
 Safety: every Canvas request goes through ReadOnlySession, which refuses any
 HTTP method other than GET and refuses any host other than the configured
-Canvas origin. Nothing in this file can submit an assignment, send a message or
-change Canvas state.
+Canvas origin. External fetches use a separate GET-only session that never
+carries the Canvas token. Nothing in this file can submit an assignment, send
+a message or change Canvas state.
 """
 
 from __future__ import annotations
 
+import html as html_module
 import io
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 import streamlit as st
@@ -81,10 +86,23 @@ DEFAULT_DB_PATH = "canvas_assistant.db"
 USER_AGENT = "cmu-canvas-study-assistant/1.0"
 
 # Files larger than this are described but not downloaded, so a stray 2 GB
-# lecture recording cannot wedge the app.
+# lecture recording cannot wedge the app. The same cap applies to open_url.
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
+MAX_REDIRECTS = 5
+# KaTeX cannot render a full paper; snippets this small are shown as math too.
+TEX_RENDER_CHARS = 4_000
 
 PREVIEWABLE_TYPES = ("application/pdf", "image/", "text/")
+TEX_CONTENT_TYPES = {"text/x-tex", "application/x-tex", "text/latex"}
+
+# Hostnames that must never be fetched, even over https.
+BLOCKED_HOSTNAMES = {
+    "localhost",
+    "localhost.localdomain",
+    "metadata.google.internal",
+    "metadata",
+    "instance-data",
+}
 
 # Assignment prompts can be long; keep enough to be useful in a prompt budget.
 MAX_DESCRIPTION_CHARS = 8_000
@@ -195,6 +213,173 @@ class ReadOnlySession(requests.Session):
         return super().send(request, **kwargs)
 
 
+class UrlFetchError(RuntimeError):
+    """A URL could not be opened safely or the fetch failed."""
+
+
+class ExternalGetSession(requests.Session):
+    """GET-only session for public https URLs. Never carries a Canvas token.
+
+    Redirects are not followed automatically: the caller re-checks each hop so
+    a public URL cannot bounce onto a private address. Authorization and Cookie
+    headers are stripped on every send, in case a caller tried to attach them.
+    """
+
+    def request(self, method, url, *args, **kwargs):  # type: ignore[override]
+        if (method or "").upper() != "GET":
+            raise ReadOnlyViolation(
+                f"Blocked {method!r} request: external fetches are read-only and may only issue GET."
+            )
+        kwargs.setdefault("allow_redirects", False)
+        return super().request(method, url, *args, **kwargs)
+
+    def send(self, request, **kwargs):  # type: ignore[override]
+        if (request.method or "").upper() != "GET":
+            raise ReadOnlyViolation(
+                f"Blocked {request.method!r} request: external fetches are read-only and may only issue GET."
+            )
+        request.headers.pop("Authorization", None)
+        request.headers.pop("Cookie", None)
+        return super().send(request, **kwargs)
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return _is_blocked_ip(ip.ipv4_mapped)
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+        return True
+    if ip.is_reserved or ip.is_unspecified:
+        return True
+    # Carrier-grade NAT and the "this host" documentation range are not
+    # somewhere a student's PDF should live.
+    if ip in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    if ip in ipaddress.ip_network("0.0.0.0/8"):
+        return True
+    return False
+
+
+def parse_https_url(url: str) -> Any:
+    """Parse an absolute https URL or raise UrlFetchError."""
+    raw = (url or "").strip()
+    if not raw:
+        raise UrlFetchError("open_url needs an https URL.")
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    if scheme in {"file", "javascript", "data", "ftp", "ws", "wss", "http"}:
+        if scheme == "http":
+            raise UrlFetchError("Only https URLs can be opened (http is blocked to avoid cleartext and mixed-content SSRF).")
+        raise UrlFetchError(f"Blocked URL scheme {scheme!r}. Only https is allowed.")
+    if scheme != "https":
+        raise UrlFetchError("Only https URLs can be opened.")
+    if parsed.username or parsed.password:
+        raise UrlFetchError("URLs with embedded credentials are not allowed.")
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        raise UrlFetchError("URL is missing a hostname.")
+    if hostname in BLOCKED_HOSTNAMES:
+        raise UrlFetchError(f"Blocked local or metadata host {hostname!r}.")
+    return parsed
+
+
+def assert_public_https_url(url: str) -> None:
+    """Reject non-https, local, private, and link-local targets (including DNS)."""
+    parsed = parse_https_url(url)
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if _is_blocked_ip(literal):
+            raise UrlFetchError(f"Blocked private or local address {hostname}.")
+        return
+    try:
+        answers = socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise UrlFetchError(f"Could not resolve {hostname}: {exc}") from exc
+    if not answers:
+        raise UrlFetchError(f"Could not resolve {hostname}.")
+    for info in answers:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip):
+            raise UrlFetchError(f"Blocked private or local address for {hostname}.")
+
+
+def canvas_file_id_from_url(url: str, canvas_base_url: str) -> int | None:
+    """Return a Canvas file id if ``url`` is a file on the configured origin."""
+    try:
+        if origin_of(url) != origin_of(canvas_base_url):
+            return None
+    except ReadOnlyViolation:
+        return None
+    match = FILE_LINK_PATTERN.search(urlparse(url).path or "")
+    return int(match.group(1)) if match else None
+
+
+def canvas_assignment_from_url(url: str, canvas_base_url: str) -> tuple[int, int] | None:
+    """Return (course_id, assignment_id) for a Canvas assignment page URL."""
+    try:
+        if origin_of(url) != origin_of(canvas_base_url):
+            return None
+    except ReadOnlyViolation:
+        return None
+    match = ASSIGNMENT_URL_PATTERN.search(urlparse(url).path or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def read_capped_body(response: requests.Response, max_bytes: int, label: str) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            raise UrlFetchError(
+                f"{label} exceeds the {human_size(max_bytes)} preview limit."
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def is_tex_type(content_type: str, filename: str = "") -> bool:
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    name = (filename or "").lower()
+    return ctype in TEX_CONTENT_TYPES or name.endswith(".tex")
+
+
+def sniff_content_type(url: str, content_type: str, content: bytes, filename: str = "") -> str:
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    path = (filename or urlparse(url).path or "").lower()
+    if content[:4] == b"%PDF":
+        return "application/pdf"
+    if path.endswith(".pdf") and ctype in ("", "application/octet-stream"):
+        return "application/pdf"
+    if path.endswith(".tex") and ctype in ("", "application/octet-stream", "text/plain"):
+        return "text/x-tex"
+    stripped = content.lstrip()[:64].lower()
+    if ctype in ("", "application/octet-stream") and (
+        stripped.startswith(b"<!doctype html") or stripped.startswith(b"<html")
+    ):
+        return "text/html"
+    return ctype or "application/octet-stream"
+
+
+def filename_from_url(url: str, content_type: str = "") -> str:
+    name = Path(unquote(urlparse(url).path or "")).name
+    if name:
+        return name
+    subtype = (content_type.split(";")[0].split("/")[-1] or "download").strip() or "download"
+    if subtype in {"*", "octet-stream", "html"}:
+        return "download.html" if subtype == "html" else "download"
+    return f"download.{subtype}"
+
+
 # ---------------------------------------------------------------------------
 # Canvas client (read-only)
 # ---------------------------------------------------------------------------
@@ -277,35 +462,117 @@ class _HtmlExtractor(HTMLParser):
 
 
 FILE_LINK_PATTERN = re.compile(r"/files/(\d+)")
+ASSIGNMENT_URL_PATTERN = re.compile(r"/courses/(\d+)/assignments/(\d+)")
+_MATH_SCRIPT_RE = re.compile(
+    r'<script([^>]*type=["\']math/tex[^"\']*["\'][^>]*)>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+_MATH_ELEM_RE = re.compile(
+    r'<(span|div)(\s[^>]*class=["\'][^"\']*\b(?:math|mathjax|katex|equation)[^"\']*["\'][^>]*)>'
+    r"(.*?)</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
-def html_to_text_and_links(html: str) -> tuple[str, list[tuple[int, str]]]:
-    """Return readable text and any Canvas file links found in ``html``."""
+def to_streamlit_math(text: str) -> str:
+    """Turn MathJax delimiters into Streamlit/KaTeX ``$`` / ``$$`` markup.
+
+    Streamlit's markdown renderer needs block math on its own lines:
+    a ``$$`` fence, the TeX, then a closing ``$$``.
+    """
+    if not text:
+        return text
+    text = re.sub(
+        r"\\\[(.+?)\\\]",
+        lambda match: f"\n$$\n{match.group(1).strip()}\n$$\n",
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"\\\((.+?)\\\)",
+        lambda match: f"${match.group(1).strip()}$",
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"\$\$(.+?)\$\$",
+        lambda match: f"\n$$\n{match.group(1).strip()}\n$$\n",
+        text,
+        flags=re.DOTALL,
+    )
+    return text
+
+
+def rewrite_html_math_tags(html: str) -> str:
+    """Replace MathJax ``<script type="math/tex">`` / math spans with TeX delimiters."""
+
+    def from_script(match: re.Match[str]) -> str:
+        attrs, inner = match.group(1), match.group(2)
+        body = html_module.unescape(inner).strip()
+        if re.search(r"mode\s*=\s*display", attrs, re.IGNORECASE):
+            return f"\n$$\n{body}\n$$\n"
+        return f"${body}$"
+
+    html = _MATH_SCRIPT_RE.sub(from_script, html)
+
+    def from_elem(match: re.Match[str]) -> str:
+        tag, attrs, inner = match.group(1), match.group(2), match.group(3)
+        body = html_module.unescape(re.sub(r"<[^>]+>", "", inner)).strip()
+        display = tag.lower() == "div" or "display" in attrs.lower()
+        if display:
+            return f"\n$$\n{body}\n$$\n"
+        return f"${body}$"
+
+    return _MATH_ELEM_RE.sub(from_elem, html)
+
+
+def html_to_text_and_links(
+    html: str,
+    base_url: str | None = None,
+    max_chars: int = MAX_DESCRIPTION_CHARS,
+) -> tuple[str, list[tuple[int, str]], list[dict[str, str]]]:
+    """Return readable text, Canvas file links, and other http(s) links.
+
+    MathJax in the HTML is converted to Streamlit-renderable ``$`` / ``$$``.
+    """
     if not html:
-        return "", []
+        return "", [], []
     parser = _HtmlExtractor()
-    parser.feed(html)
+    parser.feed(rewrite_html_math_tags(html))
     parser.close()
 
     text = "".join(parser.parts)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
     text = "\n".join(line.strip() for line in text.splitlines()).strip()
-    if len(text) > MAX_DESCRIPTION_CHARS:
-        text = text[:MAX_DESCRIPTION_CHARS] + "\n[truncated]"
+    text = to_streamlit_math(text)
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars] + "\n[truncated]"
 
     files: list[tuple[int, str]] = []
-    seen: set[int] = set()
+    urls: list[dict[str, str]] = []
+    seen_files: set[int] = set()
+    seen_urls: set[str] = set()
     for href, label in parser.links:
-        match = FILE_LINK_PATTERN.search(href or "")
-        if not match:
+        file_match = FILE_LINK_PATTERN.search(href or "")
+        if file_match:
+            file_id = int(file_match.group(1))
+            if file_id in seen_files:
+                continue
+            seen_files.add(file_id)
+            files.append((file_id, label or f"file {file_id}"))
             continue
-        file_id = int(match.group(1))
-        if file_id in seen:
+        absolute = href or ""
+        if base_url:
+            absolute = urljoin(base_url.rstrip("/") + "/", absolute)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             continue
-        seen.add(file_id)
-        files.append((file_id, label or f"file {file_id}"))
-    return text, files
+        if absolute in seen_urls:
+            continue
+        seen_urls.add(absolute)
+        urls.append({"url": absolute, "label": label or absolute})
+    return text, files, urls
 
 
 def human_size(num_bytes: Any) -> str | None:
@@ -354,6 +621,9 @@ class CanvasClient:
         # to its storage backend. Still GET-only; the token is dropped offsite.
         self.download_session = ReadOnlySession(self.base_url, allow_offsite_redirects=True)
         self.download_session.headers.update({"User-Agent": USER_AGENT})
+        # Public https URLs. GET only, no Canvas token, no cookies.
+        self.external_session = ExternalGetSession()
+        self.external_session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
 
     # -- plumbing ---------------------------------------------------------
 
@@ -521,7 +791,7 @@ class CanvasClient:
 
         details = self._normalize_assignment(row, course)
         description = row.get("description") or ""
-        text, links = html_to_text_and_links(description)
+        text, links, url_links = html_to_text_and_links(description, base_url=self.base_url)
         submission = row.get("submission") or {}
         details.update(
             {
@@ -535,6 +805,7 @@ class CanvasClient:
                 "attached_files": [
                     {"file_id": file_id, "filename": name} for file_id, name in links
                 ],
+                "linked_urls": url_links,
                 "submission_status": {
                     "submitted_at": submission.get("submitted_at"),
                     "workflow_state": submission.get("workflow_state"),
@@ -789,6 +1060,103 @@ class CanvasClient:
             described["content_type"] = response.headers.get("Content-Type", "application/octet-stream")
         return b"".join(chunks), described
 
+    def _describe_fetched(
+        self,
+        url: str,
+        content: bytes,
+        content_type: str,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        filename = filename or filename_from_url(url, content_type)
+        content_type = sniff_content_type(url, content_type, content, filename)
+        size = len(content)
+        previewable = content_type.startswith(PREVIEWABLE_TYPES) or is_tex_type(content_type, filename)
+        return {
+            "url": url,
+            "filename": filename,
+            "content_type": content_type,
+            "size_bytes": size,
+            "size_readable": human_size(size),
+            "previewable": previewable,
+        }
+
+    def _get_canvas_url_bytes(
+        self, url: str, max_bytes: int = MAX_DOWNLOAD_BYTES
+    ) -> tuple[bytes, dict[str, Any]]:
+        """GET a same-origin Canvas URL (token stays on the Canvas origin)."""
+        try:
+            response = self.session.get(
+                url,
+                headers={**self._auth_headers(), "Accept": "*/*"},
+                timeout=self.timeout,
+                stream=True,
+            )
+        except ReadOnlyViolation:
+            raise
+        except requests.RequestException as exc:
+            raise UrlFetchError(f"Could not fetch {url}: {redact(exc)}") from exc
+        with response:
+            if response.status_code in (401, 403):
+                raise UrlFetchError(
+                    f"Canvas refused access ({response.status_code}) to {urlparse(url).path}."
+                )
+            if response.status_code >= 400:
+                raise UrlFetchError(
+                    f"Canvas returned HTTP {response.status_code} for {urlparse(url).path}."
+                )
+            try:
+                content = read_capped_body(response, max_bytes, url)
+            except UrlFetchError:
+                raise
+        content_type = response.headers.get("Content-Type", "application/octet-stream")
+        return content, self._describe_fetched(str(response.url or url), content, content_type)
+
+    def _get_external_url_bytes(
+        self, url: str, max_bytes: int = MAX_DOWNLOAD_BYTES
+    ) -> tuple[bytes, dict[str, Any]]:
+        """GET a public https URL. No Canvas token, redirects re-checked each hop."""
+        current = url
+        response: requests.Response | None = None
+        for _ in range(MAX_REDIRECTS + 1):
+            assert_public_https_url(current)
+            try:
+                response = self.external_session.get(
+                    current, timeout=self.timeout, stream=True, allow_redirects=False
+                )
+            except ReadOnlyViolation:
+                raise
+            except requests.RequestException as exc:
+                raise UrlFetchError(f"Could not fetch {current}: {redact(exc)}") from exc
+            if 300 <= response.status_code < 400:
+                location = response.headers.get("Location")
+                response.close()
+                if not location:
+                    raise UrlFetchError("Redirect had no Location header.")
+                current = urljoin(current, location)
+                continue
+            break
+        else:
+            raise UrlFetchError("Too many redirects.")
+
+        assert response is not None
+        with response:
+            if response.status_code >= 400:
+                path = urlparse(current)
+                raise UrlFetchError(f"URL returned HTTP {response.status_code} for {path.netloc}{path.path}.")
+            content = read_capped_body(response, max_bytes, current)
+        content_type = response.headers.get("Content-Type", "application/octet-stream")
+        return content, self._describe_fetched(current, content, content_type)
+
+    def fetch_url(self, url: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, dict[str, Any]]:
+        """Fetch an https URL as bytes. Canvas origin uses the token; anything else does not."""
+        try:
+            same_origin = origin_of(url) == origin_of(self.base_url)
+        except ReadOnlyViolation as exc:
+            raise UrlFetchError(str(exc)) from exc
+        if same_origin:
+            return self._get_canvas_url_bytes(url, max_bytes=max_bytes)
+        return self._get_external_url_bytes(url, max_bytes=max_bytes)
+
 
 # ---------------------------------------------------------------------------
 # Tools exposed to the model (all read-only)
@@ -910,7 +1278,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "Display a Canvas file to the student in the chat. PDFs, images and text files are "
                 "shown inline; anything else is offered as a download. Get the file_id from "
-                "find_course_files first. Returns the file's metadata, and for text files its text."
+                "find_course_files first. For a Canvas file URL (/files/<id>) use open_url, which "
+                "routes here. Returns the file's metadata, and for text files its text."
             ),
             "parameters": {
                 "type": "object",
@@ -931,10 +1300,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "Get everything Canvas knows about one assignment: the full instructions/prompt, "
                 "how it must be submitted (file upload, text entry, URL, on paper), allowed file "
-                "extensions, attempts, rubric, attached files, and the student's submission "
-                "status. Use this whenever the student asks what an assignment actually requires "
-                "or how to turn it in. Get assignment_id and course_id from "
-                "list_upcoming_assignments or find_due_dates."
+                "extensions, attempts, rubric, attached files, other http(s) links in the prompt, "
+                "and the student's submission status. Use this whenever the student asks what an "
+                "assignment actually requires or how to turn it in. Get assignment_id and course_id "
+                "from list_upcoming_assignments or find_due_dates. Follow non-file links with open_url."
             ),
             "parameters": {
                 "type": "object",
@@ -952,6 +1321,31 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_url",
+            "description": (
+                "Fetch and display an https URL in the chat so you can read it. Use this when the "
+                "student pastes a link, when assignment HTML contains a non-file http(s) link, or "
+                "when a module/page points at a PDF or webpage. Canvas file URLs (/files/<id> or "
+                "/files/<id>/download) are opened through the existing file download path so the "
+                "token stays on Canvas. PDFs, images, HTML and text are shown inline; other types "
+                "get a download button. Never invent page contents — call this instead of guessing. "
+                "Localhost, private, and metadata addresses are blocked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The https URL to open, for example a PDF, a webpage, or a Canvas file link.",
+                    }
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 TOOL_NAMES = tuple(schema["function"]["name"] for schema in TOOL_SCHEMAS)
@@ -959,16 +1353,27 @@ TOOL_NAMES = tuple(schema["function"]["name"] for schema in TOOL_SCHEMAS)
 MAX_EXTRACTED_CHARS = 20_000
 
 
-def extract_text(content: bytes, content_type: str) -> tuple[str | None, bool]:
+def extract_text(
+    content: bytes,
+    content_type: str,
+    filename: str = "",
+    base_url: str | None = None,
+) -> tuple[str | None, bool]:
     """Pull readable text out of a downloaded file so the model can discuss it.
 
     Returns (text, truncated). Text is None for formats we cannot read, in
     which case the student still sees the file itself in the UI.
     """
+    ctype = (content_type or "").split(";")[0].strip().lower()
     text: str | None = None
-    if content_type.startswith("text/"):
+    if ctype in {"text/html", "application/xhtml+xml"}:
+        decoded = content.decode("utf-8", errors="replace")
+        text, _files, _urls = html_to_text_and_links(
+            decoded, base_url=base_url, max_chars=MAX_EXTRACTED_CHARS
+        )
+    elif is_tex_type(ctype, filename) or ctype.startswith("text/"):
         text = content.decode("utf-8", errors="replace")
-    elif content_type == "application/pdf":
+    elif ctype == "application/pdf":
         try:
             from pypdf import PdfReader
         except ImportError:
@@ -985,6 +1390,74 @@ def extract_text(content: bytes, content_type: str) -> tuple[str | None, bool]:
     if len(text) > MAX_EXTRACTED_CHARS:
         return text[:MAX_EXTRACTED_CHARS], True
     return text, False
+
+
+def _open_file_result(client: CanvasClient, file_id: int) -> dict[str, Any]:
+    content, described = client.download_file(int(file_id))
+    result: dict[str, Any] = {
+        "file": described,
+        "displayed_to_student": True,
+        "note": "The file is now shown in the chat; do not try to paste its contents.",
+    }
+    text, truncated = extract_text(
+        content, described.get("content_type") or "", described.get("filename") or ""
+    )
+    if text:
+        result["text_excerpt"] = text
+        result["text_truncated"] = truncated
+    return result
+
+
+def _open_url_result(client: CanvasClient, url: str) -> dict[str, Any]:
+    raw = (url or "").strip()
+    if not raw:
+        return {"error": "open_url needs an https URL."}
+
+    file_id = canvas_file_id_from_url(raw, client.base_url)
+    if file_id is not None:
+        result = _open_file_result(client, file_id)
+        result["opened_via"] = "open_file"
+        result["url"] = raw
+        return result
+
+    assignment = canvas_assignment_from_url(raw, client.base_url)
+    if assignment is not None:
+        course_id, assignment_id = assignment
+        details = client.get_assignment_details(assignment_id, course_id=course_id)
+        return {
+            "url": raw,
+            "assignment": details,
+            "displayed_to_student": True,
+            "opened_via": "get_assignment_details",
+            "note": (
+                "This is a Canvas assignment page. Instructions are shown in the chat. "
+                "Call open_url on any linked_urls, or open_file on attached_files."
+            ),
+        }
+
+    parse_https_url(raw)
+    content, described = client.fetch_url(raw)
+    result = {
+        "url": described.get("url") or raw,
+        "resource": described,
+        "displayed_to_student": True,
+        "note": "The page or file is now shown in the chat; do not invent its contents.",
+    }
+    text, truncated = extract_text(
+        content,
+        described.get("content_type") or "",
+        described.get("filename") or "",
+        base_url=described.get("url") or raw,
+    )
+    if text:
+        result["text_excerpt"] = text
+        result["text_truncated"] = truncated
+    elif not described.get("previewable"):
+        result["note"] = (
+            "This type cannot be previewed as text. The student can download it; "
+            "do not try to reconstruct the binary."
+        )
+    return result
 
 
 def dispatch_tool(client: CanvasClient, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1036,17 +1509,9 @@ def dispatch_tool(client: CanvasClient, name: str, arguments: dict[str, Any]) ->
         if name == "open_file":
             if args.get("file_id") in (None, ""):
                 return {"error": "open_file needs a file_id from find_course_files."}
-            content, described = client.download_file(int(args["file_id"]))
-            result: dict[str, Any] = {
-                "file": described,
-                "displayed_to_student": True,
-                "note": "The file is now shown in the chat; do not try to paste its contents.",
-            }
-            text, truncated = extract_text(content, described.get("content_type") or "")
-            if text:
-                result["text_excerpt"] = text
-                result["text_truncated"] = truncated
-            return result
+            return _open_file_result(client, int(args["file_id"]))
+        if name == "open_url":
+            return _open_url_result(client, str(args.get("url") or ""))
     except Exception as exc:
         # Streamlit re-executes this file on every chat turn while
         # @st.cache_resource keeps the previous CanvasClient. That client's
@@ -1268,7 +1733,13 @@ Guidelines:
   assignment rather than in Files. Report anything in the "notes" field, such as a course whose \
   Files tab is hidden.
 - For "what does this assignment want?", "how do I submit?", or anything about instructions, \
-  formats or rubrics, call get_assignment_details. The list tools only carry titles and due dates.
+  formats or rubrics, call get_assignment_details. The list tools only carry titles and due dates. \
+  Instructions may include math in $...$ / $$ form; you can quote it that way in your reply.
+- If the student pastes a link, or assignment instructions include a non-file http(s) URL, call \
+  open_url. Do not invent the page or PDF contents. Canvas file URLs are handled by open_url too. \
+  If open_url returns a text excerpt you may use it; say so if it was truncated.
+- Write math in your replies with $...$ for inline and $$...$$ (on their own lines) for display \
+  so it renders in the chat.
 - Today is {today}. The student's local timezone is {timezone}.
 - Tool results give due dates both in UTC ("due_at") and in local time ("due_at_local"). Always \
   quote local time to the student.
@@ -1380,21 +1851,36 @@ def fetch_file(_canvas: CanvasClient, file_id: int) -> tuple[bytes, dict[str, An
     return _canvas.download_file(file_id)
 
 
-def render_file_preview(canvas: CanvasClient, payload: dict[str, Any]) -> None:
-    """Show a Canvas file inline. Called on every rerun, hence the cache."""
-    described = payload.get("file") or {}
-    file_id = described.get("file_id")
-    if not file_id:
-        return
-    try:
-        content, described = fetch_file(canvas, int(file_id))
-    except (CanvasError, ReadOnlyViolation) as exc:
-        st.warning(redact(exc))
-        return
+@st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
+def fetch_open_url(_canvas: CanvasClient, url: str) -> tuple[bytes, dict[str, Any]]:
+    return _canvas.fetch_url(url)
 
-    filename = described.get("filename") or f"file-{file_id}"
+
+def render_tex_preview(source: str) -> None:
+    """Show TeX source, and render it when it looks like a short snippet."""
+    shown = source[:20_000]
+    st.code(shown, language="latex")
+    stripped = source.strip()
+    if not stripped:
+        return
+    if r"\documentclass" in stripped or len(stripped) > TEX_RENDER_CHARS:
+        st.caption("Full TeX documents are shown as source; KaTeX can only render short snippets.")
+        return
+    math = stripped if stripped.startswith("$") else f"$$\n{stripped}\n$$"
+    st.markdown(to_streamlit_math(math))
+
+
+def render_content_preview(
+    content: bytes,
+    described: dict[str, Any],
+    *,
+    caption: str,
+    download_key: str,
+) -> None:
+    """Shared inline preview for Canvas files and URLs."""
+    filename = described.get("filename") or "download"
     content_type = described.get("content_type") or ""
-    st.caption(f"{filename} — {described.get('size_readable') or ''} from Canvas")
+    st.caption(caption)
     if content_type == "application/pdf":
         try:
             st.pdf(io.BytesIO(content), height=600)
@@ -1407,6 +1893,15 @@ def render_file_preview(canvas: CanvasClient, payload: dict[str, Any]) -> None:
             )
     elif content_type.startswith("image/"):
         st.image(content, caption=filename)
+    elif is_tex_type(content_type, filename):
+        render_tex_preview(content.decode("utf-8", errors="replace"))
+    elif content_type in {"text/html", "application/xhtml+xml"}:
+        text, _files, _urls = html_to_text_and_links(
+            content.decode("utf-8", errors="replace"),
+            base_url=described.get("url"),
+            max_chars=MAX_EXTRACTED_CHARS,
+        )
+        st.markdown(to_streamlit_math(text or "(empty page)"))
     elif content_type.startswith("text/"):
         st.code(content.decode("utf-8", errors="replace")[:20_000])
     else:
@@ -1416,8 +1911,58 @@ def render_file_preview(canvas: CanvasClient, payload: dict[str, Any]) -> None:
         data=content,
         file_name=filename,
         mime=content_type or "application/octet-stream",
-        key=f"download-{file_id}-{abs(hash(filename)) % 10_000}",
+        key=download_key,
     )
+
+
+def render_file_preview(canvas: CanvasClient, payload: dict[str, Any]) -> None:
+    """Show a Canvas file inline. Called on every rerun, hence the cache."""
+    described = payload.get("file") or {}
+    file_id = described.get("file_id")
+    if not file_id:
+        return
+    try:
+        content, described = fetch_file(canvas, int(file_id))
+    except (CanvasError, ReadOnlyViolation, UrlFetchError) as exc:
+        st.warning(redact(exc))
+        return
+
+    filename = described.get("filename") or f"file-{file_id}"
+    render_content_preview(
+        content,
+        described,
+        caption=f"{filename} — {described.get('size_readable') or ''} from Canvas",
+        download_key=f"download-{file_id}-{abs(hash(filename)) % 10_000}",
+    )
+
+
+def render_url_preview(canvas: CanvasClient, payload: dict[str, Any]) -> None:
+    """Re-fetch and show an open_url result the same way Canvas files are shown."""
+    described = payload.get("resource") or {}
+    url = described.get("url") or payload.get("url")
+    if not url:
+        return
+    try:
+        content, described = fetch_open_url(canvas, str(url))
+    except (CanvasError, ReadOnlyViolation, UrlFetchError) as exc:
+        st.warning(redact(exc))
+        return
+    filename = described.get("filename") or filename_from_url(str(url), described.get("content_type") or "")
+    host = urlparse(str(described.get("url") or url)).netloc
+    render_content_preview(
+        content,
+        described,
+        caption=f"{filename} — {described.get('size_readable') or ''} from {host}",
+        download_key=f"download-url-{abs(hash(url)) % 10_000}",
+    )
+
+
+def render_assignment_instructions(assignment: dict[str, Any]) -> None:
+    title = assignment.get("title") or "Assignment instructions"
+    st.caption(title)
+    instructions = assignment.get("instructions")
+    if instructions:
+        st.markdown(to_streamlit_math(instructions))
 
 
 def render_tool_message(message: dict[str, Any], canvas: CanvasClient | None = None) -> None:
@@ -1426,8 +1971,16 @@ def render_tool_message(message: dict[str, Any], canvas: CanvasClient | None = N
     except json.JSONDecodeError:
         payload = None
 
-    if canvas and message.get("name") == "open_file" and isinstance(payload, dict) and payload.get("file"):
-        render_file_preview(canvas, payload)
+    name = message.get("name")
+    if canvas and isinstance(payload, dict) and not payload.get("error"):
+        if payload.get("file") and name in {"open_file", "open_url"}:
+            render_file_preview(canvas, payload)
+        elif name == "open_url" and payload.get("assignment"):
+            render_assignment_instructions(payload["assignment"])
+        elif name == "open_url" and payload.get("url"):
+            render_url_preview(canvas, payload)
+        elif name == "get_assignment_details" and (payload.get("assignment") or {}).get("instructions"):
+            render_assignment_instructions(payload["assignment"])
 
     with st.expander(f"Canvas lookup: {message.get('name', 'tool')}", expanded=False):
         if payload is None:
@@ -1447,7 +2000,7 @@ def render_message(message: dict[str, Any], canvas: CanvasClient | None = None) 
             st.caption(f"Calling `{function.get('name')}` with `{function.get('arguments')}`")
         if message.get("content"):
             with st.chat_message("assistant"):
-                st.markdown(message["content"])
+                st.markdown(to_streamlit_math(message["content"]))
         return
     if role == "user" and message.get("content"):
         with st.chat_message("user"):
@@ -1464,7 +2017,7 @@ def render_sidebar(settings: Settings, store: ConversationStore) -> None:
             st.write(f"{'OK' if value else 'MISSING'} — `{name}`")
         st.write(f"Canvas: `{settings.canvas_base_url}`")
         st.write(f"Model: `{settings.model}`")
-        st.caption("Token values are never shown here, logged, or sent anywhere except Canvas.")
+        st.caption("Token values are never shown here, logged, or sent to non-Canvas URLs.")
 
         st.divider()
         st.subheader("Conversations")
@@ -1486,7 +2039,7 @@ def render_sidebar(settings: Settings, store: ConversationStore) -> None:
                 st.rerun()
 
         st.divider()
-        st.caption("Read-only: this app only ever sends GET requests to Canvas.")
+        st.caption("Read-only: Canvas and open_url traffic are GET only. The Canvas token never leaves the Canvas origin.")
 
 
 def main() -> None:
@@ -1496,8 +2049,8 @@ def main() -> None:
     st.set_page_config(page_title=PAGE_TITLE, page_icon="📚", layout="centered")
     st.title(PAGE_TITLE)
     st.caption(
-        "Ask about your courses, upcoming work, due dates and course files. "
-        "Canvas access is read-only."
+        "Ask about your courses, upcoming work, due dates, files and links. "
+        "Canvas access is read-only; math in assignments and replies is rendered."
     )
 
     store = get_store(settings.db_path)
