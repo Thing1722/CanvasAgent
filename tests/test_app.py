@@ -1543,6 +1543,33 @@ def test_system_prompt_asks_the_model_to_be_decisive():
     assert "when relevant evidence is available" in prompt
     assert "read-only" in prompt
     assert "cannot submit" in prompt
+    assert prompt.count("You are a study assistant") == 1
+
+
+def test_system_prompt_includes_retrieval_routing():
+    prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    assert "course codes" in prompt
+    assert "cross-listed" in prompt
+    assert "date-related" in prompt
+    assert "content-related" in prompt
+    assert "modules and course files" in prompt
+    assert "before assignments" in prompt
+    assert "Files tab is hidden" in prompt
+    assert "module items" in prompt
+    assert "enumerate the candidate sources" in prompt
+    assert "open it" in prompt and "before responding" in prompt
+    assert "syllabus for dates and logistics" in prompt
+    assert "study guides" in prompt
+    assert "review materials" in prompt
+    assert "exam scope" in prompt
+    assert "reconcile them explicitly" in prompt
+    assert "first source found" in prompt
+    assert "more specific evidence" in prompt
+    assert "read-only" in prompt
+    assert "cannot submit" in prompt
+    assert "Be decisive" in prompt
+    assert "stop searching" in prompt
+    assert prompt.count("You are a study assistant") == 1
 
 
 # --- math / LaTeX conversion ------------------------------------------------
