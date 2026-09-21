@@ -2507,7 +2507,10 @@ FILES_SIDEBAR_CSS_CLASS = f"st-key-{FILES_SIDEBAR_KEY}"
 FILES_SIDEBAR_DEFAULT_PX = 320
 FILES_SIDEBAR_MIN_PX = 240
 FILES_SIDEBAR_MAX_PX = 720
-FILES_SIDEBAR_COLLAPSED_PX = 48
+FILES_SIDEBAR_COLLAPSED_PX = 0
+FILES_SIDEBAR_TOGGLE_MS = 300
+FILES_SIDEBAR_COLLAPSE_ICON = ":material/keyboard_double_arrow_right:"
+FILES_SIDEBAR_EXPAND_ICON = ":material/keyboard_double_arrow_left:"
 
 
 @st.cache_resource(show_spinner=False)
@@ -3056,32 +3059,44 @@ def files_sidebar_css(collapsed: bool) -> str:
     (the main column is a VerticalBlock) and left the sticky chat input
     stretching across the gap (``stBottom`` is a sibling of the block
     container, not inside it). Inset ``stAppViewContainer`` instead, and pin
-    only ``.st-key-files-sidebar``.
+    only ``.st-key-files-sidebar``. Collapse matches the left Streamlit
+    sidebar: double-arrow icon and a 300ms slide.
     """
-    width = FILES_SIDEBAR_COLLAPSED_PX if collapsed else FILES_SIDEBAR_DEFAULT_PX
-    padding = "3.75rem 0.15rem 1rem 0.15rem" if collapsed else "3.75rem 0.85rem 2rem 0.85rem"
+    gutter = FILES_SIDEBAR_COLLAPSED_PX if collapsed else FILES_SIDEBAR_DEFAULT_PX
+    transform = "translateX(100%)" if collapsed else "translateX(0)"
+    ms = FILES_SIDEBAR_TOGGLE_MS
     return f"""
 <style>
+@property --files-sidebar-width {{
+  syntax: "<length>";
+  inherits: true;
+  initial-value: {FILES_SIDEBAR_DEFAULT_PX}px;
+}}
 :root {{
-  --files-sidebar-width: {width}px;
+  --files-sidebar-width: {gutter}px;
+  --files-sidebar-panel: {FILES_SIDEBAR_DEFAULT_PX}px;
 }}
 [data-testid="stAppViewContainer"] {{
   padding-right: var(--files-sidebar-width) !important;
+  transition: padding-right {ms}ms;
 }}
 .{FILES_SIDEBAR_CSS_CLASS}:not(:has([data-testid="stChatMessage"])) {{
   position: fixed !important;
   top: 0;
   right: 0;
   height: 100vh;
-  width: var(--files-sidebar-width) !important;
-  max-width: var(--files-sidebar-width) !important;
+  width: var(--files-sidebar-panel) !important;
+  max-width: var(--files-sidebar-panel) !important;
+  min-width: 0 !important;
   background: var(--secondary-background-color);
   border-left: 1px solid rgba(49, 51, 63, 0.2);
   z-index: 100;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: {padding} !important;
+  padding: 3.75rem 0.85rem 2rem 0.85rem !important;
   box-sizing: border-box;
+  transform: {transform};
+  transition: transform {ms}ms, min-width {ms}ms, max-width {ms}ms;
 }}
 .{FILES_SIDEBAR_CSS_CLASS} [data-testid="stHtml"],
 .{FILES_SIDEBAR_CSS_CLASS} [data-testid="stIFrame"],
@@ -3094,6 +3109,19 @@ def files_sidebar_css(collapsed: bool) -> str:
   overflow: hidden !important;
   position: absolute !important;
   border: 0 !important;
+}}
+.st-key-files-sidebar-expand {{
+  position: fixed !important;
+  top: 0.45rem;
+  right: 0.35rem;
+  z-index: 100002;
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
+}}
+.st-key-files-sidebar-collapse,
+.st-key-files-sidebar-expand {{
+  background: transparent !important;
 }}
 .files-sidebar-resizer {{
   position: absolute;
@@ -3126,13 +3154,16 @@ def files_sidebar_script(collapsed: bool) -> str:
   const HOST_SEL = ".__HOST__";
   function apply(px) {
     const width = Math.max(MIN, Math.min(MAX, Math.round(px)));
-    doc.documentElement.style.setProperty("--files-sidebar-width", width + "px");
+    doc.documentElement.style.setProperty("--files-sidebar-panel", width + "px");
+    if (!collapsed) {
+      doc.documentElement.style.setProperty("--files-sidebar-width", width + "px");
+    }
     try { localStorage.setItem(STORAGE, String(width)); } catch (err) {}
   }
-  if (!collapsed) {
-    const stored = parseInt(localStorage.getItem(STORAGE) || DEF, 10);
-    apply(Number.isFinite(stored) ? stored : DEF);
-  } else {
+  const stored = parseInt(localStorage.getItem(STORAGE) || DEF, 10);
+  const restored = Number.isFinite(stored) ? stored : DEF;
+  apply(restored);
+  if (collapsed) {
     doc.documentElement.style.setProperty("--files-sidebar-width", COLLAPSED + "px");
   }
   function findHost() {
@@ -3157,7 +3188,7 @@ def files_sidebar_script(collapsed: bool) -> str:
         event.preventDefault();
         const startX = event.clientX;
         const startW = parseInt(
-          getComputedStyle(doc.documentElement).getPropertyValue("--files-sidebar-width"),
+    getComputedStyle(doc.documentElement).getPropertyValue("--files-sidebar-panel"),
           10
         ) || DEF;
         function move(ev) { apply(startW + (startX - ev.clientX)); }
@@ -3230,50 +3261,59 @@ def render_file_panel(
 ) -> None:
     """Right-hand files sidebar (collapsible/resizable); chat transcript is unchanged."""
     collapsed = bool(st.session_state.get("files_sidebar_collapsed", False))
-    inject_files_sidebar_chrome(collapsed)
 
     files = store.list_opened_files(conversation_id)
     st.session_state.opened_files = files
     st.session_state.opened_files_cid = conversation_id
 
+    with st.container(key=FILES_SIDEBAR_KEY):
+        inject_files_sidebar_chrome(collapsed)
+        if not collapsed:
+            header_title, header_collapse = st.columns([6, 1])
+            with header_title:
+                st.subheader("Files")
+            with header_collapse:
+                if st.button(
+                    FILES_SIDEBAR_COLLAPSE_ICON,
+                    key="files-sidebar-collapse",
+                    type="tertiary",
+                    help="Hide files sidebar",
+                ):
+                    st.session_state.files_sidebar_collapsed = True
+                    st.rerun()
+
+            if not files:
+                st.caption(FILE_PANEL_EMPTY)
+            else:
+                lookup = {entry["identity"]: entry for entry in files}
+                identities = [entry["identity"] for entry in files]
+                sync_files_sidebar_selection(conversation_id, files)
+                chosen = st.selectbox(
+                    "Opened files",
+                    options=identities,
+                    format_func=lambda ident: files_sidebar_label(lookup[ident]),
+                    key=panel_select_key(conversation_id),
+                    label_visibility="collapsed",
+                    help="Files opened in this chat. The newest file is selected automatically.",
+                )
+                st.session_state.panel_selected = chosen
+                current = panel_entry_for_choice(chosen, files)
+                if current is not None and canvas is not None:
+                    try:
+                        render_panel_file(canvas, current)
+                    except Exception as exc:
+                        logger.exception("Failed to render file panel preview")
+                        st.error(redact(exc))
+
     if collapsed:
-        if st.button("‹", key="files-sidebar-expand", help="Show files sidebar"):
+        if st.button(
+            FILES_SIDEBAR_EXPAND_ICON,
+            key="files-sidebar-expand",
+            type="tertiary",
+            help="Show files sidebar",
+        ):
             st.session_state.files_sidebar_collapsed = False
             st.rerun()
-        return
-
-    header_title, header_collapse = st.columns([6, 1])
-    with header_title:
-        st.subheader("Files")
-    with header_collapse:
-        if st.button("›", key="files-sidebar-collapse", help="Hide files sidebar"):
-            st.session_state.files_sidebar_collapsed = True
-            st.rerun()
-
-    if not files:
-        st.caption(FILE_PANEL_EMPTY)
-        return
-
-    lookup = {entry["identity"]: entry for entry in files}
-    identities = [entry["identity"] for entry in files]
-    sync_files_sidebar_selection(conversation_id, files)
-    chosen = st.selectbox(
-        "Opened files",
-        options=identities,
-        format_func=lambda ident: files_sidebar_label(lookup[ident]),
-        key=panel_select_key(conversation_id),
-        label_visibility="collapsed",
-        help="Files opened in this chat. The newest file is selected automatically.",
-    )
-    st.session_state.panel_selected = chosen
-    current = panel_entry_for_choice(chosen, files)
-    if current is None or canvas is None:
-        return
-    try:
-        render_panel_file(canvas, current)
-    except Exception as exc:
-        logger.exception("Failed to render file panel preview")
-        st.error(redact(exc))
 
 
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
@@ -3396,8 +3436,7 @@ def main() -> None:
 
         render_agent_turn(produced, canvas)
 
-    with st.container(key=FILES_SIDEBAR_KEY):
-        render_file_panel(store, conversation_id, canvas)
+    render_file_panel(store, conversation_id, canvas)
 
 
 if __name__ == "__main__":

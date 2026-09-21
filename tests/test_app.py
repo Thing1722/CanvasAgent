@@ -1564,12 +1564,16 @@ def test_files_sidebar_css_insets_main_pane_not_block_container():
     assert ".block-container" not in css
     assert app.FILES_SIDEBAR_CSS_CLASS in css
     assert "stChatMessage" in css
+    assert f"transform {app.FILES_SIDEBAR_TOGGLE_MS}ms" in css
     assert "closest(" not in script
     assert "stChatMessage" in script
     assert app.FILES_SIDEBAR_CSS_CLASS in script
     main_src = inspect.getsource(app.main)
+    panel_src = inspect.getsource(app.render_file_panel)
     assert "st.columns([2, 1]" not in main_src
-    assert "FILES_SIDEBAR_KEY" in main_src
+    assert "FILES_SIDEBAR_KEY" in panel_src
+    assert "keyboard_double_arrow_right" in app.FILES_SIDEBAR_COLLAPSE_ICON
+    assert "keyboard_double_arrow_left" in app.FILES_SIDEBAR_EXPAND_ICON
 
 
 def test_assistant_is_user_facing_hides_tool_calls_and_reasoning():
