@@ -149,7 +149,9 @@ comes with a Download button instead. There is a download button on every previe
 
 Paste an https link (a Canvas file URL, an assignment page, or an ordinary PDF/webpage) and the
 assistant fetches it with `open_url`. Canvas file URLs reuse the same download path as `open_file`.
-HTML is stripped to readable text (math included); PDFs are shown with the same viewer.
+HTML is stripped to readable text (math included); navigation, scripts and footers are dropped
+and the remaining text is grouped by heading or page so the assistant can quote original
+sections. PDFs are shown with the same viewer.
 
 Math in assignment prompts and in the assistant's replies is rendered with Streamlit's built-in
 KaTeX support (`$...$` inline, `$$` on its own lines for display). Canvas MathJax (`\(...\)`,

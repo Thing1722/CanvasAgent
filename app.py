@@ -497,9 +497,15 @@ def matches_all_words(haystack: str, query: str) -> bool:
 
 
 class _HtmlExtractor(HTMLParser):
-    """Turn a Canvas HTML description into plain text plus its links."""
+    """Turn HTML into readable text plus its links.
+
+    Navigation, scripts, footers and similar chrome are dropped so the model
+    sees the article, not the site furniture.
+    """
 
     BLOCK_TAGS = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}
+    CHROME_TAGS = {"script", "style", "nav", "footer", "header", "aside", "noscript", "iframe"}
+    HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -510,8 +516,14 @@ class _HtmlExtractor(HTMLParser):
         self._skip_depth = 0
 
     def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style"):
+        if tag in self.CHROME_TAGS:
             self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag in self.HEADING_TAGS:
+            level = int(tag[1])
+            self.parts.append("\n" + ("#" * level) + " ")
             return
         if tag in self.BLOCK_TAGS:
             self.parts.append("\n")
@@ -522,8 +534,10 @@ class _HtmlExtractor(HTMLParser):
             self._link_text = []
 
     def handle_endtag(self, tag):
-        if tag in ("script", "style"):
+        if tag in self.CHROME_TAGS:
             self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if self._skip_depth:
             return
         # Not li/br: the next list item opens with its own newline, and closing
         # both ends would put a blank line between every bullet.
@@ -1645,6 +1659,176 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 TOOL_NAMES = tuple(schema["function"]["name"] for schema in TOOL_SCHEMAS)
 
 MAX_EXTRACTED_CHARS = 20_000
+MAX_CHUNK_CHARS = 4_000
+MAX_PDF_PAGES = 50
+_HEADING_LINE = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def _split_oversized_chunk(section: str, text: str, page: int | None) -> list[dict[str, Any]]:
+    """Break a long section on blank lines so each piece stays under MAX_CHUNK_CHARS."""
+    pieces: list[dict[str, Any]] = []
+    remaining = text.strip()
+    part = 1
+    while remaining:
+        if len(remaining) <= MAX_CHUNK_CHARS:
+            chunk = {"section": section if part == 1 else f"{section} (cont.)", "text": remaining}
+            if page is not None:
+                chunk["page"] = page
+            pieces.append(chunk)
+            break
+        window = remaining[:MAX_CHUNK_CHARS]
+        split_at = window.rfind("\n\n")
+        if split_at < MAX_CHUNK_CHARS // 4:
+            split_at = MAX_CHUNK_CHARS
+        piece, remaining = remaining[:split_at].strip(), remaining[split_at:].strip()
+        if piece:
+            label = section if part == 1 else f"{section} (cont.)"
+            chunk = {"section": label, "text": piece}
+            if page is not None:
+                chunk["page"] = page
+            pieces.append(chunk)
+            part += 1
+    return pieces
+
+
+def chunk_cleaned_text(
+    text: str,
+    *,
+    default_section: str = "Document",
+    page: int | None = None,
+) -> list[dict[str, Any]]:
+    """Split cleaned source text into heading/section chunks of original wording."""
+    if not (text or "").strip():
+        return []
+    sections: list[dict[str, Any]] = []
+    current_heading = default_section
+    current_parts: list[str] = []
+    heading_from_markup = False
+
+    def flush() -> None:
+        body = "\n".join(current_parts).strip()
+        current_parts.clear()
+        if heading_from_markup:
+            combined = f"{current_heading}\n{body}".strip() if body else current_heading
+        else:
+            combined = body
+        if not combined:
+            return
+        sections.extend(_split_oversized_chunk(current_heading, combined, page))
+
+    for line in text.splitlines():
+        match = _HEADING_LINE.match(line.strip())
+        if match:
+            flush()
+            current_heading = match.group(2).strip() or current_heading
+            heading_from_markup = True
+            continue
+        current_parts.append(line)
+    flush()
+    if sections:
+        return sections
+    return _split_oversized_chunk(default_section, text.strip(), page)
+
+
+def limit_source_chunks(
+    chunks: list[dict[str, Any]], max_chars: int = MAX_EXTRACTED_CHARS
+) -> tuple[list[dict[str, Any]], bool]:
+    """Keep original chunk text up to ``max_chars``; flag when later sections were dropped."""
+    kept: list[dict[str, Any]] = []
+    total = 0
+    for chunk in chunks:
+        body = chunk.get("text") or ""
+        if total >= max_chars:
+            return kept, True
+        if total + len(body) > max_chars:
+            remain = max_chars - total
+            if remain < 80:
+                return kept, True
+            clipped = dict(chunk, text=body[:remain])
+            kept.append(clipped)
+            return kept, True
+        kept.append(chunk)
+        total += len(body)
+    return kept, False
+
+
+def _pdf_page_chunks(content: bytes) -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return [], None
+    try:
+        reader = PdfReader(io.BytesIO(content))
+    except Exception:
+        return [], None
+    total_pages = len(reader.pages)
+    chunks: list[dict[str, Any]] = []
+    for index, page in enumerate(reader.pages[:MAX_PDF_PAGES], start=1):
+        body = (page.extract_text() or "").strip()
+        if not body:
+            continue
+        chunks.extend(
+            _split_oversized_chunk(f"Page {index}", body, index)
+        )
+    note = None
+    if total_pages > MAX_PDF_PAGES:
+        note = f"Only the first {MAX_PDF_PAGES} of {total_pages} pages were processed."
+    return chunks, note
+
+
+def extract_source_document(
+    content: bytes,
+    content_type: str,
+    filename: str = "",
+    base_url: str | None = None,
+    title: str | None = None,
+    url: str | None = None,
+) -> dict[str, Any] | None:
+    """Cleaned original text in section/page chunks, plus an outline.
+
+    Returns None when the format cannot be read. ``partial`` is True when only
+    part of the source was processed (length cap or unread PDF pages).
+    """
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    label = title or filename or (Path(urlparse(url or "").path).name if url else "") or "Document"
+    processed_note: str | None = None
+    chunks: list[dict[str, Any]] = []
+
+    if ctype in {"text/html", "application/xhtml+xml"}:
+        decoded = content.decode("utf-8", errors="replace")
+        text, _files, _urls = html_to_text_and_links(decoded, base_url=base_url, max_chars=0)
+        chunks = chunk_cleaned_text(text, default_section=label)
+    elif ctype == "application/pdf":
+        chunks, processed_note = _pdf_page_chunks(content)
+        if not chunks:
+            return None
+    elif is_tex_type(ctype, filename) or ctype.startswith("text/"):
+        text = content.decode("utf-8", errors="replace")
+        chunks = chunk_cleaned_text(text, default_section=label)
+    else:
+        return None
+
+    if not chunks:
+        return None
+    limited, clipped = limit_source_chunks(chunks)
+    excerpt = "\n\n".join(chunk["text"] for chunk in limited if chunk.get("text"))
+    if excerpt and len(excerpt) > MAX_EXTRACTED_CHARS:
+        excerpt = excerpt[:MAX_EXTRACTED_CHARS]
+        clipped = True
+    partial = bool(clipped or processed_note)
+    if clipped and not processed_note:
+        processed_note = "Only part of the source was processed."
+    source = {
+        "title": label,
+        "filename": filename or None,
+        "url": url,
+        "outline": [chunk["section"] for chunk in limited],
+        "chunks": limited,
+        "partial": partial,
+    }
+    if processed_note:
+        source["note"] = processed_note
+    return {"excerpt": excerpt or None, "truncated": partial, "source": source}
 
 
 def extract_text(
@@ -1658,32 +1842,12 @@ def extract_text(
     Returns (text, truncated). Text is None for formats we cannot read, in
     which case the student still sees the file itself in the UI.
     """
-    ctype = (content_type or "").split(";")[0].strip().lower()
-    text: str | None = None
-    if ctype in {"text/html", "application/xhtml+xml"}:
-        decoded = content.decode("utf-8", errors="replace")
-        text, _files, _urls = html_to_text_and_links(
-            decoded, base_url=base_url, max_chars=MAX_EXTRACTED_CHARS
-        )
-    elif is_tex_type(ctype, filename) or ctype.startswith("text/"):
-        text = content.decode("utf-8", errors="replace")
-    elif ctype == "application/pdf":
-        try:
-            from pypdf import PdfReader
-        except ImportError:
-            return None, False
-        try:
-            reader = PdfReader(io.BytesIO(content))
-            pages = [page.extract_text() or "" for page in reader.pages[:50]]
-        except Exception:  # pypdf raises a wide range of parse errors
-            return None, False
-        text = "\n\n".join(page.strip() for page in pages if page.strip())
-
-    if not text or not text.strip():
+    extracted = extract_source_document(
+        content, content_type, filename=filename, base_url=base_url
+    )
+    if not extracted or not extracted.get("excerpt"):
         return None, False
-    if len(text) > MAX_EXTRACTED_CHARS:
-        return text[:MAX_EXTRACTED_CHARS], True
-    return text, False
+    return extracted["excerpt"], bool(extracted.get("truncated"))
 
 
 def _open_file_result(client: CanvasClient, file_id: int) -> dict[str, Any]:
@@ -1693,12 +1857,23 @@ def _open_file_result(client: CanvasClient, file_id: int) -> dict[str, Any]:
         "displayed_to_student": True,
         "note": "The file is now shown in the chat; do not try to paste its contents.",
     }
-    text, truncated = extract_text(
-        content, described.get("content_type") or "", described.get("filename") or ""
+    extracted = extract_source_document(
+        content,
+        described.get("content_type") or "",
+        filename=described.get("filename") or "",
+        title=described.get("filename") or None,
     )
-    if text:
-        result["text_excerpt"] = text
-        result["text_truncated"] = truncated
+    if extracted and extracted.get("excerpt"):
+        result["text_excerpt"] = extracted["excerpt"]
+        result["text_truncated"] = extracted["truncated"]
+        result["source"] = extracted["source"]
+        result["note"] = (
+            "source.chunks are the original cleaned text, grouped by section or page. "
+            "Use those chunks as evidence. Do not summarize only the outline. "
+            "The file is shown in the chat; do not paste the whole document."
+        )
+        if extracted["source"].get("partial"):
+            result["source_partial"] = True
     return result
 
 
@@ -1737,15 +1912,25 @@ def _open_url_result(client: CanvasClient, url: str) -> dict[str, Any]:
         "displayed_to_student": True,
         "note": "The page or file is now shown in the chat; do not invent its contents.",
     }
-    text, truncated = extract_text(
+    extracted = extract_source_document(
         content,
         described.get("content_type") or "",
-        described.get("filename") or "",
+        filename=described.get("filename") or "",
         base_url=described.get("url") or raw,
+        title=described.get("filename") or None,
+        url=described.get("url") or raw,
     )
-    if text:
-        result["text_excerpt"] = text
-        result["text_truncated"] = truncated
+    if extracted and extracted.get("excerpt"):
+        result["text_excerpt"] = extracted["excerpt"]
+        result["text_truncated"] = extracted["truncated"]
+        result["source"] = extracted["source"]
+        result["note"] = (
+            "source.chunks are the original cleaned text, grouped by section or page. "
+            "Use those chunks as evidence; do not summarize only the outline. "
+            "The page is shown in the chat; do not invent missing sections."
+        )
+        if extracted["source"].get("partial"):
+            result["source_partial"] = True
     elif not described.get("previewable"):
         result["note"] = (
             "This type cannot be previewed as text. The student can download it; "
@@ -2157,6 +2342,16 @@ Guidelines:
 - If the student pastes a link, or assignment instructions include a non-file http(s) URL, call \
   open_url. Do not invent the page or PDF contents. Canvas file URLs are handled by open_url too. \
   If open_url returns a text excerpt you may use it; say so if it was truncated.
+- Large documents and websites: open_file / open_url return cleaned original text in \
+  source.chunks (navigation, scripts, footers and repeated chrome removed), grouped by \
+  heading, page range or section, with title, URL or filename, section name and page when \
+  known. For a focused question, use the relevant original chunks — not a summary of them. \
+  For exact details, quotations or nuanced questions, quote from those chunks. For a broad \
+  summary: (1) use source.outline of the sections, (2) select the relevant chunks, \
+  (3) summarize those chunks from their original text, (4) combine into the final answer. \
+  Never summarize only an outline when the original chunk text is available. If \
+  source.partial is true or source.note says only part of the source was processed, say so \
+  clearly.
 - Write math in your replies with $...$ for inline and $$...$$ (on their own lines) for display \
   so it renders in the chat.
 - Today is {today}. The student's local timezone is {timezone}.
@@ -2183,6 +2378,7 @@ _USABLE_OBJECT_KEYS = (
     "text_excerpt",
     "url",
     "resource",
+    "source",
 )
 
 
