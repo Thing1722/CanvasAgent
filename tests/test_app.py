@@ -1575,6 +1575,8 @@ def test_files_sidebar_uses_custom_component_not_js_dock():
     assert not hasattr(app, "files_sidebar_script")
     assert not hasattr(app, "inject_files_sidebar_chrome")
     assert not hasattr(app, "inject_files_sidebar_css")
+    assert not hasattr(app, "files_sidebar_css")
+    assert not hasattr(app, "files_sidebar_css_script")
     assert files_rail.HOST_ID in frontend
     assert "streamlit:componentReady" in frontend
     assert "streamlit:setComponentValue" in frontend
