@@ -170,3 +170,44 @@ app.render_file_preview(canvas, payload, tool_call_id="call_b")
     keys = [button.key for button in harness.download_button]
     assert len(keys) == 2
     assert len(set(keys)) == 2
+
+
+def test_tool_message_render_error_leaves_the_rest_of_the_page_intact():
+    """A StreamlitDuplicateElementKey (or any Exception) on one tool message
+    must become an inline error, not a dead page — later messages still render."""
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+from streamlit.errors import StreamlitDuplicateElementKey
+
+def boom(message, canvas=None):
+    raise StreamlitDuplicateElementKey("download-14814596-2110")
+
+_orig = app.render_tool_message
+app.render_tool_message = boom
+try:
+    app.render_message({{"role": "user", "content": "open notes.txt"}})
+    app.render_message(
+        {{
+            "role": "tool",
+            "name": "open_file",
+            "tool_call_id": "call_1",
+            "content": "{{}}",
+        }}
+    )
+    app.render_message({{"role": "assistant", "content": "The notes say Friday."}})
+    st.write("page survived")
+finally:
+    app.render_tool_message = _orig
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    rendered = " ".join(str(element.value) for element in harness.markdown)
+    assert "open notes.txt" in rendered
+    assert "The notes say Friday." in rendered
+    assert "page survived" in rendered
+    errors = " ".join(str(element.value) for element in harness.error)
+    assert "download-14814596-2110" in errors

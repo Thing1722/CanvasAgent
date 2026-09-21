@@ -1460,21 +1460,28 @@ def render_tool_message(message: dict[str, Any], canvas: CanvasClient | None = N
 
 
 def render_message(message: dict[str, Any], canvas: CanvasClient | None = None) -> None:
-    role = message.get("role")
-    if role == "tool":
-        render_tool_message(message, canvas)
-        return
-    if role == "assistant":
-        for call in message.get("tool_calls") or []:
-            function = call.get("function") or {}
-            st.caption(f"Calling `{function.get('name')}` with `{function.get('arguments')}`")
-        if message.get("content"):
-            with st.chat_message("assistant"):
+    """Show one chat message. A failure here must not kill the rest of the page."""
+    try:
+        role = message.get("role")
+        if role == "tool":
+            render_tool_message(message, canvas)
+            return
+        if role == "assistant":
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                st.caption(f"Calling `{function.get('name')}` with `{function.get('arguments')}`")
+            if message.get("content"):
+                with st.chat_message("assistant"):
+                    st.markdown(message["content"])
+            return
+        if role == "user" and message.get("content"):
+            with st.chat_message("user"):
                 st.markdown(message["content"])
-        return
-    if role == "user" and message.get("content"):
-        with st.chat_message("user"):
-            st.markdown(message["content"])
+    except Exception as exc:
+        # Includes StreamlitDuplicateElementKey / StreamlitAPIException from
+        # widgets in this message; later history still renders.
+        logger.exception("Failed to render a %s message", message.get("role"))
+        st.error(redact(exc))
 
 
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
