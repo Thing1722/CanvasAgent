@@ -1581,6 +1581,8 @@ def test_files_sidebar_uses_native_columns_not_js_dock():
     assert "querySelector" not in script
     assert "position: sticky" in css
     assert "100dvh" in css
+    assert '[data-testid="stColumn"]:has(.st-key-files-sidebar)' in css
+    assert "st-key-files-sidebar-collapse" in css
     assert "keyboard_double_arrow" not in app.FILES_SIDEBAR_COLLAPSE_ICON
     assert "keyboard_double_arrow" not in app.FILES_SIDEBAR_EXPAND_ICON
     assert not hasattr(app, "files_sidebar_script")

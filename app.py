@@ -3101,22 +3101,19 @@ def files_sidebar_css() -> str:
   pointer-events: none !important;
 }
 
+.stMain .block-container,
 [data-testid="stMainBlockContainer"] {
   padding-right: 0 !important;
 }
 
+[data-testid="stHorizontalBlock"]:has(.st-key-files-sidebar),
 [data-testid="stHorizontalBlock"]:has(.st-key-files-sidebar) {
   align-items: stretch !important;
   gap: 0 !important;
   overflow: visible !important;
 }
 
-[data-testid="stHorizontalBlock"]:has(.st-key-files-sidebar) > [data-testid="stColumn"]:first-child {
-  padding-right: 1.25rem;
-  min-width: 0 !important;
-}
-
-[data-testid="stHorizontalBlock"]:has(.st-key-files-sidebar) > [data-testid="stColumn"]:last-child {
+[data-testid="stColumn"]:has(.st-key-files-sidebar) {
   position: sticky !important;
   top: 0 !important;
   height: 100dvh !important;
@@ -3124,42 +3121,42 @@ def files_sidebar_css() -> str:
   align-self: flex-start !important;
   overflow: visible !important;
   z-index: 6;
-  margin-top: -6rem;
-  padding: 0 !important;
+  margin-top: -6rem !important;
 }
 
-[data-testid="stHorizontalBlock"]:has(.st-key-files-sidebar) > [data-testid="stColumn"]:last-child > div {
+[data-testid="stColumn"]:has(.st-key-files-sidebar) > div,
+[data-testid="stColumn"]:has(.st-key-files-sidebar) .stVerticalBlock,
+[data-testid="stColumn"]:has(.st-key-files-sidebar) [data-testid="stLayoutWrapper"]:has(.st-key-files-sidebar) {
   height: 100% !important;
+  min-height: 100% !important;
   overflow: visible !important;
 }
 
 .st-key-files-sidebar {
   position: relative !important;
   height: 100% !important;
-  max-height: 100dvh !important;
+  min-height: 100% !important;
   box-sizing: border-box !important;
   background: var(--secondary-background-color);
-  border: none !important;
-  border-top: none !important;
-  border-bottom: none !important;
-  border-right: none !important;
+  border: 0 !important;
   border-left: 1px solid rgba(49, 51, 63, 0.18) !important;
   border-radius: 0 !important;
   box-shadow: none !important;
-  overflow: hidden !important;
+  overflow: visible !important;
 }
 
-[data-testid="stHorizontalBlock"]:has(.st-key-files-sidebar-expand) > [data-testid="stColumn"]:last-child {
+[data-testid="stColumn"]:has(.st-key-files-sidebar-expand) {
   flex: 0 0 0 !important;
   width: 0 !important;
   min-width: 0 !important;
   max-width: 0 !important;
 }
 
-[data-testid="stHorizontalBlock"]:has(.st-key-files-sidebar-expand) .st-key-files-sidebar {
+[data-testid="stColumn"]:has(.st-key-files-sidebar-expand) .st-key-files-sidebar {
   background: transparent;
-  border: none !important;
+  border: 0 !important;
   overflow: visible !important;
+  width: 0 !important;
 }
 
 .st-key-files-sidebar-body {
@@ -3167,7 +3164,7 @@ def files_sidebar_css() -> str:
   max-height: 100dvh !important;
   overflow-x: hidden !important;
   overflow-y: auto !important;
-  padding: 6rem 1.6rem 1.25rem 1rem !important;
+  padding: 6rem 1.6rem 1.25rem 0.85rem !important;
   box-sizing: border-box !important;
 }
 
@@ -3183,27 +3180,24 @@ def files_sidebar_css() -> str:
   padding: 0 !important;
 }
 
-.st-key-files-sidebar-collapse [data-testid="stBaseButton-tertiary"],
-.st-key-files-sidebar-expand [data-testid="stBaseButton-tertiary"] {
+.st-key-files-sidebar-collapse button,
+.st-key-files-sidebar-expand button {
   background: var(--secondary-background-color) !important;
-  border: 1px solid rgba(49, 51, 63, 0.22) !important;
+  border: 1px solid rgba(49, 51, 63, 0.28) !important;
   border-right: none !important;
   border-radius: 10px 0 0 10px !important;
-  min-height: 56px !important;
-  min-width: 22px !important;
-  width: 22px !important;
-  padding: 0.35rem 0.1rem !important;
+  min-height: 64px !important;
+  height: 64px !important;
+  min-width: 18px !important;
+  width: 18px !important;
+  padding: 0 !important;
   box-shadow: none !important;
 }
 
-.st-key-files-sidebar-expand [data-testid="stBaseButton-tertiary"] {
-  background: var(--background-color) !important;
-}
-
-.st-key-files-sidebar-collapse [data-testid="stBaseButton-tertiary"]:hover,
-.st-key-files-sidebar-expand [data-testid="stBaseButton-tertiary"]:hover {
-  background: var(--secondary-background-color) !important;
-  border-color: rgba(49, 51, 63, 0.4) !important;
+.st-key-files-sidebar-collapse button svg,
+.st-key-files-sidebar-expand button svg {
+  width: 1.1rem !important;
+  height: 1.1rem !important;
 }
 """.strip()
 
