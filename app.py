@@ -2855,11 +2855,10 @@ def render_file_panel(
     if st.session_state.get("panel_selected_cid") != conversation_id:
         st.session_state.panel_selected = None
         st.session_state.panel_selected_cid = conversation_id
-    selected = st.session_state.get("panel_selected")
     for entry in files:
         identity = entry["identity"]
         label = entry.get("filename") or identity
-        is_selected = identity == selected
+        is_selected = identity == st.session_state.get("panel_selected")
         if st.button(
             ("● " if is_selected else "") + str(label),
             key=panel_button_key(conversation_id, identity),
@@ -2868,7 +2867,7 @@ def render_file_panel(
         ):
             st.session_state.panel_selected = identity
             st.session_state.panel_selected_cid = conversation_id
-            st.rerun()
+    selected = st.session_state.get("panel_selected")
     current = next((entry for entry in files if entry["identity"] == selected), None)
     if current is None or canvas is None:
         return

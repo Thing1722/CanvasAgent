@@ -770,27 +770,31 @@ class FakeCanvas:
         )
 
 store = app.ConversationStore({str(db_path)!r})
-cid = store.create_conversation("files")
-app.remember_opened_files(
-    store,
-    cid,
-    {{
-        "role": "tool",
-        "name": "open_file",
-        "tool_call_id": "call_a",
-        "content": json.dumps({{"file": {{"file_id": 9001, "filename": "notes.txt"}}}}),
-    }},
-)
-app.remember_opened_files(
-    store,
-    cid,
-    {{
-        "role": "tool",
-        "name": "open_file",
-        "tool_call_id": "call_b",
-        "content": json.dumps({{"file": {{"file_id": 9002, "filename": "syllabus.pdf"}}}}),
-    }},
-)
+existing = store.list_conversations()
+if existing:
+    cid = existing[0]["id"]
+else:
+    cid = store.create_conversation("files")
+    app.remember_opened_files(
+        store,
+        cid,
+        {{
+            "role": "tool",
+            "name": "open_file",
+            "tool_call_id": "call_a",
+            "content": json.dumps({{"file": {{"file_id": 9001, "filename": "notes.txt"}}}}),
+        }},
+    )
+    app.remember_opened_files(
+        store,
+        cid,
+        {{
+            "role": "tool",
+            "name": "open_file",
+            "tool_call_id": "call_b",
+            "content": json.dumps({{"file": {{"file_id": 9002, "filename": "syllabus.pdf"}}}}),
+        }},
+    )
 app.render_file_panel(store, cid, FakeCanvas())
 """
     harness = AppTest.from_string(script, default_timeout=30).run()
