@@ -1552,33 +1552,30 @@ def test_panel_entry_for_choice_accepts_identity_or_label():
     assert app.panel_entry_for_choice("notes.txt", files)["identity"] == "file:1"
 
 
-def test_files_sidebar_css_docks_beside_main_not_in_chat_column():
-    """Regression: a position:fixed rail inside stMain overlapped the transcript
-    (overflow on stMain is a containing block). Dock as a sibling instead.
+def test_files_sidebar_uses_native_columns_not_js_dock():
+    """JS-docking a Streamlit block onto AppViewContainer duplicated the rail
+    on rerun (orphan + new host). Chat | files is a native st.columns split,
+    with chat_input inside the chat column so it cannot span a gap.
     """
     import inspect
 
-    css = app.files_sidebar_css(collapsed=False)
-    script = app.files_sidebar_script(collapsed=False)
-    assert '[data-testid="stAppViewContainer"]' in css
-    assert '[data-testid="stAppViewContainer"] > .' + app.FILES_SIDEBAR_CSS_CLASS in css
-    assert "padding-right: var(--files-sidebar-width)" not in css
-    assert ".block-container" not in css
-    assert "stChatMessage" in css
-    assert f"transform {app.FILES_SIDEBAR_TOGGLE_MS}ms" in css
-    assert "stToolbar" in script
-    assert "appendChild" in script
-    assert "stChatMessage" in script
-    assert "closest(" not in script
     main_src = inspect.getsource(app.main)
     panel_src = inspect.getsource(app.render_file_panel)
-    assert "st.columns([2, 1]" not in main_src
+    assert "st.columns([2, 1]" in main_src
+    assert "with files_col:" in main_src
+    assert "with chat_col:" in main_src
+    files_block = main_src[main_src.find("with files_col:"): main_src.find("with chat_col:")]
+    assert "render_file_panel" in files_block
+    chat_block = main_src[main_src.find("with chat_col:"):]
+    assert "st.chat_input" in chat_block
+    assert "render_conversation" in chat_block
+    assert "appendChild" not in main_src
+    assert "appendChild" not in panel_src
     assert "FILES_SIDEBAR_KEY" in panel_src
-    panel_at = main_src.find("render_file_panel")
-    spinner_at = main_src.find("st.spinner")
-    assert 0 <= panel_at < spinner_at
     assert "keyboard_double_arrow_right" in app.FILES_SIDEBAR_COLLAPSE_ICON
     assert "keyboard_double_arrow_left" in app.FILES_SIDEBAR_EXPAND_ICON
+    assert not hasattr(app, "files_sidebar_script")
+    assert not hasattr(app, "inject_files_sidebar_chrome")
 
 
 def test_assistant_is_user_facing_hides_tool_calls_and_reasoning():

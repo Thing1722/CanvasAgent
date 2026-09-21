@@ -191,9 +191,12 @@ Chats are stored in a local SQLite database (`canvas_assistant.db` next to `app.
 wherever `CANVAS_ASSISTANT_DB` points). Nothing leaves your machine. Delete individual chats with
 the ✕ in the sidebar, or delete the `.db` file to wipe everything. The file is git-ignored.
 
-Opened files for the current chat appear in a **right-hand sidebar** (same idea as the left
-config sidebar: collapse it, drag the edge to resize). A dropdown lists those files and
-selects the newest one automatically; the transcript still shows previews inline.
+Opened files for the current chat appear in a **right-hand Files column** next
+to the transcript. Collapse it with the double-arrow in the Files header; expand
+with the matching control at the top of the chat column. A dropdown lists those
+files and selects the newest one automatically; the transcript still shows
+previews inline. Streamlit has no native right sidebar, so this is a layout
+column rather than a second `st.sidebar`.
 
 ## Tests
 
