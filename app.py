@@ -34,6 +34,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 import streamlit as st
@@ -83,7 +85,28 @@ DEFAULT_CANVAS_BASE_URL = "https://canvas.cmu.edu"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-flash"
 DEFAULT_DB_PATH = "canvas_assistant.db"
+DEFAULT_TIMEZONE = "America/New_York"
 USER_AGENT = "cmu-canvas-study-assistant/1.0"
+
+# Sidebar options: common US academic zones, UTC, and a few others. The IANA
+# name is the stored value so Eastern follows EST/EDT instead of a fixed offset.
+TIMEZONE_CHOICES: tuple[tuple[str, str], ...] = (
+    ("America/New_York", "Pittsburgh / Eastern — America/New_York"),
+    ("America/Chicago", "Central — America/Chicago"),
+    ("America/Denver", "Mountain — America/Denver"),
+    ("America/Phoenix", "Arizona — America/Phoenix"),
+    ("America/Los_Angeles", "Pacific — America/Los_Angeles"),
+    ("America/Anchorage", "Alaska — America/Anchorage"),
+    ("Pacific/Honolulu", "Hawaii — Pacific/Honolulu"),
+    ("UTC", "UTC"),
+    ("America/Toronto", "Toronto — America/Toronto"),
+    ("Europe/London", "London — Europe/London"),
+    ("Europe/Paris", "Paris — Europe/Paris"),
+    ("Asia/Kolkata", "India — Asia/Kolkata"),
+    ("Asia/Shanghai", "Beijing — Asia/Shanghai"),
+    ("Asia/Tokyo", "Tokyo — Asia/Tokyo"),
+    ("Australia/Sydney", "Sydney — Australia/Sydney"),
+)
 
 # Files larger than this are described but not downloaded, so a stray 2 GB
 # lecture recording cannot wedge the app. The same cap applies to open_url.
@@ -118,6 +141,7 @@ class Settings:
     deepseek_base_url: str = DEFAULT_DEEPSEEK_BASE_URL
     model: str = DEEPSEEK_MODEL
     db_path: str = DEFAULT_DB_PATH
+    timezone: str = DEFAULT_TIMEZONE
 
     @property
     def missing(self) -> list[str]:
@@ -138,10 +162,50 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         deepseek_base_url=(source.get("DEEPSEEK_BASE_URL") or DEFAULT_DEEPSEEK_BASE_URL).strip().rstrip("/"),
         model=(source.get("DEEPSEEK_MODEL") or DEEPSEEK_MODEL).strip(),
         db_path=(source.get("CANVAS_ASSISTANT_DB") or DEFAULT_DB_PATH).strip(),
+        timezone=resolve_timezone_name(source.get("CANVAS_ASSISTANT_TZ")),
     )
     register_secret(settings.deepseek_api_key)
     register_secret(settings.canvas_api_token)
     return settings
+
+
+def resolve_timezone_name(name: str | None) -> str:
+    """Return a valid IANA timezone name, defaulting to Pittsburgh / Eastern."""
+    candidate = (name or "").strip() or DEFAULT_TIMEZONE
+    try:
+        ZoneInfo(candidate)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return DEFAULT_TIMEZONE
+    return candidate
+
+
+def as_zoneinfo(tz: str | ZoneInfo | None = None) -> ZoneInfo:
+    if isinstance(tz, ZoneInfo):
+        return tz
+    return ZoneInfo(resolve_timezone_name(tz))
+
+
+def timezone_select_options(current: str) -> list[str]:
+    names = [iana for iana, _label in TIMEZONE_CHOICES]
+    if current not in names:
+        return [current, *names]
+    return names
+
+
+def timezone_label(name: str) -> str:
+    for iana, label in TIMEZONE_CHOICES:
+        if iana == name:
+            return label
+    return name
+
+
+def format_timezone_for_prompt(now: datetime, tz: ZoneInfo) -> str:
+    """IANA name plus the abbreviation in force at ``now`` (EST vs EDT)."""
+    name = getattr(tz, "key", None) or str(tz)
+    abbrev = now.strftime("%Z")
+    if abbrev and abbrev != name:
+        return f"{name} ({abbrev})"
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -586,15 +650,32 @@ def human_size(num_bytes: Any) -> str | None:
     return None
 
 
-def describe_due(due: datetime | None, now: datetime | None = None) -> dict[str, Any]:
-    """Render a due date in UTC, in the machine's local time, and as a delta."""
+def describe_due(
+    due: datetime | None,
+    now: datetime | None = None,
+    tz: str | ZoneInfo | None = None,
+) -> dict[str, Any]:
+    """Render a due date in UTC, in the student's timezone, and as a delta.
+
+    ``due_at`` stays UTC. ``due_at_local`` and ``days_until`` use ``tz``
+    (Pittsburgh / Eastern by default), never the machine's local zone.
+    """
     if due is None:
         return {"due_at": None, "due_at_local": None, "days_until": None}
-    now = now or datetime.now(timezone.utc)
+    zone = as_zoneinfo(tz)
+    due_aware = due if due.tzinfo is not None else due.replace(tzinfo=timezone.utc)
+    due_utc = due_aware.astimezone(timezone.utc)
+    due_local = due_aware.astimezone(zone)
+    if now is None:
+        now_in_zone = datetime.now(zone)
+    elif now.tzinfo is None:
+        now_in_zone = now.replace(tzinfo=zone)
+    else:
+        now_in_zone = now.astimezone(zone)
     return {
-        "due_at": due.isoformat().replace("+00:00", "Z"),
-        "due_at_local": due.astimezone().strftime("%a %b %d, %Y %I:%M %p %Z").strip(),
-        "days_until": round((due - now).total_seconds() / 86400, 2),
+        "due_at": due_utc.isoformat().replace("+00:00", "Z"),
+        "due_at_local": due_local.strftime("%a %b %d, %Y %I:%M %p %Z").strip(),
+        "days_until": round((due_aware - now_in_zone).total_seconds() / 86400, 2),
     }
 
 
@@ -608,11 +689,13 @@ class CanvasClient:
         timeout: float = 30.0,
         max_pages: int = 10,
         session: ReadOnlySession | None = None,
+        tz: str | ZoneInfo | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_pages = max_pages
         self._token = api_token
+        self.tz = as_zoneinfo(tz)
         self.session = session or ReadOnlySession(self.base_url)
         self.session.headers.update(
             {"Accept": "application/json", "User-Agent": USER_AGENT}
@@ -624,6 +707,12 @@ class CanvasClient:
         # Public https URLs. GET only, no Canvas token, no cookies.
         self.external_session = ExternalGetSession()
         self.external_session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+
+    def set_timezone(self, tz: str | ZoneInfo | None) -> None:
+        self.tz = as_zoneinfo(tz)
+
+    def _describe_due(self, due: datetime | None, now: datetime | None = None) -> dict[str, Any]:
+        return describe_due(due, now=now, tz=self.tz)
 
     # -- plumbing ---------------------------------------------------------
 
@@ -739,8 +828,7 @@ class CanvasClient:
             return courses
         return [c for c in courses if c["course_id"] == int(course_id)]
 
-    @staticmethod
-    def _normalize_assignment(row: dict[str, Any], course: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_assignment(self, row: dict[str, Any], course: dict[str, Any]) -> dict[str, Any]:
         due = parse_canvas_timestamp(row.get("due_at"))
         submission = row.get("submission") or {}
         return {
@@ -753,7 +841,7 @@ class CanvasClient:
             "submitted": bool(submission.get("submitted_at")) if submission else None,
             "has_description": bool((row.get("description") or "").strip()),
             "html_url": row.get("html_url"),
-            **describe_due(due),
+            **self._describe_due(due),
         }
 
     def get_assignment(self, course_id: int, assignment_id: int) -> dict[str, Any]:
@@ -800,8 +888,8 @@ class CanvasClient:
                 "allowed_extensions": row.get("allowed_extensions") or [],
                 "allowed_attempts": row.get("allowed_attempts"),
                 "grading_type": row.get("grading_type"),
-                "unlock_at": (describe_due(parse_canvas_timestamp(row.get("unlock_at"))))["due_at_local"],
-                "lock_at": (describe_due(parse_canvas_timestamp(row.get("lock_at"))))["due_at_local"],
+                "unlock_at": (self._describe_due(parse_canvas_timestamp(row.get("unlock_at"))))["due_at_local"],
+                "lock_at": (self._describe_due(parse_canvas_timestamp(row.get("lock_at"))))["due_at_local"],
                 "attached_files": [
                     {"file_id": file_id, "filename": name} for file_id, name in links
                 ],
@@ -1610,6 +1698,12 @@ SCHEMA_STATEMENTS = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages (conversation_id, id)",
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
 )
 
 
@@ -1709,6 +1803,19 @@ class ConversationStore:
             messages.append(message)
         return messages
 
+    def get_setting(self, key: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row["value"])
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
 
 # ---------------------------------------------------------------------------
 # Agent loop
@@ -1749,11 +1856,17 @@ Guidelines:
 MAX_TOOL_ROUNDS = 4
 
 
-def build_system_prompt(now: datetime | None = None) -> str:
-    now = now or datetime.now().astimezone()
+def build_system_prompt(now: datetime | None = None, tz: str | ZoneInfo | None = None) -> str:
+    zone = as_zoneinfo(tz)
+    if now is None:
+        now = datetime.now(zone)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=zone)
+    else:
+        now = now.astimezone(zone)
     return SYSTEM_PROMPT.format(
         today=now.strftime("%A, %B %d, %Y"),
-        timezone=now.strftime("%Z") or "the machine's local timezone",
+        timezone=format_timezone_for_prompt(now, zone),
     )
 
 
@@ -1769,7 +1882,7 @@ def run_agent_turn(
     ``history`` is the stored conversation (no system message). ``on_message``
     is called with each new message so the caller can persist and render it.
     """
-    working = [{"role": "system", "content": build_system_prompt()}] + list(history)
+    working = [{"role": "system", "content": build_system_prompt(tz=getattr(canvas, "tz", None))}] + list(history)
     produced: list[dict[str, Any]] = []
 
     def emit(message: dict[str, Any]) -> None:
@@ -1838,7 +1951,7 @@ def get_store(db_path: str) -> ConversationStore:
 
 @st.cache_resource(show_spinner=False)
 def get_canvas_client(_settings: Settings, cache_key: str) -> CanvasClient:
-    return CanvasClient(_settings.canvas_base_url, _settings.canvas_api_token)
+    return CanvasClient(_settings.canvas_base_url, _settings.canvas_api_token, tz=_settings.timezone)
 
 
 @st.cache_resource(show_spinner=False)
@@ -2020,6 +2133,25 @@ def render_sidebar(settings: Settings, store: ConversationStore) -> None:
         st.caption("Token values are never shown here, logged, or sent to non-Canvas URLs.")
 
         st.divider()
+        st.subheader("Timezone")
+        if "timezone" not in st.session_state:
+            stored = store.get_setting("timezone")
+            st.session_state.timezone = resolve_timezone_name(stored or settings.timezone)
+        chosen = st.selectbox(
+            "Due dates and the assistant's idea of today",
+            options=timezone_select_options(st.session_state.timezone),
+            format_func=timezone_label,
+            key="timezone",
+            help=(
+                "CMU due times default to Pittsburgh (Eastern). Changing this updates "
+                "local due dates and the system prompt. Canvas timestamps stay in UTC."
+            ),
+        )
+        if store.get_setting("timezone") != chosen:
+            store.set_setting("timezone", chosen)
+        st.caption(f"Times are shown in `{chosen}`.")
+
+        st.divider()
         st.subheader("Conversations")
         if st.button("New chat", width="stretch"):
             st.session_state.conversation_id = store.create_conversation()
@@ -2072,6 +2204,7 @@ def main() -> None:
     conversation_id = st.session_state.conversation_id
 
     canvas = get_canvas_client(settings, settings.canvas_base_url)
+    canvas.set_timezone(st.session_state.get("timezone") or settings.timezone)
     deepseek = get_deepseek_client(settings, f"{settings.deepseek_base_url}:{settings.model}")
 
     history = store.get_messages(conversation_id)

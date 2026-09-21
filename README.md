@@ -92,6 +92,7 @@ config with `copy .env.example .env`.
 | `DEEPSEEK_BASE_URL` | no | Defaults to `https://api.deepseek.com` |
 | `DEEPSEEK_MODEL` | no | Defaults to `deepseek-flash` |
 | `CANVAS_ASSISTANT_DB` | no | SQLite file path, defaults to `canvas_assistant.db` |
+| `CANVAS_ASSISTANT_TZ` | no | IANA timezone for due dates and "today". Defaults to `America/New_York` (Pittsburgh / Eastern). Do not use a fixed UTC offset; EST/EDT follow the calendar. |
 
 **Where to get a Canvas API token:** sign in at <https://canvas.cmu.edu>, then go to **Account →
 Settings**, scroll to **Approved Integrations**, click **+ New Access Token**, give it a purpose
@@ -114,6 +115,11 @@ streamlit run app.py
 Streamlit prints a local URL (`http://localhost:8501`) and usually opens it for you. Ask questions
 in the chat box; when the assistant needs your real data it calls a Canvas tool, and you can expand
 "Canvas lookup" to see exactly what it fetched. Press `Ctrl+C` in the terminal to stop the app.
+
+Due dates are shown in **Pittsburgh / Eastern time** (`America/New_York`) by default, even if the
+computer itself is set to another zone (for example Beijing). Change it from the **Timezone**
+select in the sidebar; the choice is remembered in the local database across reruns. You can also
+set `CANVAS_ASSISTANT_TZ` in `.env`. Canvas still stores timestamps in UTC.
 
 Each new terminal session needs the virtual environment activated again
 (`.\.venv\Scripts\Activate.ps1`) before `streamlit run app.py`.
