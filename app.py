@@ -31,6 +31,7 @@ from urllib.parse import urlparse
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from streamlit.errors import StreamlitAPIException
 
 # ---------------------------------------------------------------------------
 # Secret handling
@@ -1067,7 +1068,15 @@ def render_file_preview(canvas: CanvasClient, payload: dict[str, Any]) -> None:
     content_type = described.get("content_type") or ""
     st.caption(f"{filename} — {described.get('size_readable') or ''} from Canvas")
     if content_type == "application/pdf":
-        st.pdf(io.BytesIO(content), height=600)
+        try:
+            st.pdf(io.BytesIO(content), height=600)
+        except StreamlitAPIException:
+            # st.pdf needs the streamlit[pdf] extra; without it, still hand
+            # over the file rather than blowing up the chat.
+            st.info(
+                "Install the PDF viewer to see this inline: `pip install -r requirements.txt` "
+                "(or `pip install \"streamlit[pdf]\"`). You can download the file below."
+            )
     elif content_type.startswith("image/"):
         st.image(content, caption=filename)
     elif content_type.startswith("text/"):

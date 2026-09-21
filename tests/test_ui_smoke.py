@@ -66,6 +66,23 @@ def test_sidebar_never_renders_secret_values(monkeypatch, tmp_path):
     assert "canvas.example.edu" in rendered
 
 
+def test_inline_pdf_viewer_is_available(tmp_path):
+    """st.pdf only works with the streamlit[pdf] extra installed, so keep a
+    test that fails loudly if requirements.txt ever drops it."""
+    from test_app import make_pdf
+
+    pdf_path = tmp_path / "syllabus.pdf"
+    pdf_path.write_bytes(make_pdf("Syllabus week 1"))
+    script = (
+        "import streamlit as st\n"
+        f"st.pdf(open({str(pdf_path)!r}, 'rb').read(), height=200)\n"
+        "st.write('rendered')\n"
+    )
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception
+    assert harness.markdown[0].value == "rendered"
+
+
 def test_new_chat_button_creates_a_conversation(monkeypatch, tmp_path):
     harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
     before = len(harness.sidebar.button)

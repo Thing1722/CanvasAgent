@@ -1,4 +1,6 @@
-streamlit>=1.50,<2.0
+# The [pdf] extra installs the viewer component behind st.pdf, which the
+# assistant uses to show Canvas PDFs inline.
+streamlit[pdf]>=1.50,<2.0
 requests>=2.32,<3.0
 python-dotenv>=1.0,<2.0
 pypdf>=5.0,<7.0
