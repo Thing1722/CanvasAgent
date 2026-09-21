@@ -1608,6 +1608,8 @@ def test_files_sidebar_uses_custom_component_not_js_dock():
     assert "files-rail-chevron" in frontend
     assert "files-rail-resize" in frontend
     assert "col-resize" in frontend
+    assert "ew-resize" not in frontend
+    assert "border-left: 1px solid" in frontend
     assert "button.files-rail-download" in frontend
     assert "a.files-rail-download" not in frontend
     assert "bottom: 0" in frontend

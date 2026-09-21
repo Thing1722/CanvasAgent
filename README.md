@@ -194,7 +194,7 @@ the ✕ in the sidebar, or delete the `.db` file to wipe everything. The file is
 Opened files for the current chat appear in a **right-hand Files rail** next
 to the transcript. The rail is a custom Streamlit component (`files_rail/`) that
 paints one host on `document.body`, so it stays full-height while you scroll
-the chat. Drag the double-line handle on the rail's left edge to resize it
+the chat. Drag the grey divider on the rail's left edge to resize it
 (same `col-resize` cursor as the left Streamlit sidebar). Collapse or expand
 it with the triangle on the middle of the right edge; a dropdown lists opened
 files and selects the newest one automatically. Panel preview is HTML inside

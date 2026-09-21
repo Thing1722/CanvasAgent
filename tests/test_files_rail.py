@@ -49,6 +49,18 @@ def test_frontend_is_a_declare_component_iframe():
     assert "files-rail-resize" in html
     assert "col-resize" in html
     assert "cursor: col-resize" in html
+    assert "ew-resize" not in html
+    assert "border-left: 1px solid" in html
+    assert "rgba(49, 51, 63, 0.2)" in html
+    resize_chunk = html[
+        html.find("#canvas-files-rail-host .files-rail-resize") : html.find(
+            "#canvas-files-rail-host .files-rail-toggle"
+        )
+    ]
+    assert "cursor: col-resize" in resize_chunk
+    assert "linear-gradient" not in resize_chunk
+    assert "ff4b4b" not in resize_chunk
+    assert "primary" not in resize_chunk
     assert "button.files-rail-download" in html
     assert "createElement(\"button\")" in html
     assert "a.files-rail-download" not in html
