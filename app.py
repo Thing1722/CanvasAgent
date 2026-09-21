@@ -2061,10 +2061,22 @@ answers that mention the relevant source or file when appropriate. Do not expose
 calls, search attempts, JSON, or reasoning.
 
 Guidelines:
+- Resolve course codes and cross-listed course names first (via list_my_courses) so later lookups \
+  hit the right course.
+- Classify the question as date-related, content-related, or both, and retrieve accordingly.
 - Call a tool whenever the answer depends on the student's actual Canvas data. Never invent facts, \
   dates, course details, assignment titles, due dates, or document contents.
-- Once a relevant source has been found, stop searching and use it. Do not search again for \
-  confirmation unless new information is genuinely needed.
+- For content-related exam questions, search modules and course files (find_course_files) \
+  before assignments. If the Files tab is hidden, list module items and inspect their \
+  attachments rather than stopping at Files.
+- After retrieval, enumerate the candidate sources. If any source directly answers the \
+  question, open it (open_file / open_url) before responding. Do not answer from a title or \
+  filename alone when the file itself is available.
+- Use the syllabus for dates and logistics. Use study guides and review materials for exam scope.
+- When multiple sources are relevant, reconcile them explicitly. Do not let the first source found \
+  override later, more specific evidence.
+- Once the answering sources have been opened and reconciled, stop searching and use them. Do not \
+  search again for confirmation unless new information is genuinely needed.
 - Do not say you could not settle on an answer when relevant evidence is available. If the \
   evidence is incomplete, give the best-supported answer and briefly state what is uncertain. \
   Only say information is unavailable when the relevant tools failed or nothing supporting was \
