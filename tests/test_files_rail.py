@@ -44,7 +44,13 @@ def test_frontend_is_a_declare_component_iframe():
     assert "position: fixed" in html
     assert "stAppScrollToBottomContainer" in html
     assert "doc.body.appendChild(host)" in html
+    assert "files-rail-toggle" in html
+    assert "files-rail-chevron" in html
     assert "st-key-files-sidebar" not in html
+    assert "position: sticky" not in html
+    assert '[data-testid="stColumn"]' not in html
+    assert "chevron_right" not in html
+    assert "chevron_left" not in html
     assert "AppViewContainer" not in html
     assert Path(files_rail._component.path) == files_rail.FRONTEND_DIR
 

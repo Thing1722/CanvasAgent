@@ -2505,9 +2505,6 @@ PAGE_TITLE = "CMU Canvas Study Assistant"
 FILE_PANEL_KEY_SUFFIX = "panel"
 FILE_PANEL_EMPTY = "No files opened in this chat yet."
 PANEL_URL_PREVIEW_TYPES = ("application/pdf", "image/")
-FILES_SIDEBAR_KEY = "files-sidebar"
-FILES_SIDEBAR_COLLAPSE_ICON = ":material/keyboard_double_arrow_right:"
-FILES_SIDEBAR_EXPAND_ICON = ":material/keyboard_double_arrow_left:"
 PANEL_PREVIEW_MAX_BYTES = 1_500_000
 
 
