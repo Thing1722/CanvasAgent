@@ -1975,6 +1975,33 @@ def render_tex_preview(source: str) -> None:
     st.code(shown, language="latex")
     stripped = source.strip()
     if not stripped:
+_file_preview_seq = 0
+
+
+def next_file_preview_id(tool_call_id: str | None = None) -> str:
+    """Id for one file-preview instance in this Streamlit script run.
+
+    Streamlit re-executes the file on every interaction, so the counter starts
+    at 0 again. Pairing it with the tool message's ``tool_call_id`` keeps
+    download / PDF widgets unique when the same Canvas file is opened twice
+    (two tool messages, or history replay plus a new ``open_file``).
+    """
+    global _file_preview_seq
+    _file_preview_seq += 1
+    call = re.sub(r"[^A-Za-z0-9_-]", "_", str(tool_call_id or "nocall"))[:80]
+    return f"{call}-{_file_preview_seq}"
+
+
+def render_file_preview(
+    canvas: CanvasClient,
+    payload: dict[str, Any],
+    *,
+    tool_call_id: str | None = None,
+) -> None:
+    """Show a Canvas file inline. Called on every rerun, hence the cache."""
+    described = payload.get("file") or {}
+    file_id = described.get("file_id")
+    if not file_id:
         return
     if r"\documentclass" in stripped or len(stripped) > TEX_RENDER_CHARS:
         st.caption("Full TeX documents are shown as source; KaTeX can only render short snippets.")
@@ -1993,10 +2020,11 @@ def render_content_preview(
     """Shared inline preview for Canvas files and URLs."""
     filename = described.get("filename") or "download"
     content_type = described.get("content_type") or ""
-    st.caption(caption)
+    preview_id = next_file_preview_id(tool_call_id)
+    st.caption(f"{filename} — {described.get('size_readable') or ''} from Canvas")
     if content_type == "application/pdf":
         try:
-            st.pdf(io.BytesIO(content), height=600)
+            st.pdf(io.BytesIO(content), height=600, key=f"pdf-{preview_id}")
         except StreamlitAPIException:
             # st.pdf needs the streamlit[pdf] extra; without it, still hand
             # over the file rather than blowing up the chat.
@@ -2024,7 +2052,7 @@ def render_content_preview(
         data=content,
         file_name=filename,
         mime=content_type or "application/octet-stream",
-        key=download_key,
+        key=f"download-{preview_id}",
     )
 
 
@@ -2094,6 +2122,8 @@ def render_tool_message(message: dict[str, Any], canvas: CanvasClient | None = N
             render_url_preview(canvas, payload)
         elif name == "get_assignment_details" and (payload.get("assignment") or {}).get("instructions"):
             render_assignment_instructions(payload["assignment"])
+    if canvas and message.get("name") == "open_file" and isinstance(payload, dict) and payload.get("file"):
+        render_file_preview(canvas, payload, tool_call_id=message.get("tool_call_id"))
 
     with st.expander(f"Canvas lookup: {message.get('name', 'tool')}", expanded=False):
         if payload is None:
@@ -2118,6 +2148,28 @@ def render_message(message: dict[str, Any], canvas: CanvasClient | None = None) 
     if role == "user" and message.get("content"):
         with st.chat_message("user"):
             st.markdown(to_streamlit_math(message["content"]))
+    """Show one chat message. A failure here must not kill the rest of the page."""
+    try:
+        role = message.get("role")
+        if role == "tool":
+            render_tool_message(message, canvas)
+            return
+        if role == "assistant":
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                st.caption(f"Calling `{function.get('name')}` with `{function.get('arguments')}`")
+            if message.get("content"):
+                with st.chat_message("assistant"):
+                    st.markdown(message["content"])
+            return
+        if role == "user" and message.get("content"):
+            with st.chat_message("user"):
+                st.markdown(message["content"])
+    except Exception as exc:
+        # Includes StreamlitDuplicateElementKey / StreamlitAPIException from
+        # widgets in this message; later history still renders.
+        logger.exception("Failed to render a %s message", message.get("role"))
+        st.error(redact(exc))
 
 
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
