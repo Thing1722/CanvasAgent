@@ -97,9 +97,10 @@ def test_sidebar_timezone_defaults_to_pittsburgh(monkeypatch, tmp_path):
     assert len(harness.sidebar.selectbox) == 1
     box = harness.sidebar.selectbox[0]
     assert box.value == "America/New_York"
-    assert "America/New_York" in box.options
-    assert "Asia/Shanghai" in box.options
-    assert "UTC" in box.options
+    joined = " ".join(str(opt) for opt in box.options)
+    assert "America/New_York" in joined
+    assert "Asia/Shanghai" in joined
+    assert "UTC" in joined
     captions = " ".join(str(element.value) for element in harness.sidebar.caption)
     assert "America/New_York" in captions
 

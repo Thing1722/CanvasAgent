@@ -468,12 +468,18 @@ def test_describe_due_ignores_machine_timezone_when_set_to_shanghai(machine_tz_s
 
 
 def test_days_until_is_relative_to_now_in_the_student_zone():
-    now_utc = datetime(2026, 10, 8, 4, 0, tzinfo=timezone.utc)  # midnight EDT Oct 8
-    described = app.describe_due(PITTSBURGH_DUE, now=now_utc, tz="America/New_York")
-    # Due 11:59 PM EDT the same calendar day in Pittsburgh.
-    assert 0 < described["days_until"] < 1
-    beijing = app.describe_due(PITTSBURGH_DUE, now=now_utc, tz="Asia/Shanghai")
-    assert beijing["days_until"] == described["days_until"]
+    # Naive "now" is interpreted in the student zone, so the same clock reading
+    # is a different instant in Pittsburgh vs Beijing.
+    noon = datetime(2026, 10, 8, 12, 0)
+    pittsburgh = app.describe_due(PITTSBURGH_DUE, now=noon, tz="America/New_York")
+    beijing = app.describe_due(PITTSBURGH_DUE, now=noon, tz="Asia/Shanghai")
+    assert 0 < pittsburgh["days_until"] < 1
+    assert beijing["days_until"] > pittsburgh["days_until"]
+    aware_now = datetime(2026, 10, 8, 16, 0, tzinfo=timezone.utc)
+    assert (
+        app.describe_due(PITTSBURGH_DUE, now=aware_now, tz="America/New_York")["days_until"]
+        == app.describe_due(PITTSBURGH_DUE, now=aware_now, tz="Asia/Shanghai")["days_until"]
+    )
 
 
 def test_system_prompt_uses_student_timezone_not_machine(machine_tz_shanghai):
