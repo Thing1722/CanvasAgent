@@ -2806,6 +2806,11 @@ def panel_button_key(conversation_id: int, identity: str) -> str:
     return f"panel-pick-{conversation_id}-{digest}"
 
 
+def _select_panel_file(identity: str, conversation_id: int) -> None:
+    st.session_state.panel_selected = identity
+    st.session_state.panel_selected_cid = conversation_id
+
+
 def render_panel_file(canvas: CanvasClient, entry: dict[str, Any]) -> None:
     """Preview the selected file in the right-hand panel (separate widget keys)."""
     suffix = FILE_PANEL_KEY_SUFFIX
@@ -2864,9 +2869,10 @@ def render_file_panel(
             key=panel_button_key(conversation_id, identity),
             width="stretch",
             type="primary" if is_selected else "secondary",
+            on_click=_select_panel_file,
+            args=(identity, conversation_id),
         ):
-            st.session_state.panel_selected = identity
-            st.session_state.panel_selected_cid = conversation_id
+            _select_panel_file(identity, conversation_id)
     selected = st.session_state.get("panel_selected")
     current = next((entry for entry in files if entry["identity"] == selected), None)
     if current is None or canvas is None:
