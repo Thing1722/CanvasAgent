@@ -1285,6 +1285,53 @@ def test_store_lists_and_deletes_conversations(tmp_path):
     assert store.get_messages(first) == []
 
 
+def test_assistant_is_user_facing_hides_tool_calls_and_reasoning():
+    assert app.assistant_is_user_facing(
+        {"role": "assistant", "content": "Homework 4 is due Friday."}
+    )
+    assert not app.assistant_is_user_facing(
+        {
+            "role": "assistant",
+            "content": "Let me search Canvas for that.",
+            "reasoning_content": "Call find_due_dates.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "find_due_dates", "arguments": '{"query": "ZZZ"}'},
+                }
+            ],
+        }
+    )
+    assert not app.assistant_is_user_facing({"role": "assistant", "content": ""})
+    assert not app.assistant_is_user_facing({"role": "tool", "content": "{}"})
+    assert not app.assistant_is_user_facing({"role": "user", "content": "hi"})
+
+
+def test_turn_trace_entries_collect_calls_without_final_answer():
+    turn = [
+        {
+            "role": "assistant",
+            "content": "Let me search Canvas for that.",
+            "reasoning_content": "Call find_due_dates.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "find_due_dates", "arguments": '{"query": "ZZZ"}'},
+                }
+            ],
+        },
+        {"role": "tool", "name": "find_due_dates", "content": '{"count": 1}'},
+        {"role": "assistant", "content": "Homework 4 is due Friday."},
+    ]
+    kinds = [entry["kind"] for entry in app.turn_trace_entries(turn)]
+    names = [entry.get("name") for entry in app.turn_trace_entries(turn) if entry.get("name")]
+    assert kinds == ["reasoning", "progress", "call", "result"]
+    assert names == ["find_due_dates", "find_due_dates"]
+    assert app.turn_trace_entries([{"role": "assistant", "content": "hi"}]) == []
+
+
 # --- agent loop ------------------------------------------------------------
 
 
