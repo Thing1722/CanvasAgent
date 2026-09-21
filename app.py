@@ -20,6 +20,7 @@ in this file can submit an assignment, send a message or change Canvas state.
 
 from __future__ import annotations
 
+import base64
 import html as html_module
 import io
 import ipaddress
@@ -41,6 +42,8 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 from streamlit.errors import StreamlitAPIException
+
+import files_rail
 
 # ---------------------------------------------------------------------------
 # Secret handling
@@ -2502,12 +2505,8 @@ PAGE_TITLE = "CMU Canvas Study Assistant"
 FILE_PANEL_KEY_SUFFIX = "panel"
 FILE_PANEL_EMPTY = "No files opened in this chat yet."
 PANEL_URL_PREVIEW_TYPES = ("application/pdf", "image/")
-FILES_SIDEBAR_KEY = "files-sidebar"
-FILES_SIDEBAR_BODY_KEY = "files-sidebar-body"
-FILES_SIDEBAR_CSS_KEY = "files-sidebar-css"
-FILES_SIDEBAR_STYLE_ID = "canvas-files-sidebar-style"
-FILES_SIDEBAR_COLLAPSE_ICON = ":material/chevron_right:"
-FILES_SIDEBAR_EXPAND_ICON = ":material/chevron_left:"
+PANEL_PREVIEW_MAX_BYTES = 1_500_000
+
 
 @st.cache_resource(show_spinner=False)
 def get_store(db_path: str) -> ConversationStore:
@@ -3048,7 +3047,7 @@ def sync_files_sidebar_selection(conversation_id: int, files: list[dict[str, Any
 
 
 def render_panel_file(canvas: CanvasClient, entry: dict[str, Any]) -> None:
-    """Preview the selected file in the right-hand panel (separate widget keys)."""
+    """Preview the selected file with Streamlit widgets (in-chat tests / fallback)."""
     suffix = FILE_PANEL_KEY_SUFFIX
     tool_call_id = entry.get("tool_call_id")
     if entry.get("kind") == "url":
@@ -3080,148 +3079,105 @@ def render_panel_file(canvas: CanvasClient, entry: dict[str, Any]) -> None:
     )
 
 
-def files_sidebar_css() -> str:
-    """Style the native files column as a full-height right rail.
-
-    Widgets stay in the React tree. This only paints sticky / full-viewport /
-    borderless chrome. ``position:fixed`` is not used — ``stMain`` overflow is
-    a containing block and would trap it.
-    """
-    return """
-.st-key-files-sidebar-css,
-.st-key-files-sidebar-css iframe {
-  display: none !important;
-  height: 0 !important;
-  width: 0 !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  border: 0 !important;
-  overflow: hidden !important;
-  position: absolute !important;
-  pointer-events: none !important;
-}
-
-.stMain .block-container,
-[data-testid="stMainBlockContainer"] {
-  padding-right: 0 !important;
-}
-
-[data-testid="stHorizontalBlock"]:has(.st-key-files-sidebar),
-[data-testid="stHorizontalBlock"]:has(.st-key-files-sidebar) {
-  align-items: stretch !important;
-  gap: 0 !important;
-  overflow: visible !important;
-}
-
-[data-testid="stColumn"]:has(.st-key-files-sidebar) {
-  position: sticky !important;
-  top: 0 !important;
-  height: 100dvh !important;
-  max-height: 100dvh !important;
-  align-self: flex-start !important;
-  overflow: visible !important;
-  z-index: 6;
-  margin-top: -6rem !important;
-}
-
-[data-testid="stColumn"]:has(.st-key-files-sidebar) > div,
-[data-testid="stColumn"]:has(.st-key-files-sidebar) .stVerticalBlock,
-[data-testid="stColumn"]:has(.st-key-files-sidebar) [data-testid="stLayoutWrapper"]:has(.st-key-files-sidebar) {
-  height: 100% !important;
-  min-height: 100% !important;
-  overflow: visible !important;
-}
-
-.st-key-files-sidebar {
-  position: relative !important;
-  height: 100% !important;
-  min-height: 100% !important;
-  box-sizing: border-box !important;
-  background: var(--secondary-background-color);
-  border: 0 !important;
-  border-left: 1px solid rgba(49, 51, 63, 0.18) !important;
-  border-radius: 0 !important;
-  box-shadow: none !important;
-  overflow: visible !important;
-}
-
-[data-testid="stColumn"]:has(.st-key-files-sidebar-expand) {
-  flex: 0 0 0 !important;
-  width: 0 !important;
-  min-width: 0 !important;
-  max-width: 0 !important;
-}
-
-[data-testid="stColumn"]:has(.st-key-files-sidebar-expand) .st-key-files-sidebar {
-  background: transparent;
-  border: 0 !important;
-  overflow: visible !important;
-  width: 0 !important;
-}
-
-.st-key-files-sidebar-body {
-  height: 100% !important;
-  max-height: 100dvh !important;
-  overflow-x: hidden !important;
-  overflow-y: auto !important;
-  padding: 6rem 1.6rem 1.25rem 0.85rem !important;
-  box-sizing: border-box !important;
-}
-
-.st-key-files-sidebar-collapse,
-.st-key-files-sidebar-expand {
-  position: absolute !important;
-  top: 50% !important;
-  right: 0 !important;
-  transform: translateY(-50%);
-  z-index: 8;
-  width: auto !important;
-  margin: 0 !important;
-  padding: 0 !important;
-}
-
-.st-key-files-sidebar-collapse button,
-.st-key-files-sidebar-expand button {
-  background: var(--secondary-background-color) !important;
-  border: 1px solid rgba(49, 51, 63, 0.28) !important;
-  border-right: none !important;
-  border-radius: 10px 0 0 10px !important;
-  min-height: 64px !important;
-  height: 64px !important;
-  min-width: 18px !important;
-  width: 18px !important;
-  padding: 0 !important;
-  box-shadow: none !important;
-}
-
-.st-key-files-sidebar-collapse button svg,
-.st-key-files-sidebar-expand button svg {
-  width: 1.1rem !important;
-  height: 1.1rem !important;
-}
-""".strip()
+def _preview_data_url(content: bytes, content_type: str) -> str | None:
+    if not content or len(content) > PANEL_PREVIEW_MAX_BYTES:
+        return None
+    mime = (content_type or "application/octet-stream").split(";")[0].strip() or "application/octet-stream"
+    return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
 
 
-def files_sidebar_css_script() -> str:
-    """Iframe body that copies CSS onto parent.document.head. Does not move widgets."""
-    css = files_sidebar_css()
-    return (
-        "<!DOCTYPE html><html><head></head><body><script>"
-        "(function(){"
-        "var doc=window.parent.document;"
-        f"var id={json.dumps(FILES_SIDEBAR_STYLE_ID)};"
-        "var el=doc.getElementById(id);"
-        "if(!el){el=doc.createElement('style');el.id=id;doc.head.appendChild(el);}"
-        f"el.textContent={json.dumps(css)};"
-        "})();"
-        "</script></body></html>"
-    )
+def build_panel_preview(canvas: CanvasClient | None, entry: dict[str, Any] | None) -> dict[str, Any]:
+    """JSON payload the files-rail iframe can render without Streamlit widgets."""
+    if entry is None:
+        return {"kind": "empty"}
+    filename = files_sidebar_label(entry)
+    if canvas is None:
+        return {"kind": "error", "filename": filename, "message": "Canvas is not configured."}
+    try:
+        if entry.get("kind") == "url":
+            url = str(entry.get("url") or "")
+            content, described = fetch_open_url(canvas, url)
+        else:
+            file_id = entry.get("file_id")
+            if file_id in (None, ""):
+                return {"kind": "error", "filename": filename, "message": "Missing file id."}
+            content, described = fetch_file(canvas, int(file_id))
+    except (CanvasError, ReadOnlyViolation, UrlFetchError) as exc:
+        return {"kind": "error", "filename": filename, "message": redact(exc)}
+
+    filename = described.get("filename") or filename
+    content_type = described.get("content_type") or ""
+    size = described.get("size_readable") or ""
+    host = urlparse(str(described.get("url") or entry.get("url") or "")).netloc
+    caption = f"{filename} — {size}" + (f" from {host}" if host else " from Canvas")
+    data_url = _preview_data_url(content, content_type)
+    payload: dict[str, Any] = {
+        "filename": filename,
+        "caption": caption,
+        "download_name": filename,
+    }
+    if data_url:
+        payload["data_url"] = data_url
+
+    if content_type == "application/pdf":
+        payload["kind"] = "pdf"
+        if not data_url:
+            payload["message"] = "This PDF is too large to preview here — download it from the chat."
+        return payload
+    if content_type.startswith("image/"):
+        payload["kind"] = "image"
+        return payload
+    if is_tex_type(content_type, filename):
+        payload["kind"] = "text"
+        payload["text"] = content.decode("utf-8", errors="replace")[:20_000]
+        return payload
+    if content_type in {"text/html", "application/xhtml+xml"}:
+        text, _files, _urls = html_to_text_and_links(
+            content.decode("utf-8", errors="replace"),
+            base_url=described.get("url"),
+            max_chars=MAX_EXTRACTED_CHARS,
+        )
+        payload["kind"] = "text"
+        payload["text"] = text or "(empty page)"
+        return payload
+    if content_type.startswith("text/"):
+        payload["kind"] = "text"
+        payload["text"] = content.decode("utf-8", errors="replace")[:20_000]
+        return payload
+    payload["kind"] = "other"
+    payload["message"] = "This file type cannot be previewed here — download it to open it."
+    return payload
 
 
-def inject_files_sidebar_css() -> None:
-    """Land CSS in the parent document. ``st.html(<style>)`` is swallowed on 1.64."""
-    with st.container(key=FILES_SIDEBAR_CSS_KEY):
-        st.iframe(files_sidebar_css_script(), height=1)
+def apply_files_rail_value(
+    value: Any, *, conversation_id: int, files: list[dict[str, Any]]
+) -> None:
+    """Copy collapse / selection from the component iframe into session_state."""
+    if not isinstance(value, dict):
+        return
+    if "collapsed" in value:
+        st.session_state.files_sidebar_collapsed = bool(value["collapsed"])
+    selected = value.get("selected")
+    identities = [entry["identity"] for entry in files]
+    if selected and selected in identities:
+        st.session_state.panel_selected = selected
+        st.session_state[panel_select_key(conversation_id)] = selected
+
+
+def files_rail_items(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "identity": entry["identity"],
+            "filename": entry.get("filename"),
+            "label": files_sidebar_label(entry),
+            "kind": entry.get("kind"),
+            "file_id": entry.get("file_id"),
+            "url": entry.get("url"),
+            "content_type": entry.get("content_type"),
+            "tool_call_id": entry.get("tool_call_id"),
+        }
+        for entry in files
+    ]
 
 
 def render_file_panel(
@@ -3229,49 +3185,45 @@ def render_file_panel(
     conversation_id: int,
     canvas: CanvasClient | None = None,
 ) -> None:
-    """Right-hand files column; chat transcript is unchanged."""
-    collapsed = bool(st.session_state.get("files_sidebar_collapsed", False))
-
+    """Pinned right-hand files rail (custom component iframe, not a Streamlit column)."""
     files = store.list_opened_files(conversation_id)
     st.session_state.opened_files = files
     st.session_state.opened_files_cid = conversation_id
 
-    inject_files_sidebar_css()
-    with st.container(key=FILES_SIDEBAR_KEY, border=False):
-        if not collapsed:
-            with st.container(key=FILES_SIDEBAR_BODY_KEY, border=False):
-                st.subheader("Files")
-                if not files:
-                    st.caption(FILE_PANEL_EMPTY)
-                else:
-                    lookup = {entry["identity"]: entry for entry in files}
-                    identities = [entry["identity"] for entry in files]
-                    sync_files_sidebar_selection(conversation_id, files)
-                    chosen = st.selectbox(
-                        "Opened files",
-                        options=identities,
-                        format_func=lambda ident: files_sidebar_label(lookup[ident]),
-                        key=panel_select_key(conversation_id),
-                        label_visibility="collapsed",
-                        help="Files opened in this chat. The newest file is selected automatically.",
-                    )
-                    st.session_state.panel_selected = chosen
-                    current = panel_entry_for_choice(chosen, files)
-                    if current is not None and canvas is not None:
-                        try:
-                            render_panel_file(canvas, current)
-                        except Exception as exc:
-                            logger.exception("Failed to render file panel preview")
-                            st.error(redact(exc))
+    # Widget value from the iframe click is already in session_state on this
+    # rerun; apply it before we pass `collapsed` back as component args.
+    apply_files_rail_value(
+        st.session_state.get(files_rail.COMPONENT_KEY),
+        conversation_id=conversation_id,
+        files=files,
+    )
 
-        if st.button(
-            FILES_SIDEBAR_EXPAND_ICON if collapsed else FILES_SIDEBAR_COLLAPSE_ICON,
-            key="files-sidebar-expand" if collapsed else "files-sidebar-collapse",
-            type="tertiary",
-            help="Show files panel" if collapsed else "Hide files panel",
-        ):
-            st.session_state.files_sidebar_collapsed = not collapsed
-            st.rerun()
+    chosen = sync_files_sidebar_selection(conversation_id, files)
+    current = panel_entry_for_choice(chosen, files) if files else None
+    collapsed = bool(st.session_state.get("files_sidebar_collapsed", False))
+    preview: dict[str, Any] = {"kind": "empty"}
+    if current is not None and not collapsed:
+        try:
+            preview = build_panel_preview(canvas, current)
+        except Exception as exc:
+            logger.exception("Failed to render file panel preview")
+            preview = {
+                "kind": "error",
+                "filename": files_sidebar_label(current),
+                "message": redact(exc),
+            }
+
+    value = files_rail.mount(
+        files=files_rail_items(files),
+        selected=chosen,
+        collapsed=collapsed,
+        preview=preview,
+        empty_copy=FILE_PANEL_EMPTY,
+    )
+    apply_files_rail_value(value, conversation_id=conversation_id, files=files)
+    if bool(st.session_state.get("files_sidebar_collapsed", False)) != collapsed:
+        st.rerun()
+
 
 
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
@@ -3328,25 +3280,21 @@ def render_sidebar(settings: Settings, store: ConversationStore) -> None:
         st.caption("Read-only: Canvas and open_url traffic are GET only. The Canvas token never leaves the Canvas origin.")
 
 
-def _render_page_heading() -> None:
+def main() -> None:
+    load_dotenv()
+    settings = load_settings()
+
+    st.set_page_config(page_title=PAGE_TITLE, page_icon="📚", layout="wide")
     st.title(PAGE_TITLE)
     st.caption(
         "Ask about your courses, upcoming work, due dates, files and links. "
         "Canvas access is read-only; math in assignments and replies is rendered."
     )
 
-
-def main() -> None:
-    load_dotenv()
-    settings = load_settings()
-
-    st.set_page_config(page_title=PAGE_TITLE, page_icon="📚", layout="wide")
-
     store = get_store(settings.db_path)
     render_sidebar(settings, store)
 
     if settings.missing:
-        _render_page_heading()
         st.error(
             "Missing environment variables: "
             + ", ".join(f"`{name}`" for name in settings.missing)
@@ -3402,22 +3350,12 @@ def main() -> None:
         if after != before:
             st.rerun()
 
-    collapsed = bool(st.session_state.get("files_sidebar_collapsed", False))
-    # Native columns (not JS-docked widgets). Moving a Streamlit block into
-    # AppViewContainer duplicated the rail on every rerun. Draw the files
-    # column first so a spinner in the chat column cannot mark it stale.
-    # Title lives in the chat column so the files rail can occupy the full
-    # right edge without covering the heading.
-    if collapsed:
-        chat_col, files_col = st.columns([100, 1], gap="small")
-    else:
-        chat_col, files_col = st.columns([2, 1], gap="small")
-    with files_col:
-        render_file_panel(store, conversation_id, canvas)
-    with chat_col:
-        _render_page_heading()
-        render_conversation(history, canvas)
-        handle_prompt(st.chat_input("What's due this week?"))
+    # Custom component iframe owns the pinned rail. Native columns cannot stay
+    # on screen while the transcript scrolls, and docking Streamlit widgets
+    # duplicated the host on rerun.
+    render_file_panel(store, conversation_id, canvas)
+    render_conversation(history, canvas)
+    handle_prompt(st.chat_input("What's due this week?"))
 
 
 if __name__ == "__main__":

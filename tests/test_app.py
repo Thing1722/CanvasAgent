@@ -1552,51 +1552,64 @@ def test_panel_entry_for_choice_accepts_identity_or_label():
     assert app.panel_entry_for_choice("notes.txt", files)["identity"] == "file:1"
 
 
-def test_files_sidebar_uses_native_columns_not_js_dock():
-    """JS-docking a Streamlit block onto AppViewContainer duplicated the rail
-    on rerun (orphan + new host). Chat | files is a native st.columns split,
-    with chat_input inside the chat column so it cannot span a gap.
+def test_files_sidebar_uses_custom_component_not_js_dock():
+    """Native columns cannot pin a rail. JS-docking Streamlit widgets duplicated
+    hosts. The files UI is a declare_component iframe that paints one body host.
+
+    #22's sticky-column CSS is gone, not layered: no stColumn stick, no
+    Streamlit chevron toggle, no hidden CSS iframe on document.head.
     """
     import inspect
+    from pathlib import Path
 
+    import files_rail
+
+    app_src = Path(app.__file__).read_text()
     main_src = inspect.getsource(app.main)
     panel_src = inspect.getsource(app.render_file_panel)
-    assert "st.columns([2, 1]" in main_src
-    assert "with files_col:" in main_src
-    assert "with chat_col:" in main_src
-    files_block = main_src[main_src.find("with files_col:"): main_src.find("with chat_col:")]
-    assert "render_file_panel" in files_block
-    chat_block = main_src[main_src.find("with chat_col:"):]
-    assert "st.chat_input" in chat_block
-    assert "render_conversation" in chat_block
+    frontend = (files_rail.FRONTEND_DIR / "index.html").read_text()
+    assert "files_rail.mount" in panel_src
+    assert "render_file_panel" in main_src
+    assert "st.chat_input" in main_src
+    assert "st.columns([2, 1]" not in main_src
+    assert "with files_col:" not in main_src
     assert "appendChild" not in main_src
     assert "appendChild" not in panel_src
-    assert "FILES_SIDEBAR_KEY" in panel_src
-    assert "chevron_right" in app.FILES_SIDEBAR_COLLAPSE_ICON
-    assert "chevron_left" in app.FILES_SIDEBAR_EXPAND_ICON
-    script = app.files_sidebar_css_script()
-    css = app.files_sidebar_css()
-    assert "doc.head.appendChild" in script
-    assert "stAppViewContainer" not in script
-    assert "querySelector" not in script
-    assert "position: sticky" in css
-    assert "100dvh" in css
-    assert '[data-testid="stColumn"]:has(.st-key-files-sidebar)' in css
-    assert "st-key-files-sidebar-collapse" in css
-    assert "keyboard_double_arrow" not in app.FILES_SIDEBAR_COLLAPSE_ICON
-    assert "keyboard_double_arrow" not in app.FILES_SIDEBAR_EXPAND_ICON
+    assert "inject_files_sidebar_css" not in app_src
+    assert "position: sticky" not in app_src
+    assert "100dvh" not in app_src
+    assert "st-key-files-sidebar" not in app_src
+    assert '[data-testid="stColumn"]' not in app_src
+    assert "chevron_right" not in app_src
+    assert "chevron_left" not in app_src
+    assert "keyboard_double_arrow" not in app_src
+    assert "FILES_SIDEBAR_COLLAPSE_ICON" not in app_src
+    assert "FILES_SIDEBAR_EXPAND_ICON" not in app_src
+    assert "FILES_SIDEBAR_KEY" not in app_src
+    assert "FILES_SIDEBAR_CSS_KEY" not in app_src
+    assert "FILES_SIDEBAR_BODY_KEY" not in app_src
+    assert "FILES_SIDEBAR_STYLE_ID" not in app_src
+    assert "canvas-files-sidebar-style" not in app_src
+    assert "files-sidebar-css" not in app_src
     assert not hasattr(app, "files_sidebar_script")
     assert not hasattr(app, "inject_files_sidebar_chrome")
-
-
-def test_files_sidebar_css_injection_does_not_move_widgets():
-    script = app.files_sidebar_css_script()
-    assert "appendChild(el)" in script
-    assert "createElement('style')" in script
-    assert "appendChild(host)" not in script
-    assert "stToolbar" not in script
-    assert "stAppViewContainer" not in script
-    assert "querySelector(" not in script
+    assert not hasattr(app, "inject_files_sidebar_css")
+    assert not hasattr(app, "files_sidebar_css")
+    assert not hasattr(app, "files_sidebar_css_script")
+    assert not hasattr(app, "FILES_SIDEBAR_COLLAPSE_ICON")
+    assert not hasattr(app, "FILES_SIDEBAR_EXPAND_ICON")
+    assert not hasattr(app, "FILES_SIDEBAR_KEY")
+    assert files_rail.HOST_ID in frontend
+    assert "streamlit:componentReady" in frontend
+    assert "streamlit:setComponentValue" in frontend
+    assert 'doc.body.appendChild(host)' in frontend
+    assert "st-key-files-sidebar" not in frontend
+    assert "files-rail-toggle" in frontend
+    assert "files-rail-chevron" in frontend
+    assert "position: sticky" not in frontend
+    assert '[data-testid="stColumn"]' not in frontend
+    assert "chevron_right" not in frontend
+    assert "chevron_left" not in frontend
 
 
 def test_assistant_is_user_facing_hides_tool_calls_and_reasoning():
