@@ -3414,7 +3414,10 @@ def main() -> None:
     # column first so a spinner in the chat column cannot mark it stale.
     # Title lives in the chat column so the files rail can occupy the full
     # right edge without covering the heading.
-    chat_col, files_col = st.columns([100, 1] if collapsed else [2, 1], gap="small")
+    if collapsed:
+        chat_col, files_col = st.columns([100, 1], gap="small")
+    else:
+        chat_col, files_col = st.columns([2, 1], gap="small")
     with files_col:
         render_file_panel(store, conversation_id, canvas)
     with chat_col:

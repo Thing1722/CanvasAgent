@@ -1593,7 +1593,8 @@ def test_files_sidebar_css_injection_does_not_move_widgets():
     assert "createElement('style')" in script
     assert "appendChild(host)" not in script
     assert "stToolbar" not in script
-    assert "stMain" not in script
+    assert "stAppViewContainer" not in script
+    assert "querySelector(" not in script
 
 
 def test_assistant_is_user_facing_hides_tool_calls_and_reasoning():
