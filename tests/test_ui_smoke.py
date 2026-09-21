@@ -264,6 +264,56 @@ app.render_file_preview(canvas, payload, tool_call_id="call_b")
     assert len(set(keys)) == 2
 
 
+def test_two_submission_attachments_do_not_collide_keys():
+    """Two files on one get_my_submission must not share a download-button key
+    (including the same file_id appearing twice)."""
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import json
+import sys
+sys.path.insert(0, {repo!r})
+import app
+
+class FakeCanvas:
+    def download_file(self, file_id, max_bytes=None):
+        return (
+            b"submission-bytes",
+            {{
+                "file_id": file_id,
+                "filename": f"hw-{{file_id}}.pdf",
+                "content_type": "text/plain",
+                "size_readable": "16 B",
+            }},
+        )
+
+payload = {{
+    "submission": {{
+        "title": "Homework 4",
+        "workflow_state": "submitted",
+        "attachments": [
+            {{"file_id": 8801, "filename": "hw-a.pdf"}},
+            {{"file_id": 8801, "filename": "hw-a.pdf"}},
+        ],
+    }}
+}}
+app.render_tool_message(
+    {{
+        "role": "tool",
+        "name": "get_my_submission",
+        "tool_call_id": "call_sub",
+        "content": json.dumps(payload),
+    }},
+    FakeCanvas(),
+)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    keys = [button.key for button in harness.download_button]
+    assert len(keys) == 2
+    assert len(set(keys)) == 2
+    assert all(key and key.startswith("download-") for key in keys)
+
+
 def test_tool_message_render_error_leaves_the_rest_of_the_page_intact():
     """A StreamlitDuplicateElementKey (or any Exception) on one tool message
     must become an inline error, not a dead page — later messages still render."""
