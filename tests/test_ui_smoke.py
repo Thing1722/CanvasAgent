@@ -377,23 +377,21 @@ def test_sidebar_timezone_honors_env_override(monkeypatch, tmp_path):
     assert harness.sidebar.selectbox[0].value == "America/Los_Angeles"
 
 
-def _default_visible_text(block) -> str:
-    """Markdown, captions, and chat text a student sees without expanding widgets."""
+def _default_visible_text(harness) -> str:
+    """Markdown, captions, and chat text a student sees without expanding widgets.
+
+    AppTest already flattens chat_message children into harness.markdown / caption.
+    Do not recurse into chat_message — ChatMessage.chat_message points at itself.
+    """
     parts: list[str] = []
     for name in ("markdown", "caption", "title", "text", "code", "info", "warning", "error"):
-        for element in getattr(block, name, []) or []:
-            parts.append(str(element.value))
-    for message in getattr(block, "chat_message", []) or []:
-        parts.append(_default_visible_text(message))
+        for element in getattr(harness, name, []) or []:
+            parts.append(str(getattr(element, "value", element)))
     return "\n".join(parts)
 
 
 def _expander_labels(harness) -> list[str]:
-    labels = []
-    for expander in getattr(harness, "expander", []) or []:
-        label = getattr(expander, "label", None) or getattr(expander, "value", "")
-        labels.append(str(label))
-    return labels
+    return [str(expander.label) for expander in getattr(harness, "expander", []) or []]
 
 
 def test_replay_hides_tool_traces_and_shows_final_answer(monkeypatch, tmp_path):
@@ -461,6 +459,7 @@ def test_replay_hides_tool_traces_and_shows_final_answer(monkeypatch, tmp_path):
     assert "find_due_dates" not in visible
     assert '{"query"' not in visible
     assert not any("Canvas lookup" in label for label in _expander_labels(harness))
+    assert len(harness.json) == 0
 
     replayed = app.ConversationStore(str(db_path)).get_messages(conversation_id)
     assert [m["role"] for m in replayed] == ["user", "assistant", "tool", "assistant"]
@@ -528,6 +527,7 @@ app.render_conversation(history + produced, FakeCanvas())
     assert "list_my_courses" not in visible
     assert '{"ZZZ_TOOL_ARG"' not in visible
     assert not any("Canvas lookup" in label for label in _expander_labels(harness))
+    assert len(harness.json) == 0
 
 
 def test_open_file_preview_still_renders_without_lookup_expander():
@@ -594,6 +594,7 @@ app.render_conversation(
     assert keys[0].startswith("download-")
     assert "call_file" in keys[0]
     assert not any("Canvas lookup" in label for label in _expander_labels(harness))
+    assert len(harness.json) == 0
     # Preview body still includes the file text (code/markdown), not the tool JSON.
     assert "Office hours are Friday." in visible or "notes.txt" in visible
 
