@@ -46,6 +46,28 @@ def test_frontend_is_a_declare_component_iframe():
     assert "doc.body.appendChild(host)" in html
     assert "files-rail-toggle" in html
     assert "files-rail-chevron" in html
+    assert "files-rail-resize" in html
+    assert "col-resize" in html
+    assert "cursor: col-resize" in html
+    assert "ew-resize" not in html
+    assert "border-left: 1px solid" in html
+    assert "rgba(49, 51, 63, 0.2)" in html
+    resize_chunk = html[
+        html.find("#canvas-files-rail-host .files-rail-resize") : html.find(
+            "#canvas-files-rail-host .files-rail-toggle"
+        )
+    ]
+    assert "cursor: col-resize" in resize_chunk
+    assert "linear-gradient" not in resize_chunk
+    assert "ff4b4b" not in resize_chunk
+    assert "primary" not in resize_chunk
+    assert "button.files-rail-download" in html
+    assert "createElement(\"button\")" in html
+    assert "a.files-rail-download" not in html
+    assert "bottom: 0" in html
+    assert "height: 100vh" in html
+    assert "height: 100dvh" in html
+    assert "localStorage" in html
     assert "st-key-files-sidebar" not in html
     assert "position: sticky" not in html
     assert '[data-testid="stColumn"]' not in html
@@ -53,6 +75,13 @@ def test_frontend_is_a_declare_component_iframe():
     assert "chevron_left" not in html
     assert "AppViewContainer" not in html
     assert Path(files_rail._component.path) == files_rail.FRONTEND_DIR
+
+
+def test_clamp_width_matches_sidebar_band():
+    assert files_rail.clamp_width(320) == 320
+    assert files_rail.clamp_width(80) == files_rail.RAIL_MIN_WIDTH_PX
+    assert files_rail.clamp_width(900) == files_rail.RAIL_MAX_WIDTH_PX
+    assert files_rail.clamp_width("nope") == files_rail.RAIL_WIDTH_PX
 
 
 def test_build_panel_preview_text_and_pdf_url():
@@ -84,3 +113,27 @@ def test_build_panel_preview_empty_and_missing_canvas():
     )
     assert missing["kind"] == "error"
     assert "Canvas" in missing["message"]
+
+
+def test_apply_files_rail_value_stores_width(monkeypatch):
+    class State(dict):
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+    state = State()
+    monkeypatch.setattr(app.st, "session_state", state, raising=False)
+    files = [{"identity": "file:1", "filename": "notes.txt"}]
+    app.apply_files_rail_value(
+        {"collapsed": False, "selected": "file:1", "width_px": 420},
+        conversation_id=1,
+        files=files,
+    )
+    assert state["files_sidebar_collapsed"] is False
+    assert state["panel_selected"] == "file:1"
+    assert state["files_rail_width_px"] == 420

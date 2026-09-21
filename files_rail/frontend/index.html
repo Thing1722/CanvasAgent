@@ -13,6 +13,18 @@
         var API = 1;
         var lastArgsKey = "";
         var lastTheme = null;
+        var liveWidth = 320;
+        var liveCollapsed = false;
+        var liveSelected = null;
+        var liveTheme = null;
+        var liveMinWidth = 200;
+        var liveMaxWidth = 600;
+        var liveHostId = "canvas-files-rail-host";
+        var liveStyleId = "canvas-files-rail-style";
+        var widthStorageKey = "canvas-files-rail-width";
+        var dragging = false;
+        var heightHooked = false;
+        var resizeHooked = false;
 
         function send(type, data) {
           var payload = Object.assign({ isStreamlitMessage: true, type: type }, data || {});
@@ -25,6 +37,25 @@
 
         function setComponentValue(value) {
           send("streamlit:setComponentValue", { value: value, dataType: "json" });
+        }
+
+        function emitValue(extra) {
+          var next = Object.assign(
+            {
+              collapsed: liveCollapsed,
+              selected: liveSelected,
+              width_px: liveWidth,
+            },
+            extra || {}
+          );
+          liveCollapsed = !!next.collapsed;
+          liveSelected = next.selected || null;
+          liveWidth = clampWidth(next.width_px, liveMinWidth, liveMaxWidth);
+          setComponentValue({
+            collapsed: liveCollapsed,
+            selected: liveSelected,
+            width_px: liveWidth,
+          });
         }
 
         function hideOwnIframe() {
@@ -43,12 +74,82 @@
           }
         }
 
+        function parentWin() {
+          try {
+            if (window.parent && window.parent !== window) return window.parent;
+          } catch (err) {}
+          return window;
+        }
+
         function parentDoc() {
           try {
-            var doc = window.parent && window.parent.document;
+            var doc = parentWin().document;
             if (doc && doc.documentElement) return doc;
           } catch (err) {}
           return null;
+        }
+
+        function clampWidth(value, minW, maxW) {
+          var n = Number(value);
+          if (!isFinite(n)) return minW;
+          return Math.max(minW, Math.min(maxW, Math.round(n)));
+        }
+
+        function storageOf(win) {
+          try {
+            return win && win.localStorage ? win.localStorage : null;
+          } catch (err) {
+            return null;
+          }
+        }
+
+        function readStoredWidth(minW, maxW, fallback) {
+          var stores = [storageOf(window), storageOf(parentWin())];
+          for (var i = 0; i < stores.length; i++) {
+            if (!stores[i]) continue;
+            try {
+              var raw = stores[i].getItem(widthStorageKey);
+              if (raw != null && raw !== "") return clampWidth(raw, minW, maxW);
+            } catch (err) {}
+          }
+          return fallback;
+        }
+
+        function writeStoredWidth(px) {
+          var stores = [storageOf(window), storageOf(parentWin())];
+          for (var i = 0; i < stores.length; i++) {
+            if (!stores[i]) continue;
+            try {
+              stores[i].setItem(widthStorageKey, String(px));
+            } catch (err) {}
+          }
+        }
+
+        function viewportHeight(doc) {
+          var win = (doc && doc.defaultView) || parentWin();
+          return (
+            (win && win.innerHeight) ||
+            (doc && doc.documentElement && doc.documentElement.clientHeight) ||
+            0
+          );
+        }
+
+        function pinHostToViewport(host) {
+          if (!host) return;
+          var h = viewportHeight(host.ownerDocument);
+          host.style.position = "fixed";
+          host.style.top = "0px";
+          host.style.right = "0px";
+          host.style.bottom = "0px";
+          host.style.left = "auto";
+          if (h) {
+            host.style.height = h + "px";
+            host.style.minHeight = h + "px";
+          } else {
+            host.style.height = "100vh";
+            host.style.minHeight = "100dvh";
+          }
+          host.style.maxHeight = "none";
         }
 
         function themeVars(theme) {
@@ -59,6 +160,7 @@
             text: theme.textColor || "var(--text-color, #31333f)",
             primary: theme.primaryColor || "var(--primary-color, #ff4b4b)",
             font: theme.font || "Source Sans, Source Sans 3, sans-serif",
+            border: "rgba(49, 51, 63, 0.2)",
           };
         }
 
@@ -90,6 +192,7 @@
             "html { --canvas-files-rail-width: " +
             width +
             "; }\n" +
+            "html, body { min-height: 100vh; min-height: 100dvh; }\n" +
             '[data-testid="stHeader"], [data-testid="stToolbar"] {' +
             " padding-right: var(--canvas-files-rail-width) !important; }\n" +
             '[data-testid="stAppScrollToBottomContainer"] {' +
@@ -97,11 +200,17 @@
             '[data-testid="stBottom"] {' +
             " right: var(--canvas-files-rail-width) !important; }\n" +
             "#canvas-files-rail-host {" +
-            " position: fixed; top: 0; right: 0; height: 100vh; height: 100dvh;" +
+            " position: fixed !important; top: 0 !important; right: 0 !important;" +
+            " bottom: 0 !important; left: auto !important;" +
+            " height: 100vh !important; height: 100dvh !important;" +
+            " min-height: 100vh !important; min-height: 100dvh !important;" +
+            " max-height: none !important;" +
             " width: " +
             (collapsed ? "0" : widthPx + "px") +
-            "; z-index: 1000020; display: flex; flex-direction: column;" +
-            " box-sizing: border-box; border: none; background: " +
+            " !important; z-index: 1000020; display: flex; flex-direction: column;" +
+            " box-sizing: border-box; border: none;" +
+            (collapsed ? "" : " border-left: 1px solid " + vars.border + ";") +
+            " background: " +
             (collapsed ? "transparent" : vars.background) +
             "; color: " +
             vars.text +
@@ -110,7 +219,7 @@
             "; pointer-events: none; }\n" +
             "#canvas-files-rail-host * { box-sizing: border-box; }\n" +
             "#canvas-files-rail-host .files-rail-panel {" +
-            " flex: 1 1 auto; min-height: 0; width: 100%; overflow: auto;" +
+            " flex: 1 1 auto; min-height: 0; height: 100%; width: 100%; overflow: auto;" +
             " padding: 1.15rem 1rem 1.25rem 1.1rem; pointer-events: auto;" +
             " display: " +
             (collapsed ? "none" : "flex") +
@@ -136,10 +245,37 @@
             " width: 100%; height: min(55vh, 28rem); border: 0; background: " +
             vars.secondary +
             "; }\n" +
-            "#canvas-files-rail-host a.files-rail-download {" +
-            " color: " +
+            "#canvas-files-rail-host button.files-rail-download {" +
+            " appearance: none; -webkit-appearance: none; display: inline-flex;" +
+            " align-items: center; justify-content: center; width: 100%;" +
+            " min-height: 2.25rem; padding: 0.25rem 0.75rem; margin: 0;" +
+            " border: 1px solid " +
+            vars.border +
+            "; border-radius: 0.5rem; background: " +
+            vars.background +
+            "; color: " +
+            vars.text +
+            "; font: inherit; font-size: 0.875rem; font-weight: 400; line-height: 1.6;" +
+            " text-decoration: none; cursor: pointer; pointer-events: auto; }\n" +
+            "#canvas-files-rail-host button.files-rail-download:hover {" +
+            " border-color: " +
             vars.primary +
-            "; font-size: 0.9rem; }\n" +
+            "; color: " +
+            vars.primary +
+            "; }\n" +
+            "#canvas-files-rail-host button.files-rail-download:focus-visible { outline: 2px solid " +
+            vars.primary +
+            "; outline-offset: 2px; }\n" +
+            "#canvas-files-rail-host .files-rail-resize {" +
+            " pointer-events: auto; position: absolute; top: 0; bottom: 0; left: 0;" +
+            " width: 8px; margin-left: -4px; padding: 0; border: 0;" +
+            " cursor: col-resize; z-index: 1000022; display: " +
+            (collapsed ? "none" : "block") +
+            "; background: transparent; }\n" +
+            "#canvas-files-rail-host .files-rail-resize:hover," +
+            "#canvas-files-rail-host .files-rail-resize:focus-visible," +
+            "#canvas-files-rail-host[data-resizing='true'] .files-rail-resize {" +
+            " cursor: col-resize; background: transparent; }\n" +
             "#canvas-files-rail-host .files-rail-toggle {" +
             " pointer-events: auto; position: fixed; top: 50%; right: 0; left: auto; width: 18px; height: 56px;" +
             " padding: 0; margin: 0; border: none; background: " +
@@ -161,6 +297,77 @@
           );
         }
 
+        function applyChrome(doc, collapsed, widthPx, theme) {
+          ensureStyle(doc, liveStyleId, chromeCss(theme, collapsed, widthPx));
+          var host = doc.getElementById(liveHostId);
+          if (host) {
+            host.style.width = collapsed ? "0px" : widthPx + "px";
+            pinHostToViewport(host);
+          }
+        }
+
+        function hookViewport() {
+          if (heightHooked) return;
+          heightHooked = true;
+          var win = parentWin();
+          var onPin = function () {
+            var doc = parentDoc();
+            if (!doc) return;
+            var host = doc.getElementById(liveHostId);
+            if (host) pinHostToViewport(host);
+          };
+          try {
+            win.addEventListener("resize", onPin);
+            if (win.visualViewport) {
+              win.visualViewport.addEventListener("resize", onPin);
+            }
+          } catch (err) {}
+        }
+
+        function hookResize(doc) {
+          if (resizeHooked || !doc) return;
+          resizeHooked = true;
+          var onMove = function (event) {
+            if (!dragging) return;
+            event.preventDefault();
+            var win = parentWin();
+            var next = clampWidth(win.innerWidth - event.clientX, liveMinWidth, liveMaxWidth);
+            liveWidth = next;
+            applyChrome(doc, liveCollapsed, liveWidth, liveTheme);
+          };
+          var onUp = function () {
+            if (!dragging) return;
+            dragging = false;
+            var host = doc.getElementById(liveHostId);
+            if (host) host.removeAttribute("data-resizing");
+            doc.body.style.removeProperty("cursor");
+            doc.body.style.removeProperty("user-select");
+            writeStoredWidth(liveWidth);
+            emitValue({ width_px: liveWidth });
+          };
+          doc.addEventListener("pointermove", onMove);
+          doc.addEventListener("pointerup", onUp);
+          doc.addEventListener("pointercancel", onUp);
+        }
+
+        function bindResizeHandle(handle) {
+          handle.addEventListener("pointerdown", function (event) {
+            if (liveCollapsed) return;
+            event.preventDefault();
+            dragging = true;
+            var doc = handle.ownerDocument;
+            var host = doc.getElementById(liveHostId);
+            if (host) host.setAttribute("data-resizing", "true");
+            doc.body.style.cursor = "col-resize";
+            doc.body.style.userSelect = "none";
+            if (handle.setPointerCapture) {
+              try {
+                handle.setPointerCapture(event.pointerId);
+              } catch (err) {}
+            }
+          });
+        }
+
         function clearNode(node) {
           while (node.firstChild) node.removeChild(node.firstChild);
         }
@@ -171,6 +378,16 @@
           el.textContent = text == null ? "" : String(text);
           parent.appendChild(el);
           return el;
+        }
+
+        function triggerDownload(doc, dataUrl, filename) {
+          var link = doc.createElement("a");
+          link.href = dataUrl;
+          link.setAttribute("download", filename || "download");
+          link.style.display = "none";
+          doc.body.appendChild(link);
+          link.click();
+          link.remove();
         }
 
         function renderPreview(panel, preview) {
@@ -199,12 +416,18 @@
             addText(panel, "p", "files-rail-caption", preview.message);
           }
           if (preview.data_url && preview.download_name) {
-            var link = panel.ownerDocument.createElement("a");
-            link.className = "files-rail-download";
-            link.textContent = "Download";
-            link.setAttribute("download", preview.download_name);
-            link.href = preview.data_url;
-            panel.appendChild(link);
+            var button = panel.ownerDocument.createElement("button");
+            button.type = "button";
+            button.className = "files-rail-download";
+            button.textContent = "Download";
+            button.addEventListener("click", function () {
+              triggerDownload(
+                panel.ownerDocument,
+                preview.data_url,
+                preview.download_name
+              );
+            });
+            panel.appendChild(button);
           }
         }
 
@@ -214,19 +437,28 @@
           var doc = parentDoc();
           if (!doc) return;
           args = args || {};
-          var hostId = args.host_id || "canvas-files-rail-host";
-          var styleId = args.style_id || "canvas-files-rail-style";
-          var widthPx = Number(args.width_px) || 320;
-          var collapsed = !!args.collapsed;
+          liveHostId = args.host_id || "canvas-files-rail-host";
+          liveStyleId = args.style_id || "canvas-files-rail-style";
+          liveMinWidth = Number(args.min_width_px) || 200;
+          liveMaxWidth = Number(args.max_width_px) || 600;
+          widthStorageKey = args.width_storage_key || "canvas-files-rail-width";
+          var fallbackWidth = clampWidth(Number(args.width_px) || 320, liveMinWidth, liveMaxWidth);
+          liveWidth = dragging
+            ? liveWidth
+            : readStoredWidth(liveMinWidth, liveMaxWidth, fallbackWidth);
+          liveCollapsed = !!args.collapsed;
+          liveSelected = args.selected || null;
+          liveTheme = theme;
           var files = Array.isArray(args.files) ? args.files : [];
-          var selected = args.selected || null;
           var emptyCopy = args.empty_copy || "No files opened in this chat yet.";
           var preview = args.preview || {};
 
-          ensureStyle(doc, styleId, chromeCss(theme, collapsed, widthPx));
-          var host = ensureHost(doc, hostId);
-          host.setAttribute("data-collapsed", collapsed ? "true" : "false");
+          applyChrome(doc, liveCollapsed, liveWidth, theme);
+          var host = ensureHost(doc, liveHostId);
+          host.setAttribute("data-collapsed", liveCollapsed ? "true" : "false");
           host.setAttribute("data-canvas-files-rail", "1");
+          host.removeAttribute("data-resizing");
+          pinHostToViewport(host);
           clearNode(host);
 
           var panel = doc.createElement("div");
@@ -241,35 +473,43 @@
               var opt = doc.createElement("option");
               opt.value = entry.identity;
               opt.textContent = entry.label || entry.filename || entry.identity;
-              if (entry.identity === selected) opt.selected = true;
+              if (entry.identity === liveSelected) opt.selected = true;
               select.appendChild(opt);
             });
             select.addEventListener("change", function () {
-              setComponentValue({ collapsed: collapsed, selected: select.value });
+              emitValue({ selected: select.value });
             });
             panel.appendChild(select);
             renderPreview(panel, preview);
           }
           host.appendChild(panel);
 
+          var resize = doc.createElement("div");
+          resize.className = "files-rail-resize";
+          resize.setAttribute("role", "separator");
+          resize.setAttribute("aria-orientation", "vertical");
+          resize.setAttribute("aria-label", "Resize files panel");
+          resize.setAttribute("title", "Drag to resize");
+          bindResizeHandle(resize);
+          hookResize(doc);
+          host.appendChild(resize);
+
           var toggle = doc.createElement("button");
           toggle.type = "button";
           toggle.className = "files-rail-toggle";
           toggle.setAttribute(
             "aria-label",
-            collapsed ? "Show files panel" : "Hide files panel"
+            liveCollapsed ? "Show files panel" : "Hide files panel"
           );
           var chevron = doc.createElement("span");
           chevron.className = "files-rail-chevron";
           chevron.setAttribute("aria-hidden", "true");
           toggle.appendChild(chevron);
           toggle.addEventListener("click", function () {
-            setComponentValue({
-              collapsed: !collapsed,
-              selected: selected,
-            });
+            emitValue({ collapsed: !liveCollapsed });
           });
           host.appendChild(toggle);
+          hookViewport();
         }
 
         window.addEventListener("message", function (event) {

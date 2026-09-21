@@ -3152,11 +3152,13 @@ def build_panel_preview(canvas: CanvasClient | None, entry: dict[str, Any] | Non
 def apply_files_rail_value(
     value: Any, *, conversation_id: int, files: list[dict[str, Any]]
 ) -> None:
-    """Copy collapse / selection from the component iframe into session_state."""
+    """Copy collapse / selection / width from the component iframe into session_state."""
     if not isinstance(value, dict):
         return
     if "collapsed" in value:
         st.session_state.files_sidebar_collapsed = bool(value["collapsed"])
+    if "width_px" in value:
+        st.session_state.files_rail_width_px = files_rail.clamp_width(value["width_px"])
     selected = value.get("selected")
     identities = [entry["identity"] for entry in files]
     if selected and selected in identities:
@@ -3219,6 +3221,9 @@ def render_file_panel(
         collapsed=collapsed,
         preview=preview,
         empty_copy=FILE_PANEL_EMPTY,
+        width_px=files_rail.clamp_width(
+            st.session_state.get("files_rail_width_px", files_rail.RAIL_WIDTH_PX)
+        ),
     )
     apply_files_rail_value(value, conversation_id=conversation_id, files=files)
     if bool(st.session_state.get("files_sidebar_collapsed", False)) != collapsed:
