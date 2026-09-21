@@ -1552,22 +1552,24 @@ def test_panel_entry_for_choice_accepts_identity_or_label():
     assert app.panel_entry_for_choice("notes.txt", files)["identity"] == "file:1"
 
 
-def test_files_sidebar_css_insets_main_pane_not_block_container():
-    """Regression: padding .block-container left the chat input spanning the gap,
-    and pinning the nearest VerticalBlock shoved the transcript into the rail."""
+def test_files_sidebar_css_docks_beside_main_not_in_chat_column():
+    """Regression: a position:fixed rail inside stMain overlapped the transcript
+    (overflow on stMain is a containing block). Dock as a sibling instead.
+    """
     import inspect
 
     css = app.files_sidebar_css(collapsed=False)
     script = app.files_sidebar_script(collapsed=False)
     assert '[data-testid="stAppViewContainer"]' in css
-    assert "padding-right: var(--files-sidebar-width)" in css
+    assert '[data-testid="stAppViewContainer"] > .' + app.FILES_SIDEBAR_CSS_CLASS in css
+    assert "padding-right: var(--files-sidebar-width)" not in css
     assert ".block-container" not in css
-    assert app.FILES_SIDEBAR_CSS_CLASS in css
     assert "stChatMessage" in css
     assert f"transform {app.FILES_SIDEBAR_TOGGLE_MS}ms" in css
-    assert "closest(" not in script
+    assert "stToolbar" in script
+    assert "appendChild" in script
     assert "stChatMessage" in script
-    assert app.FILES_SIDEBAR_CSS_CLASS in script
+    assert "closest(" not in script
     main_src = inspect.getsource(app.main)
     panel_src = inspect.getsource(app.render_file_panel)
     assert "st.columns([2, 1]" not in main_src

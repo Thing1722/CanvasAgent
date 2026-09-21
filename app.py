@@ -3052,15 +3052,12 @@ def sync_files_sidebar_selection(conversation_id: int, files: list[dict[str, Any
 
 
 def files_sidebar_css(collapsed: bool) -> str:
-    """CSS that overlays the keyed files container and insets the whole main pane.
+    """CSS for a right-hand files rail that is a sibling of the main chat pane.
 
-    The previous right-rail attempt padded ``.block-container`` and pinned the
-    nearest ``stVerticalBlock``. That shoved the transcript into the rail
-    (the main column is a VerticalBlock) and left the sticky chat input
-    stretching across the gap (``stBottom`` is a sibling of the block
-    container, not inside it). Inset ``stAppViewContainer`` instead, and pin
-    only ``.st-key-files-sidebar``. Collapse matches the left Streamlit
-    sidebar: double-arrow icon and a 300ms slide.
+    ``position:fixed`` inside ``stMain`` is trapped by that pane's overflow, so
+    the files widgets painted on top of the transcript. JS docks the keyed
+    host as a flex child of ``stAppViewContainer`` instead. Until then the
+    host is taken out of flow so it cannot occupy the chat column.
     """
     gutter = FILES_SIDEBAR_COLLAPSED_PX if collapsed else FILES_SIDEBAR_DEFAULT_PX
     transform = "translateX(100%)" if collapsed else "translateX(0)"
@@ -3076,29 +3073,39 @@ def files_sidebar_css(collapsed: bool) -> str:
   --files-sidebar-width: {gutter}px;
   --files-sidebar-panel: {FILES_SIDEBAR_DEFAULT_PX}px;
 }}
-[data-testid="stAppViewContainer"] {{
-  padding-right: var(--files-sidebar-width) !important;
-  transition: padding-right {ms}ms;
-}}
 .{FILES_SIDEBAR_CSS_CLASS}:not(:has([data-testid="stChatMessage"])) {{
-  position: fixed !important;
-  top: 0;
-  right: 0;
-  height: 100vh;
+  position: absolute !important;
+  width: 0 !important;
+  height: 0 !important;
+  overflow: hidden !important;
+  visibility: hidden;
+  pointer-events: none;
+}}
+[data-testid="stAppViewContainer"] > :has([data-testid="stMain"]) {{
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto !important;
+}}
+[data-testid="stAppViewContainer"] > .{FILES_SIDEBAR_CSS_CLASS} {{
+  position: relative !important;
+  visibility: visible;
+  pointer-events: auto;
+  flex: 0 0 var(--files-sidebar-width);
   width: var(--files-sidebar-panel) !important;
   max-width: var(--files-sidebar-panel) !important;
   min-width: 0 !important;
+  height: 100% !important;
+  align-self: stretch;
   background: var(--secondary-background-color);
   border-left: 1px solid rgba(49, 51, 63, 0.2);
-  z-index: 100001;
-  overflow-x: hidden;
-  overflow-y: auto;
+  z-index: 100;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
   padding: 3.75rem 0.85rem 2rem 0.85rem !important;
   box-sizing: border-box;
   transform: {transform};
-  transition: transform {ms}ms, min-width {ms}ms, max-width {ms}ms;
+  transition: transform {ms}ms, flex-basis {ms}ms, min-width {ms}ms, max-width {ms}ms;
   opacity: 1 !important;
-  pointer-events: auto !important;
 }}
 .{FILES_SIDEBAR_CSS_CLASS} [data-stale="true"] {{
   opacity: 1 !important;
@@ -3117,13 +3124,25 @@ def files_sidebar_css(collapsed: bool) -> str:
   border: 0 !important;
 }}
 .st-key-files-sidebar-expand {{
-  position: fixed !important;
-  top: 0.45rem;
-  right: 0.35rem;
-  z-index: 100002;
+  position: absolute !important;
+  width: 0 !important;
+  height: 0 !important;
+  overflow: hidden !important;
+  opacity: 0;
+  pointer-events: none;
+}}
+[data-testid="stHeader"] .st-key-files-sidebar-expand,
+[data-testid="stToolbar"] .st-key-files-sidebar-expand {{
+  position: relative !important;
+  top: auto !important;
+  right: auto !important;
   width: auto !important;
-  min-width: 0 !important;
-  max-width: none !important;
+  height: auto !important;
+  overflow: visible !important;
+  opacity: 1;
+  pointer-events: auto;
+  flex-shrink: 0;
+  margin-left: 0.25rem;
 }}
 .st-key-files-sidebar-collapse,
 .st-key-files-sidebar-expand {{
@@ -3146,7 +3165,7 @@ def files_sidebar_css(collapsed: bool) -> str:
 
 
 def files_sidebar_script(collapsed: bool) -> str:
-    """JS to restore the dragged width and attach a resize handle to the keyed host."""
+    """JS to dock the files rail beside main, restore width, and place the header toggle."""
     return """
 <script>
 (function () {
@@ -3178,8 +3197,22 @@ def files_sidebar_script(collapsed: bool) -> str:
     if (host.querySelector("[data-testid='stChatMessage']")) return null;
     return host;
   }
+  function dockHost(host) {
+    const app = doc.querySelector("[data-testid='stAppViewContainer']");
+    if (!app || !host) return;
+    if (host.parentElement !== app) app.appendChild(host);
+  }
+  function dockExpand() {
+    const btn = doc.querySelector(".st-key-files-sidebar-expand");
+    const toolbar = doc.querySelector("[data-testid='stToolbar']");
+    if (!btn || !toolbar) return;
+    const row = toolbar.firstElementChild || toolbar;
+    if (btn.parentElement !== row) row.appendChild(btn);
+  }
   function mount() {
     const host = findHost();
+    if (host) dockHost(host);
+    dockExpand();
     if (!host) return;
     let handle = host.querySelector(":scope > .files-sidebar-resizer");
     if (collapsed) {
@@ -3194,7 +3227,7 @@ def files_sidebar_script(collapsed: bool) -> str:
         event.preventDefault();
         const startX = event.clientX;
         const startW = parseInt(
-    getComputedStyle(doc.documentElement).getPropertyValue("--files-sidebar-panel"),
+          getComputedStyle(doc.documentElement).getPropertyValue("--files-sidebar-panel"),
           10
         ) || DEF;
         function move(ev) { apply(startW + (startX - ev.clientX)); }
