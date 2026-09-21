@@ -1,7 +1,8 @@
 # CMU Canvas Study Assistant
 
 A local chat assistant that answers questions about your Canvas courses, assignments and
-deadlines — "what's due this week?", "when is Homework 4 due?", "what am I enrolled in?".
+deadlines — "what's due this week?", "when is Homework 4 due?", "what am I enrolled in?" — and
+that can pull up course files, showing PDFs, images and handouts right in the chat.
 
 It runs entirely on your own machine: a Streamlit web UI in your browser, conversation history in a
 local SQLite file, and **read-only** access to Canvas. The only data that leaves your machine goes
@@ -11,6 +12,7 @@ to the Canvas instance you configure and to the DeepSeek API that powers the cha
 - LLM: DeepSeek (`deepseek-flash`), with function/tool calling
 - Data: Canvas LMS REST API at `https://canvas.cmu.edu` (configurable)
 - History: SQLite (`canvas_assistant.db`)
+- File text extraction: [pypdf](https://pypi.org/project/pypdf/)
 
 ## Read-only guarantee
 
@@ -26,9 +28,15 @@ in `app.py`, a `requests.Session` subclass that raises `ReadOnlyViolation` unles
    cannot be sent somewhere else, and redirects are re-checked one hop at a time.
 
 Both the high-level `request()` path and the low-level `send()` path are checked, so there is no
-way to reach the network without passing the guard. The three tools exposed to the model are
+way to reach the network without passing the guard. The five tools exposed to the model are
 read-only lookups; the model cannot invoke arbitrary endpoints, and unknown tool names are rejected.
 `tests/test_app.py` covers all of this.
+
+File downloads are the one place where traffic leaves the Canvas host, because Canvas answers a
+file request with a redirect to its storage backend. Those downloads use a second session that is
+still GET-only, must *start* at your Canvas origin, requires https, and strips the `Authorization`
+header the moment the host changes — so your Canvas token is never sent to the storage host.
+Downloaded files are held in memory for the preview and are never written to disk.
 
 Your tokens are read from environment variables only. They are never written to the database, never
 shown in the UI (the sidebar shows only "OK" or "MISSING"), and any secret that would otherwise
@@ -108,8 +116,22 @@ Each new terminal session needs the virtual environment activated again
 - "What's due in the next 10 days?"
 - "When is the 15-213 midterm due?"
 - "I have 6 hours tonight — what should I work on first?"
+- "Show me the 21-241 syllabus."
+- "Pull up the lecture 5 slides and tell me what's on them."
 
-It cannot submit work or message anyone; ask it and it will tell you to do that in Canvas yourself.
+It cannot submit work, upload files or message anyone; ask it and it will tell you to do that in
+Canvas yourself.
+
+### Viewing course files
+
+Ask for a file by name and the assistant searches your courses' Files, then displays it inline:
+PDFs in a built-in viewer, images as images, text and code as text. Anything else — a `.pptx`, a
+`.zip` — comes with a Download button instead. There is a download button on every preview.
+
+For PDFs and text files the assistant also reads the contents (first ~50 pages, 20,000 characters),
+so you can ask "what's the late policy in this syllabus?" rather than skimming it yourself. Files
+larger than 25 MB are described but not fetched; open those in Canvas directly. Locked files stay
+locked — the app respects whatever Canvas says you may see.
 
 ## Conversation history
 
@@ -135,6 +157,10 @@ python -m pytest
   and update `.env`, then restart the app.
 - **"DeepSeek rejected the API key (401)"** — check `DEEPSEEK_API_KEY`, and that the account has
   credit.
+- **It can't find a file you know exists** — the assistant searches each course's Files area. If
+  your instructor hid the Files tab, or the file was attached directly to a Page or assignment
+  rather than uploaded to Files, it won't be listed. Naming the course ("in 15-213") narrows the
+  search and usually helps.
 - **Port already in use** — run `streamlit run app.py --server.port 8502`.
 - **Changes to `.env` don't apply** — restart the app; environment variables are read at startup.
 
@@ -154,7 +180,7 @@ streamlit run app.py
 
 | File | Purpose |
 | --- | --- |
-| `app.py` | Everything: config, read-only Canvas client, tool schemas, DeepSeek client, SQLite history, Streamlit UI |
+| `app.py` | Everything: config, read-only Canvas client, file viewer, tool schemas, DeepSeek client, SQLite history, Streamlit UI |
 | `requirements.txt` | Runtime dependencies |
 | `requirements-dev.txt` | Test dependencies |
 | `.env.example` | Template for your local `.env` |

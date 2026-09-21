@@ -34,6 +34,38 @@ def make_response(payload, status=200, headers=None, url=BASE_URL) -> requests.R
     return response
 
 
+def make_binary_response(content: bytes, content_type: str, status=200) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status
+    response.raw = io.BytesIO(content)
+    response.headers["Content-Type"] = content_type
+    return response
+
+
+def make_pdf(text: str) -> bytes:
+    """Smallest valid PDF that carries a line of extractable text."""
+    stream = b"BT /F1 12 Tf 20 100 Td (" + text.encode("ascii") + b") Tj ET"
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R"
+        b"/Resources<</Font<</F1 5 0 R>>>>>>",
+        b"<</Length %d>>stream\n" % len(stream) + stream + b"\nendstream",
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for index, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % index + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer\n<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    return bytes(out)
+
+
 class FakeCanvas:
     """Serves canned responses in order and records the requests it saw."""
 
@@ -113,6 +145,37 @@ def test_session_blocks_prepared_request_sent_directly():
 def test_session_requires_https():
     with pytest.raises(app.ReadOnlyViolation):
         app.ReadOnlySession("http://canvas.example.edu")
+
+
+def test_download_session_still_refuses_non_get():
+    session = app.ReadOnlySession(BASE_URL, allow_offsite_redirects=True)
+    with pytest.raises(app.ReadOnlyViolation):
+        session.post(f"{BASE_URL}/api/v1/files/1")
+    prepared = requests.Request("DELETE", "https://files.example.com/x").prepare()
+    with pytest.raises(app.ReadOnlyViolation):
+        session.send(prepared)
+
+
+def test_download_session_must_start_at_canvas():
+    session = app.ReadOnlySession(BASE_URL, allow_offsite_redirects=True)
+    with pytest.raises(app.ReadOnlyViolation):
+        session.get("https://files.example.com/leaked")
+
+
+def test_download_session_strips_auth_on_offsite_redirect():
+    session = app.ReadOnlySession(BASE_URL, allow_offsite_redirects=True)
+    prepared = requests.Request(
+        "GET", "https://storage.example.com/file.pdf", headers={"Authorization": f"Bearer {TOKEN}"}
+    ).prepare()
+    sent = {}
+
+    def capture(self, request, **kwargs):
+        sent["headers"] = dict(request.headers)
+        return make_response([], url=request.url)
+
+    with mock.patch.object(requests.Session, "send", autospec=True, side_effect=capture):
+        session.send(prepared)
+    assert "Authorization" not in sent["headers"]
 
 
 def test_client_only_issues_gets(client_factory):
@@ -281,11 +344,127 @@ def test_parse_canvas_timestamp_handles_z_suffix_and_garbage():
     assert app.parse_canvas_timestamp(None) is None
 
 
+# --- course files ----------------------------------------------------------
+
+FILE_ROW = {
+    "id": 9001,
+    "display_name": "15213-syllabus.pdf",
+    "filename": "15213-syllabus.pdf",
+    "content-type": "application/pdf",
+    "size": 240_000,
+    "updated_at": "2026-08-25T14:00:00Z",
+    "url": f"{BASE_URL}/files/9001/download?download_frd=1&verifier=supersecretverifier",
+}
+
+
+def test_find_course_files_normalizes_and_hides_download_url(client_factory):
+    client, fake = client_factory(
+        [
+            [{"id": 1, "name": "15-213"}],
+            [FILE_ROW, {"id": 9002, "display_name": "notes.txt", "content-type": "text/plain", "size": 12}],
+        ]
+    )
+    files = client.find_course_files("syllabus")
+    assert len(files) == 1
+    found = files[0]
+    assert found["file_id"] == 9001
+    assert found["filename"] == "15213-syllabus.pdf"
+    assert found["course_name"] == "15-213"
+    assert found["size_readable"] == "234.4 KB"
+    assert found["previewable"] is True
+    assert "verifier" not in json.dumps(found)
+    assert "search_term=syllabus" in fake.requests[1].url
+
+
+def test_find_course_files_skips_courses_without_a_files_tab(client_factory):
+    client, _ = client_factory(
+        [
+            [{"id": 1, "name": "Hidden files"}, {"id": 2, "name": "Open files"}],
+            make_response({"status": "unauthorized"}, status=403),
+            [FILE_ROW],
+        ]
+    )
+    files = client.find_course_files()
+    assert [f["course_name"] for f in files] == ["Open files"]
+
+
+def test_download_file_returns_bytes_and_metadata(client_factory):
+    pdf_bytes = make_pdf("Syllabus week 1")
+    client, fake = client_factory([FILE_ROW, make_binary_response(pdf_bytes, "application/pdf")])
+
+    content, described = client.download_file(9001)
+    assert content == pdf_bytes
+    assert described["filename"] == "15213-syllabus.pdf"
+    assert described["size_bytes"] == len(pdf_bytes)
+    assert [request.method for request in fake.requests] == ["GET", "GET"]
+
+
+def test_download_file_refuses_oversized_files(client_factory):
+    big = dict(FILE_ROW, size=200 * 1024 * 1024)
+    client, fake = client_factory([big])
+    with pytest.raises(app.CanvasError) as excinfo:
+        client.download_file(9001)
+    assert "preview limit" in str(excinfo.value)
+    assert len(fake.requests) == 1  # never fetched the body
+
+
+def test_download_file_stops_reading_past_the_cap(client_factory):
+    client, _ = client_factory(
+        [dict(FILE_ROW, size=None), make_binary_response(b"x" * 5000, "application/pdf")]
+    )
+    with pytest.raises(app.CanvasError):
+        client.download_file(9001, max_bytes=1000)
+
+
+def test_download_file_refuses_locked_files(client_factory):
+    client, _ = client_factory([dict(FILE_ROW, locked_for_user=True)])
+    with pytest.raises(app.CanvasError) as excinfo:
+        client.download_file(9001)
+    assert "locked" in str(excinfo.value)
+
+
+def test_extract_text_reads_text_files():
+    text, truncated = app.extract_text(b"hello notes", "text/plain")
+    assert text == "hello notes"
+    assert truncated is False
+
+
+def test_extract_text_truncates_long_text():
+    text, truncated = app.extract_text(b"a" * (app.MAX_EXTRACTED_CHARS + 50), "text/markdown")
+    assert truncated is True
+    assert len(text) == app.MAX_EXTRACTED_CHARS
+
+
+def test_extract_text_reads_a_real_pdf():
+    pytest.importorskip("pypdf")
+    text, truncated = app.extract_text(make_pdf("Syllabus week 1"), "application/pdf")
+    assert "Syllabus week 1" in text
+    assert truncated is False
+
+
+def test_extract_text_ignores_unreadable_formats():
+    assert app.extract_text(b"\x00\x01binary", "application/zip") == (None, False)
+    assert app.extract_text(b"not really a pdf", "application/pdf") == (None, False)
+
+
+def test_human_size_formats_bytes():
+    assert app.human_size(512) == "512 B"
+    assert app.human_size(2048) == "2.0 KB"
+    assert app.human_size(5 * 1024 * 1024) == "5.0 MB"
+    assert app.human_size(None) is None
+
+
 # --- tool layer ------------------------------------------------------------
 
 
 def test_tool_schemas_are_well_formed():
-    assert set(app.TOOL_NAMES) == {"list_my_courses", "list_upcoming_assignments", "find_due_dates"}
+    assert set(app.TOOL_NAMES) == {
+        "list_my_courses",
+        "list_upcoming_assignments",
+        "find_due_dates",
+        "find_course_files",
+        "open_file",
+    }
     for schema in app.TOOL_SCHEMAS:
         assert schema["type"] == "function"
         function = schema["function"]
@@ -311,6 +490,44 @@ def test_dispatch_tool_reports_unknown_tools(client_factory):
     client, _ = client_factory([])
     result = app.dispatch_tool(client, "submit_assignment", {"assignment_id": 1})
     assert "Unknown tool" in result["error"]
+
+
+def test_dispatch_open_file_reports_the_file_and_its_text(client_factory):
+    text_file = dict(FILE_ROW, id=9002, display_name="notes.txt", **{"content-type": "text/plain"})
+    client, _ = client_factory(
+        [text_file, make_binary_response(b"Homework 4 is due Friday.", "text/plain")]
+    )
+
+    result = app.dispatch_tool(client, "open_file", {"file_id": 9002})
+    assert result["displayed_to_student"] is True
+    assert result["file"]["filename"] == "notes.txt"
+    assert result["text_excerpt"] == "Homework 4 is due Friday."
+    assert "verifier" not in json.dumps(result)
+    json.dumps(result)
+
+
+def test_dispatch_open_file_requires_a_file_id(client_factory):
+    client, fake = client_factory([])
+    result = app.dispatch_tool(client, "open_file", {})
+    assert "file_id" in result["error"]
+    assert fake.requests == []
+
+
+def test_dispatch_open_file_extracts_pdf_text_for_the_model(client_factory):
+    pytest.importorskip("pypdf")
+    client, _ = client_factory(
+        [FILE_ROW, make_binary_response(make_pdf("Midterm is October 9"), "application/pdf")]
+    )
+    result = app.dispatch_tool(client, "open_file", {"file_id": 9001})
+    assert "Midterm is October 9" in result["text_excerpt"]
+    assert result["file"]["content_type"] == "application/pdf"
+
+
+def test_dispatch_find_course_files(client_factory):
+    client, _ = client_factory([[{"id": 1, "name": "15-213"}], [FILE_ROW]])
+    result = app.dispatch_tool(client, "find_course_files", {"query": "syllabus"})
+    assert result["count"] == 1
+    assert result["files"][0]["file_id"] == 9001
 
 
 def test_dispatch_tool_converts_canvas_errors_to_messages(client_factory):
