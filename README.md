@@ -50,10 +50,37 @@ Your tokens are read from environment variables only. They are never written to 
 shown in the UI (the sidebar shows only "OK" or "MISSING"), and any secret that would otherwise
 appear in an error message is scrubbed by `redact()`.
 
-## Setup on Windows
+## Setup
 
-You need Python 3.10 or newer ([python.org/downloads](https://www.python.org/downloads/); tick
-"Add python.exe to PATH" during install).
+You need Python 3.10 or newer. Same four steps on **macOS / Linux** and **Windows** — pick the
+command block for your OS.
+
+### macOS / Linux
+
+`python3 --version` should report 3.10 or newer. If it doesn't, install from
+[python.org/downloads](https://www.python.org/downloads/) or Homebrew (`brew install python`).
+
+Open Terminal in the folder where you cloned this repo (bash or zsh), then:
+
+```bash
+# 1. Create a virtual environment
+python3 -m venv .venv
+
+# 2. Activate it (bash / zsh)
+source .venv/bin/activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Create your local config from the template
+cp .env.example .env
+open -e .env        # macOS TextEdit; on Linux use nano .env (or any editor)
+```
+
+### Windows
+
+Install Python from [python.org/downloads](https://www.python.org/downloads/) and tick
+"Add python.exe to PATH" during install.
 
 Open PowerShell in the folder where you cloned this repo, then:
 
@@ -106,9 +133,9 @@ using this app.
 
 ## Running it
 
-With the virtual environment active:
+With the virtual environment active (bash, zsh, or PowerShell):
 
-```powershell
+```bash
 streamlit run app.py
 ```
 
@@ -121,8 +148,9 @@ computer itself is set to another zone (for example Beijing). Change it from the
 select in the sidebar; the choice is remembered in the local database across reruns. You can also
 set `CANVAS_ASSISTANT_TZ` in `.env`. Canvas still stores timestamps in UTC.
 
-Each new terminal session needs the virtual environment activated again
-(`.\.venv\Scripts\Activate.ps1`) before `streamlit run app.py`.
+Each new terminal session needs the virtual environment activated again before
+`streamlit run app.py`: `source .venv/bin/activate` on macOS / Linux, or
+`.\.venv\Scripts\Activate.ps1` on Windows.
 
 ### What it can answer
 
@@ -207,7 +235,9 @@ not a second `st.sidebar`.
 No Canvas or DeepSeek credentials are needed — Canvas HTTP traffic is faked at the transport layer
 and the UI runs through Streamlit's headless test harness.
 
-```powershell
+Activate the venv first (`source .venv/bin/activate` or `.\.venv\Scripts\Activate.ps1`), then:
+
+```bash
 pip install -r requirements-dev.txt
 python -m pytest
 ```
@@ -232,18 +262,6 @@ python -m pytest
   `pip install -r requirements.txt` if the UI is older.
 - **Port already in use** — run `streamlit run app.py --server.port 8502`.
 - **Changes to `.env` don't apply** — restart the app; environment variables are read at startup.
-
-## macOS / Linux
-
-Same steps, different activation:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-streamlit run app.py
-```
 
 ## Layout
 
