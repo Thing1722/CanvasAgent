@@ -1572,10 +1572,31 @@ def test_files_sidebar_uses_native_columns_not_js_dock():
     assert "appendChild" not in main_src
     assert "appendChild" not in panel_src
     assert "FILES_SIDEBAR_KEY" in panel_src
-    assert "keyboard_double_arrow_right" in app.FILES_SIDEBAR_COLLAPSE_ICON
-    assert "keyboard_double_arrow_left" in app.FILES_SIDEBAR_EXPAND_ICON
+    assert "chevron_right" in app.FILES_SIDEBAR_COLLAPSE_ICON
+    assert "chevron_left" in app.FILES_SIDEBAR_EXPAND_ICON
+    script = app.files_sidebar_css_script()
+    css = app.files_sidebar_css()
+    assert "doc.head.appendChild" in script
+    assert "stAppViewContainer" not in script
+    assert "querySelector" not in script
+    assert "position: sticky" in css
+    assert "100dvh" in css
+    assert '[data-testid="stColumn"]:has(.st-key-files-sidebar)' in css
+    assert "st-key-files-sidebar-collapse" in css
+    assert "keyboard_double_arrow" not in app.FILES_SIDEBAR_COLLAPSE_ICON
+    assert "keyboard_double_arrow" not in app.FILES_SIDEBAR_EXPAND_ICON
     assert not hasattr(app, "files_sidebar_script")
     assert not hasattr(app, "inject_files_sidebar_chrome")
+
+
+def test_files_sidebar_css_injection_does_not_move_widgets():
+    script = app.files_sidebar_css_script()
+    assert "appendChild(el)" in script
+    assert "createElement('style')" in script
+    assert "appendChild(host)" not in script
+    assert "stToolbar" not in script
+    assert "stAppViewContainer" not in script
+    assert "querySelector(" not in script
 
 
 def test_assistant_is_user_facing_hides_tool_calls_and_reasoning():
