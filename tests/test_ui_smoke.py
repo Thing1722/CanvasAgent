@@ -377,21 +377,55 @@ def test_sidebar_timezone_honors_env_override(monkeypatch, tmp_path):
     assert harness.sidebar.selectbox[0].value == "America/Los_Angeles"
 
 
+def _expander_element_ids(harness) -> set[int]:
+    """AppTest flattens expander children into the top-level element lists."""
+    ids: set[int] = set()
+    for expander in getattr(harness, "expander", []) or []:
+        for name in ("markdown", "caption", "title", "text", "code", "info", "warning", "error", "json"):
+            for element in getattr(expander, name, []) or []:
+                ids.add(id(element))
+    return ids
+
+
 def _default_visible_text(harness) -> str:
     """Markdown, captions, and chat text a student sees without expanding widgets.
 
     AppTest already flattens chat_message children into harness.markdown / caption.
-    Do not recurse into chat_message — ChatMessage.chat_message points at itself.
+    Skip expander children — those are collapsed until clicked.
     """
+    skip = _expander_element_ids(harness)
     parts: list[str] = []
     for name in ("markdown", "caption", "title", "text", "code", "info", "warning", "error"):
         for element in getattr(harness, name, []) or []:
+            if id(element) in skip:
+                continue
             parts.append(str(getattr(element, "value", element)))
     return "\n".join(parts)
 
 
 def _expander_labels(harness) -> list[str]:
     return [str(expander.label) for expander in getattr(harness, "expander", []) or []]
+
+
+def _json_outside_expanders(harness) -> list:
+    skip = _expander_element_ids(harness)
+    return [element for element in (getattr(harness, "json", []) or []) if id(element) not in skip]
+
+
+def _details_expanders(harness):
+    import app
+
+    return [exp for exp in (getattr(harness, "expander", []) or []) if exp.label == app.TURN_TRACE_EXPANDER_LABEL]
+
+
+def _expander_body_text(expander) -> str:
+    parts: list[str] = []
+    for name in ("markdown", "caption", "title", "text", "code"):
+        for element in getattr(expander, name, []) or []:
+            parts.append(str(getattr(element, "value", element)))
+    for element in getattr(expander, "json", []) or []:
+        parts.append(str(getattr(element, "value", element)))
+    return "\n".join(parts)
 
 
 def test_replay_hides_tool_traces_and_shows_final_answer(monkeypatch, tmp_path):
@@ -459,7 +493,15 @@ def test_replay_hides_tool_traces_and_shows_final_answer(monkeypatch, tmp_path):
     assert "find_due_dates" not in visible
     assert '{"query"' not in visible
     assert not any("Canvas lookup" in label for label in _expander_labels(harness))
-    assert len(harness.json) == 0
+    assert _json_outside_expanders(harness) == []
+    details = _details_expanders(harness)
+    assert len(details) == 1
+    assert details[0].proto.expanded is False
+    body = _expander_body_text(details[0])
+    assert "find_due_dates" in body
+    assert "ZZZ_TOOL_ARG" in body
+    assert "ZZZ_TOOL_JSON" in body
+    assert "Let me search Canvas for that." in body
 
     replayed = app.ConversationStore(str(db_path)).get_messages(conversation_id)
     assert [m["role"] for m in replayed] == ["user", "assistant", "tool", "assistant"]
@@ -527,7 +569,14 @@ app.render_conversation(history + produced, FakeCanvas())
     assert "list_my_courses" not in visible
     assert '{"ZZZ_TOOL_ARG"' not in visible
     assert not any("Canvas lookup" in label for label in _expander_labels(harness))
-    assert len(harness.json) == 0
+    assert _json_outside_expanders(harness) == []
+    details = _details_expanders(harness)
+    assert len(details) == 1
+    assert details[0].proto.expanded is False
+    body = _expander_body_text(details[0])
+    assert "list_my_courses" in body
+    assert "ZZZ_TOOL_ARG" in body
+    assert "Let me look that up." in body
 
 
 def test_open_file_preview_still_renders_without_lookup_expander():
@@ -594,7 +643,14 @@ app.render_conversation(
     assert keys[0].startswith("download-")
     assert "call_file" in keys[0]
     assert not any("Canvas lookup" in label for label in _expander_labels(harness))
-    assert len(harness.json) == 0
+    assert _json_outside_expanders(harness) == []
+    details = _details_expanders(harness)
+    assert len(details) == 1
+    assert details[0].proto.expanded is False
+    assert len(details[0].download_button) == 0
+    body = _expander_body_text(details[0])
+    assert "open_file" in body
+    assert "14814596" in body
     # Preview body still includes the file text (code/markdown), not the tool JSON.
     assert "Office hours are Friday." in visible or "notes.txt" in visible
 

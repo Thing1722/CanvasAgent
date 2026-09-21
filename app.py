@@ -2501,16 +2501,107 @@ def render_message(message: dict[str, Any], canvas: CanvasClient | None = None) 
         st.error(redact(exc))
 
 
+TURN_TRACE_EXPANDER_LABEL = "Details"
+_turn_trace_seq = 0
+
+
+def turn_trace_entries(turn: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Calling, reasoning, and tool results for one collapsed Details expander."""
+    entries: list[dict[str, Any]] = []
+    for message in turn:
+        role = message.get("role")
+        if role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if reasoning and str(reasoning).strip():
+                entries.append({"kind": "reasoning", "text": str(reasoning)})
+            if message.get("tool_calls"):
+                progress = message.get("content")
+                if progress and str(progress).strip():
+                    entries.append({"kind": "progress", "text": str(progress)})
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") or {}
+                    arguments = function.get("arguments") or "{}"
+                    try:
+                        parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+                    except json.JSONDecodeError:
+                        parsed = arguments
+                    entries.append(
+                        {
+                            "kind": "call",
+                            "name": function.get("name") or "tool",
+                            "arguments": parsed,
+                        }
+                    )
+        elif role == "tool":
+            payload = _tool_payload(message)
+            entries.append(
+                {
+                    "kind": "result",
+                    "name": message.get("name") or "tool",
+                    "payload": payload if payload is not None else (message.get("content") or ""),
+                }
+            )
+    return entries
+
+
+def _turn_trace_expander_key(turn: list[dict[str, Any]]) -> str:
+    global _turn_trace_seq
+    _turn_trace_seq += 1
+    call_ids: list[str] = []
+    for message in turn:
+        for call in message.get("tool_calls") or []:
+            call_ids.append(str(call.get("id") or ""))
+        if message.get("tool_call_id"):
+            call_ids.append(str(message["tool_call_id"]))
+    token = re.sub(r"[^A-Za-z0-9_-]", "_", "-".join(c for c in call_ids if c) or "none")[:80]
+    return f"details-{token}-{_turn_trace_seq}"
+
+
+def render_turn_traces(turn: list[dict[str, Any]]) -> None:
+    """One collapsed expander per turn; file previews stay outside it."""
+    entries = turn_trace_entries(turn)
+    if not entries:
+        return
+    try:
+        with st.expander(
+            TURN_TRACE_EXPANDER_LABEL,
+            expanded=False,
+            key=_turn_trace_expander_key(turn),
+        ):
+            for entry in entries:
+                kind = entry.get("kind")
+                if kind in {"reasoning", "progress"}:
+                    st.markdown(entry["text"])
+                elif kind == "call":
+                    st.caption(entry["name"])
+                    arguments = entry.get("arguments")
+                    if isinstance(arguments, (dict, list)):
+                        st.json(arguments, expanded=False)
+                    else:
+                        st.code(str(arguments))
+                elif kind == "result":
+                    st.caption(entry["name"])
+                    payload = entry.get("payload")
+                    if isinstance(payload, (dict, list)):
+                        st.json(payload, expanded=False)
+                    else:
+                        st.code(str(payload))
+    except Exception as exc:
+        logger.exception("Failed to render turn traces")
+        st.error(redact(exc))
+
+
 def render_agent_turn(
     turn: list[dict[str, Any]], canvas: CanvasClient | None = None
 ) -> None:
-    """Render one model turn: final answer first, then file / submission previews."""
+    """Render one model turn: final answer first, then file previews, then traces."""
     for message in turn:
         if assistant_is_user_facing(message):
             render_message(message, canvas)
     for message in turn:
         if message.get("role") == "tool":
             render_message(message, canvas)
+    render_turn_traces(turn)
 
 
 def render_conversation(
