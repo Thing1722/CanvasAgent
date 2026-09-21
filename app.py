@@ -21,9 +21,11 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -83,6 +85,9 @@ USER_AGENT = "cmu-canvas-study-assistant/1.0"
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 
 PREVIEWABLE_TYPES = ("application/pdf", "image/", "text/")
+
+# Assignment prompts can be long; keep enough to be useful in a prompt budget.
+MAX_DESCRIPTION_CHARS = 8_000
 
 REQUIRED_ENV_VARS = ("DEEPSEEK_API_KEY", "CANVAS_API_TOKEN")
 
@@ -199,6 +204,15 @@ class CanvasError(RuntimeError):
     """A Canvas request failed in a way worth showing the user."""
 
 
+class CanvasAccessError(CanvasError):
+    """Canvas refused this particular resource (401/403).
+
+    Canvas answers "you may not list this" with 401 just as it answers "your
+    token is bad", so callers that have already made a successful request treat
+    this as a permission problem for one endpoint rather than a dead token.
+    """
+
+
 def parse_canvas_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -206,6 +220,92 @@ def parse_canvas_timestamp(value: str | None) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def matches_all_words(haystack: str, query: str) -> bool:
+    """Loose search: every word in the query must appear somewhere."""
+    text = (haystack or "").lower()
+    words = [word for word in (query or "").lower().split() if word]
+    return all(word in text for word in words)
+
+
+class _HtmlExtractor(HTMLParser):
+    """Turn a Canvas HTML description into plain text plus its links."""
+
+    BLOCK_TAGS = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._link_text: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip_depth += 1
+            return
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+        if tag == "li":
+            self.parts.append("- ")
+        if tag == "a":
+            self._href = dict(attrs).get("href")
+            self._link_text = []
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        # Not li/br: the next list item opens with its own newline, and closing
+        # both ends would put a blank line between every bullet.
+        if tag in self.BLOCK_TAGS - {"li", "br"}:
+            self.parts.append("\n")
+        if tag == "a":
+            if self._href:
+                self.links.append((self._href, "".join(self._link_text).strip()))
+            self._href = None
+            self._link_text = []
+
+    def handle_data(self, data):
+        if self._skip_depth:
+            return
+        self.parts.append(data)
+        if self._href is not None:
+            self._link_text.append(data)
+
+
+FILE_LINK_PATTERN = re.compile(r"/files/(\d+)")
+
+
+def html_to_text_and_links(html: str) -> tuple[str, list[tuple[int, str]]]:
+    """Return readable text and any Canvas file links found in ``html``."""
+    if not html:
+        return "", []
+    parser = _HtmlExtractor()
+    parser.feed(html)
+    parser.close()
+
+    text = "".join(parser.parts)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    text = "\n".join(line.strip() for line in text.splitlines()).strip()
+    if len(text) > MAX_DESCRIPTION_CHARS:
+        text = text[:MAX_DESCRIPTION_CHARS] + "\n[truncated]"
+
+    files: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for href, label in parser.links:
+        match = FILE_LINK_PATTERN.search(href or "")
+        if not match:
+            continue
+        file_id = int(match.group(1))
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        files.append((file_id, label or f"file {file_id}"))
+    return text, files
 
 
 def human_size(num_bytes: Any) -> str | None:
@@ -273,12 +373,11 @@ class CanvasClient:
         except requests.RequestException as exc:
             raise CanvasError(f"Could not reach Canvas at {self.base_url}: {redact(exc)}") from exc
 
-        if response.status_code == 401:
-            raise CanvasError(
-                "Canvas rejected the API token (401). Generate a new token and update CANVAS_API_TOKEN in your .env."
+        if response.status_code in (401, 403):
+            raise CanvasAccessError(
+                f"Canvas refused access ({response.status_code}) to {urlparse(url).path}. "
+                "Either the API token is invalid or this part of the course is hidden from students."
             )
-        if response.status_code == 403:
-            raise CanvasError("Canvas denied access to this data (403).")
         if response.status_code == 404:
             raise CanvasError(f"Canvas has no such resource (404): {urlparse(url).path}")
         if response.status_code >= 400:
@@ -301,10 +400,14 @@ class CanvasClient:
         return None
 
     def get_list(self, path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        """GET a paginated Canvas collection and return every row we fetched."""
+        """GET a paginated Canvas collection and return every row we fetched.
+
+        ``path`` may be an API path or a full Canvas URL, since Canvas hands
+        back absolute URLs in places like a module's ``items_url``.
+        """
         query = {"per_page": 100}
         query.update(params or {})
-        url: str | None = self._url(path)
+        url: str | None = path if path.startswith("http") else self._url(path)
         rows: list[dict[str, Any]] = []
         pages = 0
         while url and pages < self.max_pages:
@@ -354,7 +457,9 @@ class CanvasClient:
         params: dict[str, Any] = {"include[]": "submission", "order_by": "due_at"}
         if bucket:
             params["bucket"] = bucket
-        if search_term:
+        # Canvas rejects search_term shorter than 3 characters, so short
+        # queries are filtered locally instead.
+        if search_term and len(search_term) >= 3:
             params["search_term"] = search_term
         return self.get_list(f"courses/{int(course_id)}/assignments", params)
 
@@ -374,10 +479,80 @@ class CanvasClient:
             "course_id": course.get("course_id"),
             "course_name": course.get("name"),
             "points_possible": row.get("points_possible"),
+            "submission_types": row.get("submission_types") or [],
             "submitted": bool(submission.get("submitted_at")) if submission else None,
+            "has_description": bool((row.get("description") or "").strip()),
             "html_url": row.get("html_url"),
             **describe_due(due),
         }
+
+    def get_assignment(self, course_id: int, assignment_id: int) -> dict[str, Any]:
+        response = self._get(
+            self._url(f"courses/{int(course_id)}/assignments/{int(assignment_id)}"),
+            {"include[]": "submission"},
+        )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise CanvasError(f"Canvas returned a non-JSON response for assignment {assignment_id}.") from exc
+
+    def get_assignment_details(
+        self, assignment_id: int, course_id: int | None = None
+    ) -> dict[str, Any]:
+        """Full detail for one assignment: the prompt, how to submit, attachments."""
+        courses = self._course_lookup(course_id)
+        if course_id is not None and not courses:
+            raise CanvasError(f"Course {course_id} is not one of your active courses.")
+
+        row: dict[str, Any] | None = None
+        course: dict[str, Any] = {}
+        for candidate in courses:
+            try:
+                row = self.get_assignment(candidate["course_id"], assignment_id)
+            except CanvasError:
+                continue  # wrong course when we are scanning; try the next one
+            course = candidate
+            break
+        if row is None:
+            raise CanvasError(
+                f"Could not find assignment {assignment_id}. Pass the course_id from "
+                "list_upcoming_assignments or find_due_dates."
+            )
+
+        details = self._normalize_assignment(row, course)
+        description = row.get("description") or ""
+        text, links = html_to_text_and_links(description)
+        submission = row.get("submission") or {}
+        details.update(
+            {
+                "instructions": text or None,
+                "submission_types": row.get("submission_types") or [],
+                "allowed_extensions": row.get("allowed_extensions") or [],
+                "allowed_attempts": row.get("allowed_attempts"),
+                "grading_type": row.get("grading_type"),
+                "unlock_at": (describe_due(parse_canvas_timestamp(row.get("unlock_at"))))["due_at_local"],
+                "lock_at": (describe_due(parse_canvas_timestamp(row.get("lock_at"))))["due_at_local"],
+                "attached_files": [
+                    {"file_id": file_id, "filename": name} for file_id, name in links
+                ],
+                "submission_status": {
+                    "submitted_at": submission.get("submitted_at"),
+                    "workflow_state": submission.get("workflow_state"),
+                    "attempt": submission.get("attempt"),
+                    "late": submission.get("late"),
+                    "missing": submission.get("missing"),
+                    "score": submission.get("score"),
+                },
+                "rubric": [
+                    {
+                        "criterion": item.get("description"),
+                        "points": item.get("points"),
+                    }
+                    for item in (row.get("rubric") or [])
+                ],
+            }
+        )
+        return details
 
     def list_upcoming_assignments(
         self,
@@ -439,34 +614,117 @@ class CanvasClient:
             "previewable": bool(
                 (row.get("content-type") or row.get("content_type") or "").startswith(PREVIEWABLE_TYPES)
             ),
+            "found_in": row.get("module") or row.get("source"),
         }
+
+    def _files_from_files_tab(self, course_id: int) -> list[dict[str, Any]]:
+        # No search_term or sort parameters here on purpose: Canvas rejects
+        # short search terms outright, and a rejected request used to look
+        # exactly like a course with no files. Filter and sort locally instead.
+        return [dict(row, source="files") for row in self.get_list(f"courses/{course_id}/files")]
+
+    def _files_from_modules(self, course_id: int) -> list[dict[str, Any]]:
+        """Find files through Modules, which stay visible when Files is hidden."""
+        found: list[dict[str, Any]] = []
+        for module in self.get_list(f"courses/{course_id}/modules", {"include[]": "items"}):
+            items = module.get("items")
+            if items is None and module.get("items_url"):
+                try:
+                    items = self.get_list(module["items_url"])
+                except CanvasError:
+                    items = []
+            for item in items or []:
+                if item.get("type") != "File" or not item.get("content_id"):
+                    continue
+                found.append(
+                    {
+                        "id": item["content_id"],
+                        "display_name": item.get("title"),
+                        "source": "modules",
+                        "module": module.get("name"),
+                    }
+                )
+        return found
+
+    def collect_course_files(self, course: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+        """Gather a course's files from every place a student can see them."""
+        course_id = course["course_id"]
+        name = course.get("name") or f"course {course_id}"
+        candidates: dict[Any, dict[str, Any]] = {}
+        notes: list[str] = []
+
+        try:
+            for row in self._files_from_files_tab(course_id):
+                candidates[row.get("id")] = row
+        except CanvasAccessError:
+            notes.append(f"{name}: the Files tab is hidden, so only files posted in Modules are visible.")
+        except CanvasError as exc:
+            notes.append(f"{name}: could not list Files ({exc})")
+
+        # Modules are the fallback when Files is hidden or empty, which is how
+        # most courses that "have no files" actually publish their handouts.
+        if not candidates:
+            try:
+                for row in self._files_from_modules(course_id):
+                    candidates.setdefault(row["id"], row)
+            except CanvasAccessError:
+                notes.append(f"{name}: Modules are not visible either.")
+            except CanvasError as exc:
+                notes.append(f"{name}: could not read Modules ({exc})")
+
+        return [row for row in candidates.values() if row.get("id")], notes
 
     def find_course_files(
         self,
         query: str | None = None,
         course_id: int | None = None,
         limit: int = 20,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Search the student's course files. Returns (files, notes).
+
+        Notes explain any course that could not be searched, so a zero-result
+        answer can say why instead of implying the course has no files.
+        """
         term = (query or "").strip()
-        if term and len(term) < 2:
-            raise CanvasError("Search text must be at least 2 characters long.")
-        params: dict[str, Any] = {"sort": "updated_at", "order": "desc"}
-        if term:
-            params["search_term"] = term
-        files: list[dict[str, Any]] = []
-        for course in self._course_lookup(course_id):
-            try:
-                rows = self.get_list(f"courses/{course['course_id']}/files", params)
-            except CanvasError:
-                # Instructors can hide the Files tab for a course; skip it.
-                continue
-            for row in rows:
-                if term and term.lower() not in (
-                    (row.get("display_name") or row.get("filename") or "").lower()
-                ):
+        notes: list[str] = []
+        matched: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        courses = self._course_lookup(course_id)
+        if not courses:
+            return [], ["No active courses were returned by Canvas."]
+
+        for course in courses:
+            candidates, course_notes = self.collect_course_files(course)
+            notes.extend(course_notes)
+            for row in candidates:
+                haystack = " ".join(
+                    str(part)
+                    for part in (
+                        row.get("display_name"),
+                        row.get("filename"),
+                        row.get("module"),
+                    )
+                    if part
+                )
+                if term and not matches_all_words(haystack, term):
                     continue
-                files.append(self._normalize_file(row, course))
-        return files[: max(1, int(limit))]
+                matched.append((row, course))
+
+        matched.sort(key=lambda pair: str(pair[0].get("updated_at") or ""), reverse=True)
+        files: list[dict[str, Any]] = []
+        for row, course in matched[: max(1, int(limit))]:
+            # Module items carry only a title and an id; fill in the rest so the
+            # model can tell a PDF from a video before opening it.
+            if not (row.get("content-type") or row.get("content_type")):
+                try:
+                    row = dict(
+                        self.get_file_metadata(row["id"]),
+                        source=row.get("source"),
+                        module=row.get("module"),
+                    )
+                except CanvasError:
+                    pass
+            files.append(self._normalize_file(row, course))
+        return files, notes
 
     def get_file_metadata(self, file_id: int) -> dict[str, Any]:
         response = self._get(self._url(f"files/{int(file_id)}"))
@@ -612,8 +870,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "find_course_files",
             "description": (
                 "Find files posted in the student's courses — lecture slides, PDFs, handouts, "
-                "syllabi. Returns file ids and metadata, not the file contents. "
-                "Use open_file afterwards to actually show a file to the student."
+                "syllabi — searching both the Files area and Modules. Returns file ids and "
+                "metadata, not the file contents. Use open_file afterwards to show a file. "
+                "Call with no query to list everything available. If it returns nothing, read "
+                "the 'notes' field: it says which courses could not be searched and why. Files "
+                "attached to a specific assignment appear in get_assignment_details instead."
             ),
             "parameters": {
                 "type": "object",
@@ -653,6 +914,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     }
                 },
                 "required": ["file_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_assignment_details",
+            "description": (
+                "Get everything Canvas knows about one assignment: the full instructions/prompt, "
+                "how it must be submitted (file upload, text entry, URL, on paper), allowed file "
+                "extensions, attempts, rubric, attached files, and the student's submission "
+                "status. Use this whenever the student asks what an assignment actually requires "
+                "or how to turn it in. Get assignment_id and course_id from "
+                "list_upcoming_assignments or find_due_dates."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "assignment_id": {
+                        "type": "integer",
+                        "description": "The Canvas assignment id.",
+                    },
+                    "course_id": {
+                        "type": "integer",
+                        "description": "The Canvas course id the assignment belongs to.",
+                    },
+                },
+                "required": ["assignment_id"],
             },
         },
     },
@@ -713,12 +1002,30 @@ def dispatch_tool(client: CanvasClient, name: str, arguments: dict[str, Any]) ->
             )
             return {"assignments": assignments, "count": len(assignments)}
         if name == "find_course_files":
-            files = client.find_course_files(
+            files, notes = client.find_course_files(
                 query=args.get("query"),
                 course_id=args.get("course_id"),
                 limit=int(args.get("limit", 20) or 20),
             )
-            return {"files": files, "count": len(files)}
+            payload: dict[str, Any] = {"files": files, "count": len(files)}
+            if notes:
+                payload["notes"] = notes
+            if not files:
+                payload["hint"] = (
+                    "No files matched. Try again with no query to see everything, or tell the "
+                    "student the file may be attached to an assignment (check "
+                    "get_assignment_details) or posted somewhere this app cannot read."
+                )
+            return payload
+        if name == "get_assignment_details":
+            if args.get("assignment_id") in (None, ""):
+                return {"error": "get_assignment_details needs an assignment_id."}
+            return {
+                "assignment": client.get_assignment_details(
+                    assignment_id=int(args["assignment_id"]),
+                    course_id=int(args["course_id"]) if args.get("course_id") else None,
+                )
+            }
         if name == "open_file":
             if args.get("file_id") in (None, ""):
                 return {"error": "open_file needs a file_id from find_course_files."}
@@ -944,6 +1251,12 @@ Guidelines:
   itself is rendered in the chat, so introduce it in one short sentence instead of describing every \
   page. If open_file returns a text excerpt you may use it to answer questions about the contents, \
   and say so if the excerpt was truncated.
+- If find_course_files returns nothing, do not simply say "no files". Retry once with no query, and \
+  check get_assignment_details for the relevant assignment, since attachments often live on the \
+  assignment rather than in Files. Report anything in the "notes" field, such as a course whose \
+  Files tab is hidden.
+- For "what does this assignment want?", "how do I submit?", or anything about instructions, \
+  formats or rubrics, call get_assignment_details. The list tools only carry titles and due dates.
 - Today is {today}. The student's local timezone is {timezone}.
 - Tool results give due dates both in UTC ("due_at") and in local time ("due_at_local"). Always \
   quote local time to the student.

@@ -28,7 +28,7 @@ in `app.py`, a `requests.Session` subclass that raises `ReadOnlyViolation` unles
    cannot be sent somewhere else, and redirects are re-checked one hop at a time.
 
 Both the high-level `request()` path and the low-level `send()` path are checked, so there is no
-way to reach the network without passing the guard. The five tools exposed to the model are
+way to reach the network without passing the guard. The six tools exposed to the model are
 read-only lookups; the model cannot invoke arbitrary endpoints, and unknown tool names are rejected.
 `tests/test_app.py` covers all of this.
 
@@ -118,20 +118,39 @@ Each new terminal session needs the virtual environment activated again
 - "I have 6 hours tonight — what should I work on first?"
 - "Show me the 21-241 syllabus."
 - "Pull up the lecture 5 slides and tell me what's on them."
+- "What exactly does the Comparative Genre Analysis ask for, and how do I submit it?"
 
 It cannot submit work, upload files or message anyone; ask it and it will tell you to do that in
 Canvas yourself.
 
 ### Viewing course files
 
-Ask for a file by name and the assistant searches your courses' Files, then displays it inline:
-PDFs in a built-in viewer, images as images, text and code as text. Anything else — a `.pptx`, a
-`.zip` — comes with a Download button instead. There is a download button on every preview.
+Ask for a file by name and the assistant searches your courses, then displays it inline: PDFs in a
+built-in viewer, images as images, text and code as text. Anything else — a `.pptx`, a `.zip` —
+comes with a Download button instead. There is a download button on every preview.
+
+Files are found in three places, because courses publish them differently:
+
+1. the course **Files** area;
+2. **Modules**, used automatically when a course hides its Files tab (common at CMU) or when Files
+   comes back empty;
+3. **attachments on an assignment**, which show up in the assignment's details.
+
+If a course can't be searched at all — a hidden Files tab and no readable Modules — the assistant
+says so instead of reporting "no files found".
 
 For PDFs and text files the assistant also reads the contents (first ~50 pages, 20,000 characters),
 so you can ask "what's the late policy in this syllabus?" rather than skimming it yourself. Files
 larger than 25 MB are described but not fetched; open those in Canvas directly. Locked files stay
 locked — the app respects whatever Canvas says you may see.
+
+### Assignment details
+
+Ask what an assignment actually requires and the assistant pulls the full record: the instructions
+as written by the instructor (HTML stripped to readable text), how it must be submitted (file
+upload, text entry, a URL, on paper), which file extensions are allowed, how many attempts you
+get, the rubric, any files attached to the prompt, and whether you've submitted yet. Attached files
+can be opened straight from there.
 
 ## Conversation history
 
@@ -157,10 +176,10 @@ python -m pytest
   and update `.env`, then restart the app.
 - **"DeepSeek rejected the API key (401)"** — check `DEEPSEEK_API_KEY`, and that the account has
   credit.
-- **It can't find a file you know exists** — the assistant searches each course's Files area. If
-  your instructor hid the Files tab, or the file was attached directly to a Page or assignment
-  rather than uploaded to Files, it won't be listed. Naming the course ("in 15-213") narrows the
-  search and usually helps.
+- **It can't find a file you know exists** — the assistant searches Files, then Modules, and finds
+  assignment attachments through the assignment itself. A file linked only from a Page or an
+  Announcement still won't be found. Naming the course ("in 76-101") narrows the search, and asking
+  about the assignment ("what's attached to the CGA?") reaches attachments directly.
 - **Port already in use** — run `streamlit run app.py --server.port 8502`.
 - **Changes to `.env` don't apply** — restart the app; environment variables are read at startup.
 
