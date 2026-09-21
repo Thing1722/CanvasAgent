@@ -364,7 +364,8 @@ def test_find_course_files_normalizes_and_hides_download_url(client_factory):
             [FILE_ROW, {"id": 9002, "display_name": "notes.txt", "content-type": "text/plain", "size": 12}],
         ]
     )
-    files = client.find_course_files("syllabus")
+    files, notes = client.find_course_files("syllabus")
+    assert notes == []
     assert len(files) == 1
     found = files[0]
     assert found["file_id"] == 9001
@@ -373,19 +374,101 @@ def test_find_course_files_normalizes_and_hides_download_url(client_factory):
     assert found["size_readable"] == "234.4 KB"
     assert found["previewable"] is True
     assert "verifier" not in json.dumps(found)
-    assert "search_term=syllabus" in fake.requests[1].url
 
 
-def test_find_course_files_skips_courses_without_a_files_tab(client_factory):
+def test_file_search_never_sends_search_term_to_canvas(client_factory):
+    """Canvas 400s on search terms under 3 characters, which used to look
+    identical to a course with no files. Filtering happens locally now."""
+    client, fake = client_factory([[{"id": 1, "name": "15-213"}], [FILE_ROW]])
+    files, _ = client.find_course_files("CGA")
+    assert all("search_term" not in request.url for request in fake.requests)
+    assert all("sort=" not in request.url for request in fake.requests)
+    assert files == []  # "CGA" genuinely does not match the syllabus
+
+
+def test_file_search_matches_every_word_in_any_order(client_factory):
     client, _ = client_factory(
         [
-            [{"id": 1, "name": "Hidden files"}, {"id": 2, "name": "Open files"}],
-            make_response({"status": "unauthorized"}, status=403),
-            [FILE_ROW],
+            [{"id": 1, "name": "Comparative Genre Analysis"}],
+            [{"id": 1, "display_name": "CGA-prompt-final.pdf", "content-type": "application/pdf"}],
         ]
     )
-    files = client.find_course_files()
-    assert [f["course_name"] for f in files] == ["Open files"]
+    files, _ = client.find_course_files("prompt cga")
+    assert [f["filename"] for f in files] == ["CGA-prompt-final.pdf"]
+
+
+def test_find_course_files_falls_back_to_modules_when_files_tab_is_hidden(client_factory):
+    """The reported bug: Canvas answers 401 for a hidden Files tab, which the
+    old code swallowed, so every search came back empty."""
+    client, _ = client_factory(
+        [
+            [{"id": 1, "name": "76-101 Interp & Argument"}],
+            make_response({"status": "unauthorized"}, status=401),
+            [
+                {
+                    "id": 55,
+                    "name": "Unit 2",
+                    "items": [
+                        {"type": "Page", "title": "Overview"},
+                        {"type": "File", "title": "CGA assignment.pdf", "content_id": 4242},
+                    ],
+                }
+            ],
+            dict(FILE_ROW, id=4242, display_name="CGA assignment.pdf"),
+        ]
+    )
+    files, notes = client.find_course_files("CGA")
+    assert [f["file_id"] for f in files] == [4242]
+    assert files[0]["filename"] == "CGA assignment.pdf"
+    assert files[0]["found_in"] == "Unit 2"
+    assert any("Files tab is hidden" in note for note in notes)
+
+
+def test_find_course_files_follows_items_url_for_large_modules(client_factory):
+    client, fake = client_factory(
+        [
+            [{"id": 1, "name": "Course"}],
+            [],  # Files tab is readable but empty
+            [{"id": 7, "name": "Week 1", "items_url": f"{BASE_URL}/api/v1/courses/1/modules/7/items"}],
+            [{"type": "File", "title": "handout.pdf", "content_id": 99}],
+            dict(FILE_ROW, id=99, display_name="handout.pdf"),
+        ]
+    )
+    files, _ = client.find_course_files("handout")
+    assert [f["file_id"] for f in files] == [99]
+    assert any("/modules/7/items" in request.url for request in fake.requests)
+
+
+def test_find_course_files_explains_a_course_it_could_not_read(client_factory):
+    client, _ = client_factory(
+        [
+            [{"id": 1, "name": "Locked down"}],
+            make_response({}, status=401),
+            make_response({}, status=401),
+        ]
+    )
+    files, notes = client.find_course_files()
+    assert files == []
+    assert any("Files tab is hidden" in note for note in notes)
+    assert any("Modules are not visible" in note for note in notes)
+
+
+def test_find_course_files_reports_when_there_are_no_courses(client_factory):
+    client, _ = client_factory([[]])
+    files, notes = client.find_course_files()
+    assert files == []
+    assert notes == ["No active courses were returned by Canvas."]
+
+
+def test_file_listing_with_no_query_returns_everything(client_factory):
+    client, _ = client_factory(
+        [
+            [{"id": 1, "name": "Course"}],
+            [FILE_ROW, dict(FILE_ROW, id=9002, display_name="lecture-1.pdf")],
+        ]
+    )
+    files, _ = client.find_course_files()
+    assert {f["file_id"] for f in files} == {9001, 9002}
 
 
 def test_download_file_returns_bytes_and_metadata(client_factory):
@@ -464,6 +547,7 @@ def test_tool_schemas_are_well_formed():
         "find_due_dates",
         "find_course_files",
         "open_file",
+        "get_assignment_details",
     }
     for schema in app.TOOL_SCHEMAS:
         assert schema["type"] == "function"
@@ -528,6 +612,134 @@ def test_dispatch_find_course_files(client_factory):
     result = app.dispatch_tool(client, "find_course_files", {"query": "syllabus"})
     assert result["count"] == 1
     assert result["files"][0]["file_id"] == 9001
+    assert "hint" not in result
+
+
+def test_dispatch_find_course_files_explains_an_empty_result(client_factory):
+    client, _ = client_factory(
+        [[{"id": 1, "name": "Course"}], make_response({}, status=401), make_response({}, status=401)]
+    )
+    result = app.dispatch_tool(client, "find_course_files", {"query": "CGA"})
+    assert result["count"] == 0
+    assert result["notes"]
+    assert "get_assignment_details" in result["hint"]
+
+
+# --- assignment details ----------------------------------------------------
+
+ASSIGNMENT_ROW = {
+    "id": 3100,
+    "name": "Comparative Genre Analysis",
+    "due_at": "2026-10-09T03:59:00Z",
+    "unlock_at": "2026-09-20T04:00:00Z",
+    "lock_at": None,
+    "points_possible": 100,
+    "grading_type": "points",
+    "submission_types": ["online_upload", "online_text_entry"],
+    "allowed_extensions": ["pdf", "docx"],
+    "allowed_attempts": 2,
+    "html_url": f"{BASE_URL}/courses/1/assignments/3100",
+    "description": (
+        "<p>Write a <strong>comparative genre analysis</strong> of two texts.</p>"
+        "<ul><li>1200-1500 words</li><li>MLA format</li></ul>"
+        "<p>See the "
+        '<a href="/courses/1/files/4242/download?wrap=1">CGA prompt</a> for details.</p>'
+        "<script>ignore me</script>"
+    ),
+    "rubric": [{"description": "Analysis", "points": 60}, {"description": "Prose", "points": 40}],
+    "submission": {"submitted_at": None, "workflow_state": "unsubmitted", "missing": False},
+}
+
+
+def test_get_assignment_details_returns_prompt_and_submission_type(client_factory):
+    client, _ = client_factory([[{"id": 1, "name": "76-101"}], ASSIGNMENT_ROW])
+    details = client.get_assignment_details(3100, course_id=1)
+
+    assert details["title"] == "Comparative Genre Analysis"
+    assert details["submission_types"] == ["online_upload", "online_text_entry"]
+    assert details["allowed_extensions"] == ["pdf", "docx"]
+    assert details["allowed_attempts"] == 2
+    assert "comparative genre analysis" in details["instructions"]
+    assert "1200-1500 words" in details["instructions"]
+    assert "ignore me" not in details["instructions"]
+    assert "<p>" not in details["instructions"]
+    assert details["attached_files"] == [{"file_id": 4242, "filename": "CGA prompt"}]
+    assert details["submission_status"]["workflow_state"] == "unsubmitted"
+    assert [item["criterion"] for item in details["rubric"]] == ["Analysis", "Prose"]
+    assert details["due_at_local"]
+
+
+def test_get_assignment_details_scans_courses_when_course_id_is_missing(client_factory):
+    client, fake = client_factory(
+        [
+            [{"id": 1, "name": "Wrong course"}, {"id": 2, "name": "Right course"}],
+            make_response({}, status=404),
+            ASSIGNMENT_ROW,
+        ]
+    )
+    details = client.get_assignment_details(3100)
+    assert details["course_name"] == "Right course"
+    assert len(fake.requests) == 3
+
+
+def test_get_assignment_details_reports_a_missing_assignment(client_factory):
+    client, _ = client_factory([[{"id": 1, "name": "Course"}], make_response({}, status=404)])
+    with pytest.raises(app.CanvasError) as excinfo:
+        client.get_assignment_details(999)
+    assert "Could not find assignment" in str(excinfo.value)
+
+
+def test_dispatch_get_assignment_details(client_factory):
+    client, _ = client_factory([[{"id": 1, "name": "76-101"}], ASSIGNMENT_ROW])
+    result = app.dispatch_tool(client, "get_assignment_details", {"assignment_id": 3100, "course_id": 1})
+    assert result["assignment"]["submission_types"] == ["online_upload", "online_text_entry"]
+    json.dumps(result)
+
+
+def test_dispatch_get_assignment_details_requires_an_id(client_factory):
+    client, fake = client_factory([])
+    result = app.dispatch_tool(client, "get_assignment_details", {})
+    assert "assignment_id" in result["error"]
+    assert fake.requests == []
+
+
+def test_assignment_listings_now_include_submission_types(client_factory):
+    client, _ = client_factory(
+        [
+            [{"id": 1, "name": "Course"}],
+            [{"id": 11, "name": "Essay", "due_at": iso_in(2), "submission_types": ["online_upload"]}],
+        ]
+    )
+    upcoming = client.list_upcoming_assignments()
+    assert upcoming[0]["submission_types"] == ["online_upload"]
+
+
+def test_html_to_text_and_links():
+    text, links = app.html_to_text_and_links(
+        "<h2>Prompt</h2><p>Compare &amp; contrast.</p>"
+        '<p><a href="https://canvas.example.edu/courses/1/files/77">handout.pdf</a></p>'
+        '<p><a href="https://example.com/other">not a canvas file</a></p>'
+    )
+    assert "Prompt" in text and "Compare & contrast." in text
+    assert links == [(77, "handout.pdf")]
+
+
+def test_html_to_text_truncates_very_long_prompts():
+    text, _ = app.html_to_text_and_links("<p>" + "word " * 5000 + "</p>")
+    assert text.endswith("[truncated]")
+    assert len(text) <= app.MAX_DESCRIPTION_CHARS + 20
+
+
+def test_html_to_text_handles_empty_description():
+    assert app.html_to_text_and_links("") == ("", [])
+    assert app.html_to_text_and_links(None) == ("", [])
+
+
+def test_matches_all_words():
+    assert app.matches_all_words("CGA prompt final.pdf", "cga prompt")
+    assert app.matches_all_words("CGA prompt final.pdf", "PROMPT cga")
+    assert not app.matches_all_words("CGA prompt final.pdf", "cga rubric")
+    assert app.matches_all_words("anything", "")
 
 
 def test_dispatch_tool_converts_canvas_errors_to_messages(client_factory):
