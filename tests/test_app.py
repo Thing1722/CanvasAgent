@@ -1184,6 +1184,78 @@ def test_html_to_text_handles_empty_description():
     assert app.html_to_text_and_links(None) == ("", [], [])
 
 
+def test_html_to_text_drops_nav_and_footer():
+    text, *_ = app.html_to_text_and_links(
+        "<html><body>"
+        "<nav>Home | Courses | Login</nav>"
+        "<header>Site banner</header>"
+        "<article><h1>Late policy</h1><p>10% per day.</p></article>"
+        "<footer>Copyright 2026</footer>"
+        "<script>alert(1)</script>"
+        "</body></html>"
+    )
+    assert "10% per day." in text
+    assert "Late policy" in text
+    assert "Login" not in text
+    assert "Site banner" not in text
+    assert "Copyright" not in text
+    assert "alert" not in text
+
+
+def test_chunk_cleaned_text_splits_on_headings():
+    chunks = app.chunk_cleaned_text(
+        "# Late policy\n10% per day.\n# Exam scope\nChapters 1-4 only.\n",
+        default_section="Guide",
+    )
+    assert [c["section"] for c in chunks] == ["Late policy", "Exam scope"]
+    assert chunks[0]["text"] == "Late policy\n10% per day."
+    assert chunks[1]["text"] == "Exam scope\nChapters 1-4 only."
+
+
+def test_extract_source_document_html_keeps_original_chunks():
+    html = (
+        b"<html><body><nav>skip me</nav>"
+        b"<h1>Late policy</h1><p>10% per day after the deadline.</p>"
+        b"<h2>Office hours</h2><p>Friday 3pm GHC 5th floor.</p>"
+        b"<footer>nav repeat</footer></body></html>"
+    )
+    extracted = app.extract_source_document(
+        html, "text/html", title="syllabus.html", url="https://cs.example.edu/syllabus.html"
+    )
+    assert extracted is not None
+    source = extracted["source"]
+    assert source["url"] == "https://cs.example.edu/syllabus.html"
+    assert source["partial"] is False
+    assert "Late policy" in source["outline"]
+    late = next(c for c in source["chunks"] if c["section"] == "Late policy")
+    assert "10% per day after the deadline." in late["text"]
+    assert "Late policy" in late["text"]
+    assert "skip me" not in extracted["excerpt"]
+    assert "nav repeat" not in extracted["excerpt"]
+
+
+def test_extract_source_document_pdf_includes_page_numbers():
+    pytest.importorskip("pypdf")
+    extracted = app.extract_source_document(
+        make_pdf("Midterm is October 9"),
+        "application/pdf",
+        filename="midterm.pdf",
+        title="midterm.pdf",
+    )
+    assert extracted is not None
+    chunk = extracted["source"]["chunks"][0]
+    assert chunk["page"] == 1
+    assert "Midterm is October 9" in chunk["text"]
+
+
+def test_limit_source_chunks_sets_partial_when_clipped():
+    huge = [{"section": "A", "text": "x" * (app.MAX_EXTRACTED_CHARS + 100)}]
+    kept, clipped = app.limit_source_chunks(huge)
+    assert clipped is True
+    assert kept[0]["text"].startswith("x")
+    assert len(kept[0]["text"]) <= app.MAX_EXTRACTED_CHARS
+
+
 def test_matches_all_words():
     assert app.matches_all_words("CGA prompt final.pdf", "cga prompt")
     assert app.matches_all_words("CGA prompt final.pdf", "PROMPT cga")
@@ -1751,6 +1823,20 @@ def test_system_prompt_includes_retrieval_routing():
     assert prompt.count("You are a study assistant") == 1
 
 
+def test_system_prompt_includes_large_document_rules():
+    prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    assert "Large documents and websites" in prompt
+    assert "source.chunks" in prompt
+    assert "original chunks" in prompt
+    assert "Never summarize only an outline" in prompt
+    assert "source.partial" in prompt
+    assert "navigation" in prompt
+    assert "footers" in prompt
+    assert "page" in prompt
+    assert "read-only" in prompt
+    assert prompt.count("You are a study assistant") == 1
+
+
 # --- math / LaTeX conversion ------------------------------------------------
 
 
@@ -1890,6 +1976,10 @@ def test_open_url_html(client_factory, public_dns):
     assert result["resource"]["content_type"] == "text/html"
     assert "Week 1: stacks." in result["text_excerpt"]
     assert "<h1>" not in result["text_excerpt"]
+    assert result["source"]["chunks"]
+    assert any("Week 1: stacks." in (c.get("text") or "") for c in result["source"]["chunks"])
+    assert result["source"]["partial"] is False
+    assert "original cleaned text" in result["note"]
     assert "Authorization" not in fake.requests[0].headers
     assert TOKEN not in fake.requests[0].url
     json.dumps(result)
