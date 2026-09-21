@@ -327,10 +327,28 @@ def test_find_due_dates_matches_titles_and_hides_past(client_factory):
     assert "search_term=homework" in fake.requests[1].url
 
 
-def test_find_due_dates_rejects_short_queries(client_factory):
+def test_find_due_dates_matches_a_single_character_query(client_factory):
+    """The model often searches for '4' when asked about Homework 4."""
+    client, fake = client_factory(
+        [
+            [{"id": 1, "name": "Course A"}],
+            [
+                {"id": 31, "name": "Homework 4", "due_at": iso_in(3)},
+                {"id": 32, "name": "Homework 1", "due_at": iso_in(4)},
+            ],
+        ]
+    )
+    matches = client.find_due_dates("4")
+    assert [item["title"] for item in matches] == ["Homework 4"]
+    assert "search_term=" not in fake.requests[1].url
+
+
+def test_find_due_dates_rejects_empty_queries(client_factory):
     client, _ = client_factory([])
-    with pytest.raises(app.CanvasError):
-        client.find_due_dates("a")
+    with pytest.raises(app.CanvasError, match="required"):
+        client.find_due_dates("")
+    with pytest.raises(app.CanvasError, match="required"):
+        client.find_due_dates("   ")
 
 
 def test_describe_due_handles_missing_date():
@@ -755,6 +773,40 @@ def test_dispatch_tool_converts_canvas_errors_to_messages(client_factory):
     assert TOKEN not in result["error"]
 
 
+def test_dispatch_find_due_dates_empty_query_is_a_tool_error_not_a_crash(client_factory):
+    client, _ = client_factory([])
+    result = app.dispatch_tool(client, "find_due_dates", {"query": ""})
+    assert "error" in result
+    assert "required" in result["error"]
+
+
+def test_dispatch_find_due_dates_single_character_query(client_factory):
+    client, _ = client_factory(
+        [
+            [{"id": 1, "name": "Course A"}],
+            [{"id": 31, "name": "Homework 4", "due_at": iso_in(3)}],
+        ]
+    )
+    result = app.dispatch_tool(client, "find_due_dates", {"query": "4"})
+    assert result["count"] == 1
+    assert result["assignments"][0]["title"] == "Homework 4"
+
+
+def test_dispatch_tool_catches_stale_exception_classes():
+    """Cached CanvasClient from a previous Streamlit run raises a CanvasError
+    that is not isinstance of the CanvasError bound in this run."""
+
+    class StaleCanvasError(RuntimeError):
+        pass
+
+    class StaleClient:
+        def find_due_dates(self, **kwargs):
+            raise StaleCanvasError("Search text must be at least 2 characters long.")
+
+    result = app.dispatch_tool(StaleClient(), "find_due_dates", {"query": "4"})
+    assert result["error"] == "Search text must be at least 2 characters long."
+
+
 # --- conversation history --------------------------------------------------
 
 
@@ -874,6 +926,77 @@ def test_agent_turn_survives_malformed_tool_arguments(client_factory):
     )
     produced = app.run_agent_turn(deepseek, client, [{"role": "user", "content": "hi"}])
     assert json.loads(produced[1]["content"])["count"] == 1
+
+
+def test_agent_turn_does_not_crash_on_a_one_character_due_date_query(client_factory):
+    client, _ = client_factory(
+        [
+            [{"id": 1, "name": "Course A"}],
+            [{"id": 31, "name": "Homework 4", "due_at": iso_in(3)}],
+        ]
+    )
+    deepseek = ScriptedDeepSeek(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "find_due_dates",
+                            "arguments": '{"query": "4"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "Homework 4 is due in three days."},
+        ]
+    )
+    produced = app.run_agent_turn(
+        deepseek, client, [{"role": "user", "content": "when is 4 due?"}]
+    )
+    payload = json.loads(produced[1]["content"])
+    assert payload["count"] == 1
+    assert payload["assignments"][0]["title"] == "Homework 4"
+    assert produced[-1]["content"] == "Homework 4 is due in three days."
+
+
+def test_agent_turn_converts_stale_tool_exceptions_into_tool_results():
+    class StaleCanvasError(RuntimeError):
+        pass
+
+    class ExplodingClient:
+        def find_due_dates(self, **kwargs):
+            raise StaleCanvasError("Search text must be at least 2 characters long.")
+
+    deepseek = ScriptedDeepSeek(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "find_due_dates",
+                            "arguments": '{"query": ""}',
+                        },
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "I need a more specific assignment name."},
+        ]
+    )
+    produced = app.run_agent_turn(
+        deepseek, ExplodingClient(), [{"role": "user", "content": "what's due?"}]
+    )
+    assert [m["role"] for m in produced] == ["assistant", "tool", "assistant"]
+    payload = json.loads(produced[1]["content"])
+    assert "error" in payload
+    assert produced[-1]["content"] == "I need a more specific assignment name."
 
 
 def test_system_prompt_states_read_only_and_date():
