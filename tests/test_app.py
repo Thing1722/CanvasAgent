@@ -1322,6 +1322,16 @@ def test_agent_turn_executes_tool_calls_then_answers(client_factory):
     assert deepseek.calls[0]["tools"] == app.TOOL_SCHEMAS
 
 
+def test_tool_result_has_usable_evidence_distinguishes_empty_error_and_data():
+    assert not app.tool_result_has_usable_evidence('{"courses": [], "count": 0}')
+    assert not app.tool_result_has_usable_evidence('{"error": "Canvas returned HTTP 404"}')
+    assert app.tool_result_has_usable_evidence(
+        '{"courses": [{"name": "Course A"}], "count": 1}'
+    )
+    assert app.tool_result_has_usable_evidence({"assignment": {"title": "Homework 4"}})
+    assert app.tool_result_has_usable_evidence({"submission": {"submitted_at": None}})
+
+
 def test_agent_turn_system_prompt_follows_canvas_timezone(client_factory):
     client, _ = client_factory([[]])
     client.set_timezone("Asia/Shanghai")
@@ -1333,6 +1343,8 @@ def test_agent_turn_system_prompt_follows_canvas_timezone(client_factory):
 
 
 def test_agent_turn_stops_after_max_tool_rounds(client_factory):
+    # Empty course lists are not usable evidence, so the exhausted-loop
+    # fallback may honestly say it could not settle.
     client, _ = client_factory([[] for _ in range(10)])
     loop_reply = {
         "role": "assistant",
@@ -1344,7 +1356,29 @@ def test_agent_turn_stops_after_max_tool_rounds(client_factory):
     deepseek = ScriptedDeepSeek([dict(loop_reply) for _ in range(5)])
     produced = app.run_agent_turn(deepseek, client, [{"role": "user", "content": "loop"}], max_tool_rounds=2)
     assert len(deepseek.calls) == 2
+    assert produced[-1]["role"] == "assistant"
+    assert json.loads(produced[1]["content"])["count"] == 0
     assert "could not settle" in produced[-1]["content"]
+    assert produced[-1]["content"] == app.MAX_TOOL_ROUNDS_NO_EVIDENCE
+
+
+def test_agent_turn_max_rounds_does_not_claim_no_answer_when_tools_found_evidence(client_factory):
+    client, _ = client_factory([[{"id": 1, "name": "Course A"}] for _ in range(10)])
+    loop_reply = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "call_x", "type": "function", "function": {"name": "list_my_courses", "arguments": "{}"}}
+        ],
+    }
+    deepseek = ScriptedDeepSeek([dict(loop_reply) for _ in range(5)])
+    produced = app.run_agent_turn(deepseek, client, [{"role": "user", "content": "loop"}], max_tool_rounds=2)
+    assert len(deepseek.calls) == 2
+    assert json.loads(produced[1]["content"])["count"] == 1
+    assert produced[-1]["role"] == "assistant"
+    assert "could not settle" not in produced[-1]["content"]
+    assert produced[-1]["content"] == app.MAX_TOOL_ROUNDS_WITH_EVIDENCE
+    assert "Here's what I found" in produced[-1]["content"]
 
 
 def test_agent_turn_survives_malformed_tool_arguments(client_factory):
@@ -1439,6 +1473,9 @@ def test_agent_turn_converts_stale_tool_exceptions_into_tool_results():
 def test_system_prompt_states_read_only_and_date():
     prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
     assert "read-only" in prompt
+    assert "cannot submit" in prompt
+    assert "post messages" in prompt
+    assert "upload files, grade, or change" in prompt
     assert "September 21, 2026" in prompt
     assert "America/New_York" in prompt
     assert "the machine's local timezone" not in prompt
@@ -1446,6 +1483,19 @@ def test_system_prompt_states_read_only_and_date():
     assert "$...$" in prompt
     assert "get_my_submission" in prompt
     assert "what did I turn in" in prompt
+    assert prompt.count("You are a study assistant") == 1
+
+
+def test_system_prompt_asks_the_model_to_be_decisive():
+    prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    assert "Be decisive" in prompt
+    assert "stop searching" in prompt
+    assert "Never invent" in prompt
+    assert "Do not expose internal tool calls" in prompt
+    assert "could not settle on an answer" in prompt
+    assert "when relevant evidence is available" in prompt
+    assert "read-only" in prompt
+    assert "cannot submit" in prompt
 
 
 # --- math / LaTeX conversion ------------------------------------------------

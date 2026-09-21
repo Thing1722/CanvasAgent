@@ -2052,12 +2052,23 @@ SYSTEM_PROMPT = """You are a study assistant for a Carnegie Mellon student. You 
 track of their Canvas courses, assignments and deadlines, and you help them plan their study time.
 
 You have read-only access to Canvas through the provided tools. You can read course files and show \
-them to the student, but you cannot submit work, post messages, upload files or change anything in \
-Canvas; if the student asks for that, say so plainly and suggest they do it themselves in Canvas.
+them to the student, but you cannot submit work, post messages, upload files, grade, or change \
+anything in Canvas; if the student asks for that, say so plainly and suggest they do it themselves \
+in Canvas.
+
+Be decisive and useful. Answer directly when the available evidence is sufficient. Prefer concise \
+answers that mention the relevant source or file when appropriate. Do not expose internal tool \
+calls, search attempts, JSON, or reasoning.
 
 Guidelines:
-- Call a tool whenever the answer depends on the student's actual Canvas data. Never invent course \
-  names, assignment titles or due dates.
+- Call a tool whenever the answer depends on the student's actual Canvas data. Never invent facts, \
+  dates, course details, assignment titles, due dates, or document contents.
+- Once a relevant source has been found, stop searching and use it. Do not search again for \
+  confirmation unless new information is genuinely needed.
+- Do not say you could not settle on an answer when relevant evidence is available. If the \
+  evidence is incomplete, give the best-supported answer and briefly state what is uncertain. \
+  Only say information is unavailable when the relevant tools failed or nothing supporting was \
+  found.
 - To show a file, call find_course_files to locate it, then open_file with its file_id. The file \
   itself is rendered in the chat, so introduce it in one short sentence instead of describing every \
   page. If open_file returns a text excerpt you may use it to answer questions about the contents, \
@@ -2086,6 +2097,55 @@ Guidelines:
 - If a tool returns an error, explain it briefly and suggest a next step."""
 
 MAX_TOOL_ROUNDS = 4
+
+MAX_TOOL_ROUNDS_NO_EVIDENCE = (
+    "I looked things up several times but could not settle on an answer. "
+    "Try asking a narrower question, for example about a single course."
+)
+MAX_TOOL_ROUNDS_WITH_EVIDENCE = (
+    "Here's what I found. Ask if you want more detail, for example about a single course."
+)
+
+_USABLE_COLLECTION_KEYS = ("courses", "assignments", "files")
+_USABLE_OBJECT_KEYS = (
+    "assignment",
+    "submission",
+    "file",
+    "text_excerpt",
+    "url",
+    "resource",
+)
+
+
+def tool_result_has_usable_evidence(content: str | dict[str, Any] | None) -> bool:
+    """True when a tool result contains data a student answer can rest on."""
+    if content is None:
+        return False
+    payload: Any = content
+    if isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            return bool(content.strip())
+    if not isinstance(payload, dict):
+        return bool(payload)
+    if payload.get("error"):
+        return False
+    count = payload.get("count")
+    if isinstance(count, int) and count > 0:
+        return True
+    for key in _USABLE_COLLECTION_KEYS:
+        value = payload.get(key)
+        if isinstance(value, list) and value:
+            return True
+    return any(payload.get(key) for key in _USABLE_OBJECT_KEYS)
+
+
+def _produced_has_usable_tool_evidence(produced: list[dict[str, Any]]) -> bool:
+    return any(
+        message.get("role") == "tool" and tool_result_has_usable_evidence(message.get("content"))
+        for message in produced
+    )
 
 
 def build_system_prompt(now: datetime | None = None, tz: str | ZoneInfo | None = None) -> str:
@@ -2161,8 +2221,9 @@ def run_agent_turn(
         {
             "role": "assistant",
             "content": (
-                "I looked things up several times but could not settle on an answer. "
-                "Try asking a narrower question, for example about a single course."
+                MAX_TOOL_ROUNDS_WITH_EVIDENCE
+                if _produced_has_usable_tool_evidence(produced)
+                else MAX_TOOL_ROUNDS_NO_EVIDENCE
             ),
         }
     )
