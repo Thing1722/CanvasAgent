@@ -47,7 +47,7 @@ def test_ordinary_message_that_mentions_a_command_later_is_unchanged():
 
 
 @pytest.mark.parametrize(
-    "message, skill, request",
+    "message, skill, remainder",
     [
         ("/schedule schedule the next week", "scheduling", "schedule the next week"),
         ("/schedule help me finish everything at a healthy pace", "scheduling", "help me finish everything at a healthy pace"),
@@ -56,8 +56,8 @@ def test_ordinary_message_that_mentions_a_command_later_is_unchanged():
         ("/deadlines what's due in the next 3 days", "deadlines", "what's due in the next 3 days"),
     ],
 )
-def test_known_commands_strip_prefix_and_select_skill(message, skill, request):
-    assert app.parse_user_message(message) == (skill, request)
+def test_known_commands_strip_prefix_and_select_skill(message, skill, remainder):
+    assert app.parse_user_message(message) == (skill, remainder)
 
 
 def test_command_matching_is_case_insensitive():
