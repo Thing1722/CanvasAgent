@@ -565,6 +565,15 @@
           try {
             win.addEventListener("resize", onPlace);
             if (win.visualViewport) win.visualViewport.addEventListener("resize", onPlace);
+            win.setInterval(onPlace, 400);
+            var doc = parentDoc();
+            if (doc && win.MutationObserver) {
+              var obs = new win.MutationObserver(onPlace);
+              obs.observe(doc.documentElement, {
+                attributes: true,
+                attributeFilter: ["style"],
+              });
+            }
           } catch (err) {}
         }
 

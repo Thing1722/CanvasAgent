@@ -303,6 +303,7 @@ def test_frontend_owns_a_real_textarea_and_parity_keys():
     assert "function restoreDraft" in html
     assert "function clearDraft" in html
     assert "__canvasCommandPickerDraft" in html
+    assert "setInterval(onPlace" in html
     assert "filterCommands" in html
     assert "ArrowDown" in html
     assert "ArrowUp" in html
