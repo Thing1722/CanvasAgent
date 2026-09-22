@@ -22,6 +22,8 @@
         font-family: Source Sans, Source Sans 3, sans-serif;
       }
       #canvas-command-picker-host * { box-sizing: border-box; }
+      #canvas-command-picker-host[data-busy="true"] .command-picker-row { opacity: 0.72; }
+      #canvas-command-picker-host[data-busy="true"] .command-picker-send { cursor: wait; }
       #canvas-command-picker-menu {
         width: 100%;
         min-width: 0;
@@ -73,7 +75,7 @@
       }
       .command-picker-row {
         display: flex;
-        align-items: center;
+        align-items: flex-end;
         gap: 0.35rem;
         width: 100%;
         min-height: 3.15rem;
@@ -92,7 +94,7 @@
         justify-content: center;
         width: 2.15rem;
         height: 2.15rem;
-        margin: 0;
+        margin: 0 0 0.1rem;
         padding: 0;
         border: 0;
         border-radius: 999px;
@@ -109,7 +111,7 @@
       }
       .command-picker-icon svg,
       .command-picker-send svg { width: 18px; height: 18px; display: block; }
-      .command-picker-input {
+      textarea.command-picker-input {
         flex: 1 1 auto;
         min-width: 0;
         border: 0;
@@ -119,7 +121,12 @@
         font-size: 1rem;
         line-height: 1.4;
         outline: none;
-        padding: 0.35rem 0.2rem;
+        padding: 0.45rem 0.2rem 0.35rem;
+        resize: none;
+        overflow-y: auto;
+        min-height: 1.4em;
+        max-height: 12.6em;
+        field-sizing: content;
       }
       .command-picker-input::placeholder { opacity: 0.55; }
     </style>
@@ -129,14 +136,14 @@
       <div id="canvas-command-picker-menu" role="listbox" aria-label="Commands" hidden></div>
       <div class="command-picker-row">
         <button type="button" class="command-picker-icon" aria-label="Commands" title="Commands" aria-haspopup="listbox" aria-expanded="false" aria-controls="canvas-command-picker-menu"></button>
-        <input
+        <textarea
           class="command-picker-input"
-          type="text"
+          rows="1"
           autocomplete="off"
           spellcheck="false"
           data-testid="command-picker-input"
           aria-label="Chat message"
-        />
+        ></textarea>
         <button type="button" class="command-picker-send" aria-label="Send" title="Send"></button>
       </div>
     </div>
@@ -152,8 +159,11 @@
         var highlight = -1;
         var placeHooked = false;
         var built = false;
-        var BAR_HEIGHT = 78;
+        var localBusy = false;
+        var LINE = 22;
+        var MAX_LINES = 9;
         var MENU_MAX = 360;
+        var PAD = 28;
 
         var host = document.getElementById("canvas-command-picker-host");
         var menu = document.getElementById("canvas-command-picker-menu");
@@ -250,6 +260,19 @@
           return !!(menu && !menu.hidden);
         }
 
+        function autosize() {
+          input.style.height = "auto";
+          var next = Math.min(LINE * MAX_LINES, Math.max(LINE, input.scrollHeight));
+          input.style.height = next + "px";
+          return next;
+        }
+
+        function barHeight() {
+          var row = host.querySelector(".command-picker-row");
+          var h = row ? row.getBoundingClientRect().height : 50;
+          return Math.round(h + PAD);
+        }
+
         function pinIframe(height) {
           var iframe = window.frameElement;
           var doc = parentDoc();
@@ -289,6 +312,34 @@
           setFrameHeight(height);
         }
 
+        function layout() {
+          autosize();
+          var extra = 0;
+          if (menuOpen()) {
+            extra = Math.min(MENU_MAX, menu.scrollHeight + 12);
+          }
+          pinIframe(barHeight() + extra);
+        }
+
+        function setBusy(on) {
+          localBusy = !!on;
+          host.setAttribute("data-busy", localBusy ? "true" : "false");
+          host.setAttribute("aria-busy", localBusy ? "true" : "false");
+          sendBtn.disabled = localBusy;
+          sendBtn.setAttribute("title", localBusy ? "Checking Canvas…" : "Send");
+          input.removeAttribute("disabled");
+        }
+
+        function focusComposer() {
+          try {
+            input.focus({ preventScroll: true });
+          } catch (err) {
+            try {
+              input.focus();
+            } catch (focusErr) {}
+          }
+        }
+
         function filterCommands(query) {
           var text = (query || "").replace(/^\s+/, "");
           if (!text.startsWith("/")) return [];
@@ -310,7 +361,18 @@
           iconOpen = false;
           highlight = -1;
           renderMenu();
-          input.focus();
+          focusComposer();
+          input.selectionStart = input.selectionEnd = input.value.length;
+        }
+
+        function insertNewline() {
+          var start = input.selectionStart;
+          var end = input.selectionEnd;
+          var value = input.value;
+          input.value = value.slice(0, start) + "\n" + value.slice(end);
+          input.selectionStart = input.selectionEnd = start + 1;
+          renderMenu();
+          focusComposer();
         }
 
         function submit() {
@@ -319,8 +381,10 @@
           iconOpen = false;
           highlight = -1;
           renderMenu();
+          setBusy(true);
           setComponentValue({ submit: text, seq: Date.now() });
           input.value = "";
+          autosize();
         }
 
         function renderMenu() {
@@ -329,9 +393,10 @@
           if (!rows.length) {
             menu.hidden = true;
             iconBtn.setAttribute("aria-expanded", "false");
-            pinIframe(BAR_HEIGHT);
+            layout();
             return;
           }
+          if (highlight < 0) highlight = 0;
           if (highlight >= rows.length) highlight = rows.length - 1;
           rows.forEach(function (cmd, index) {
             var item = document.createElement("button");
@@ -356,7 +421,7 @@
           });
           menu.hidden = false;
           iconBtn.setAttribute("aria-expanded", "true");
-          pinIframe(BAR_HEIGHT + Math.min(MENU_MAX, 16 + rows.length * 56));
+          layout();
         }
 
         function moveHighlight(delta) {
@@ -395,18 +460,23 @@
             iconOpen = !iconOpen;
             highlight = iconOpen ? 0 : -1;
             renderMenu();
-            input.focus();
+            focusComposer();
           });
           sendBtn.addEventListener("click", function (event) {
             event.preventDefault();
-            submit();
+            if (!localBusy) submit();
           });
           input.addEventListener("input", function () {
-            if (!iconOpen) highlight = -1;
-            if (!input.value.startsWith("/") && !iconOpen) {
+            if (!iconOpen) highlight = filterCommands(input.value).length ? 0 : -1;
+            if (!/^\s*\//.test(input.value) && !iconOpen) {
               iconOpen = false;
             }
             renderMenu();
+          });
+          input.addEventListener("paste", function () {
+            setTimeout(function () {
+              renderMenu();
+            }, 0);
           });
           input.addEventListener("keydown", function (event) {
             var rows = visibleCommands();
@@ -430,13 +500,19 @@
               }
               return;
             }
+            if (event.key === "Enter" && event.shiftKey) {
+              event.preventDefault();
+              insertNewline();
+              return;
+            }
             if (event.key === "Enter") {
               event.preventDefault();
-              if (open && highlight >= 0 && rows[highlight]) {
-                insert(rows[highlight].token);
+              if (open) {
+                var index = highlight >= 0 ? highlight : 0;
+                if (rows[index]) insert(rows[index].token);
                 return;
               }
-              submit();
+              if (!localBusy) submit();
             }
           });
         }
@@ -446,12 +522,18 @@
           placeHooked = true;
           var win = parentWin();
           var onPlace = function () {
-            pinIframe(menuOpen() ? host.getBoundingClientRect().height || BAR_HEIGHT : BAR_HEIGHT);
+            layout();
           };
           try {
             win.addEventListener("resize", onPlace);
             if (win.visualViewport) win.visualViewport.addEventListener("resize", onPlace);
           } catch (err) {}
+        }
+
+        function afterStreamlitPaint(busy) {
+          setBusy(!!busy);
+          if (!busy) focusComposer();
+          layout();
         }
 
         function render(args, theme) {
@@ -463,6 +545,7 @@
           input.setAttribute("placeholder", livePlaceholder);
           bindOnce();
           hookPlacement();
+          afterStreamlitPaint(!!args.busy);
           renderMenu();
         }
 
@@ -472,7 +555,7 @@
           var args = data.args || {};
           var key = JSON.stringify(args);
           if (key === lastArgsKey && lastTheme === data.theme) {
-            pinIframe(menuOpen() ? BAR_HEIGHT + MENU_MAX : BAR_HEIGHT);
+            afterStreamlitPaint(!!args.busy);
             return;
           }
           lastArgsKey = key;
@@ -481,7 +564,7 @@
         });
 
         send("streamlit:componentReady", { apiVersion: API });
-        setFrameHeight(BAR_HEIGHT);
+        setFrameHeight(78);
       })();
     </script>
   </body>

@@ -139,7 +139,39 @@ def test_enter_inserts_highlight_or_submits():
     }
     assert app.picker_enter_action("", -1) == {"kind": "noop"}
     assert app.picker_enter_action("/", 0)["kind"] == "insert"
-    assert app.picker_enter_action("/", -1) == {"kind": "submit", "text": "/"}
+    assert app.picker_enter_action("/", -1) == {"kind": "insert", "text": "/schedule "}
+
+
+def test_enter_in_open_menu_does_not_submit():
+    action = app.picker_key_action("Enter", "/sch", -1)
+    assert action == {"kind": "insert", "text": "/schedule "}
+    assert action["kind"] != "submit"
+
+
+def test_shift_enter_inserts_newline():
+    assert app.picker_key_action("Enter", "/schedule plan", -1, shift=True) == {
+        "kind": "newline",
+        "text": "/schedule plan\n",
+    }
+    assert app.picker_enter_action("line one", shift=True) == {
+        "kind": "newline",
+        "text": "line one\n",
+    }
+
+
+def test_escape_closes_menu_keeps_text():
+    assert app.picker_key_action("Escape", "/sch plan") == {
+        "kind": "close_menu",
+        "text": "/sch plan",
+    }
+    assert app.picker_key_action("Escape", "What's due?")["text"] == "What's due?"
+
+
+def test_mid_sentence_slash_does_not_open_menu():
+    assert app.filter_commands("see /files tomorrow") == ()
+    assert app.filter_commands("hello /sch") == ()
+    assert app.filter_commands("please /schedule my week") == ()
+    assert app.filter_commands("line one\n/schedule") == ()
 
 
 def test_apply_submit_is_idempotent_per_seq(monkeypatch):
@@ -223,7 +255,7 @@ def test_ordinary_submit_without_slash():
 def test_app_uses_custom_composer_not_st_chat_input(monkeypatch, tmp_path):
     seen: list[list[dict[str, str]]] = []
 
-    def fake_mount(*, commands, placeholder=None, key=command_picker.COMPONENT_KEY):
+    def fake_mount(*, commands, placeholder=None, busy=False, key=command_picker.COMPONENT_KEY):
         seen.append(list(commands))
         return None
 
@@ -239,7 +271,7 @@ def test_app_uses_custom_composer_not_st_chat_input(monkeypatch, tmp_path):
 
 
 def test_app_component_submit_is_not_an_insert(monkeypatch, tmp_path):
-    def fake_mount(*, commands, placeholder=None, key=command_picker.COMPONENT_KEY):
+    def fake_mount(*, commands, placeholder=None, busy=False, key=command_picker.COMPONENT_KEY):
         return {"insert": "schedule", "seq": 99}
 
     monkeypatch.setattr(command_picker, "mount", fake_mount)
@@ -250,21 +282,25 @@ def test_app_component_submit_is_not_an_insert(monkeypatch, tmp_path):
     assert store.get_messages(conversation_id) == []
 
 
-def test_frontend_owns_a_real_input_and_live_filter():
+def test_frontend_owns_a_real_textarea_and_parity_keys():
     html = (command_picker.FRONTEND_DIR / "index.html").read_text()
     assert command_picker.FRONTEND_DIR.is_dir()
-    assert '<input' in html
+    assert "<textarea" in html
+    assert "<input" not in html or 'type="text"' not in html
     assert 'class="command-picker-input"' in html
+    assert "function autosize" in html
+    assert "insertNewline" in html
+    assert "shiftKey" in html
+    assert "focusComposer" in html
+    assert "setBusy" in html
+    assert "aria-busy" in html
+    assert "input.removeAttribute(\"disabled\")" in html
     assert "filterCommands" in html
-    assert "startsWith(\"/\")" in html or "startsWith('/')" in html
-    assert "setComponentValue({ submit:" in html.replace(" ", "") or 'submit: text' in html
-    assert "insert(token)" in html or "function insert" in html
     assert "ArrowDown" in html
     assert "ArrowUp" in html
     assert "Escape" in html
     assert "Enter" in html
     assert "command-picker-icon" in html
-    assert "aria-label" in html and "Commands" in html
     assert "scheduling.md" not in html
     assert "files.md" not in html
     assert "st.chat_input" not in html

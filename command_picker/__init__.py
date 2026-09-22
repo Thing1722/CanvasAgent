@@ -1,9 +1,9 @@
 """Custom chat composer with live slash-command filtering.
 
-A ``declare_component`` iframe holds a real ``<input>``. Typing ``/`` filters
-the shared command list in-place. Picking a row writes ``/token `` into the
-input and does not call ``setComponentValue``. Enter without a highlighted
-row submits ``{submit, seq}`` to Streamlit.
+A ``declare_component`` iframe holds a real auto-resizing ``<textarea>``.
+Typing a leading ``/`` filters the shared command list in-place. Picking a
+row writes ``/token `` and does not submit. Enter sends ``{submit, seq}``;
+Shift+Enter inserts a newline.
 """
 
 from __future__ import annotations
@@ -39,12 +39,14 @@ def mount(
     *,
     commands: list[dict[str, Any]],
     placeholder: str = DEFAULT_PLACEHOLDER,
+    busy: bool = False,
     key: str = COMPONENT_KEY,
 ) -> Any:
     """Render the composer. Returns ``{submit, seq}`` only when the user sends."""
     return _component(
         commands=commands_payload(commands),
         placeholder=placeholder or DEFAULT_PLACEHOLDER,
+        busy=bool(busy),
         host_id=HOST_ID,
         menu_id=MENU_ID,
         style_id=STYLE_ID,

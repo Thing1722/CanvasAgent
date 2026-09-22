@@ -169,8 +169,8 @@ Each new terminal session needs the virtual environment activated again before
 
 Type `/` at the start of a message to filter commands as you type (`/sch` → `/schedule`). The
 sparkle inside the chat box opens the full list without waiting for `/`. Picking a command inserts
-`/command ` and leaves the cursor there so you can add ordinary English. Enter sends. A command by
-itself is fine; the assistant will assume a sensible default.
+`/command ` and leaves the cursor there so you can add ordinary English. Enter sends; Shift+Enter
+adds a newline. A command by itself is fine; the assistant will assume a sensible default.
 
 | Command | What it focuses on |
 | --- | --- |
