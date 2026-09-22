@@ -1,10 +1,9 @@
-"""Command picker icon + menu as a Streamlit custom component.
+"""Custom chat composer with live slash-command filtering.
 
-The visible sparkle sits beside the pinned chat input. A ``declare_component``
-iframe with a stable key stays mounted across Streamlit 1.64 reruns and paints
-one ``#canvas-command-picker-host`` on ``document.body``. Picking a command
-returns ``{insert, seq}`` through ``setComponentValue``; Python prefills
-``st.chat_input`` via session state and does not submit.
+A ``declare_component`` iframe holds a real ``<input>``. Typing ``/`` filters
+the shared command list in-place. Picking a row writes ``/token `` into the
+input and does not call ``setComponentValue``. Enter without a highlighted
+row submits ``{submit, seq}`` to Streamlit.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ HOST_ID = "canvas-command-picker-host"
 MENU_ID = "canvas-command-picker-menu"
 STYLE_ID = "canvas-command-picker-style"
 COMPONENT_KEY = "command-picker"
+DEFAULT_PLACEHOLDER = "What's due this week?"
 
 _component = components.declare_component("command_picker", path=str(FRONTEND_DIR))
 
@@ -35,10 +35,16 @@ def commands_payload(commands: list[dict[str, Any]]) -> list[dict[str, str]]:
     return rows
 
 
-def mount(*, commands: list[dict[str, Any]], key: str = COMPONENT_KEY) -> Any:
-    """Render the picker and return ``{insert, seq}`` when a command is chosen."""
+def mount(
+    *,
+    commands: list[dict[str, Any]],
+    placeholder: str = DEFAULT_PLACEHOLDER,
+    key: str = COMPONENT_KEY,
+) -> Any:
+    """Render the composer. Returns ``{submit, seq}`` only when the user sends."""
     return _component(
         commands=commands_payload(commands),
+        placeholder=placeholder or DEFAULT_PLACEHOLDER,
         host_id=HOST_ID,
         menu_id=MENU_ID,
         style_id=STYLE_ID,

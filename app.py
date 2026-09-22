@@ -2371,7 +2371,7 @@ SLASH_COMMAND_DEFAULTS: dict[str, str] = {
     command.skill: command.default_request for command in COMMANDS
 }
 
-CHAT_INPUT_KEY = "main-chat-input"
+CHAT_COMPOSER_PLACEHOLDER = "What's due this week?"
 
 REQUIRED_SKILL_FILES: dict[str, str] = {
     "base_behavior": "base_behavior.md",
@@ -2457,50 +2457,65 @@ def filter_commands(query: str | None) -> tuple[CommandDef, ...]:
     """Filter listed commands for a typed slash prefix.
 
     Ordinary text that does not begin with ``/`` returns no suggestions.
-    ``/`` alone returns every command. Matching is on the token prefix only.
+    ``/`` alone returns every command. A space after the token hides the menu
+    so ``/schedule plan next week`` is just a draft. Matching is prefix-only.
     """
     text = "" if query is None else str(query).lstrip()
     if not text.startswith("/"):
         return ()
-    first = text.split(None, 1)[0]
-    typed = first[1:].lower()
+    if any(character.isspace() for character in text):
+        return ()
+    typed = text[1:].lower()
     if not typed:
         return COMMANDS
     return tuple(command for command in COMMANDS if command.token.startswith(typed))
 
 
-def insert_command_into_chat(token: str) -> str:
-    """Prefill the chat input with ``/token `` without submitting the message.
+def commands_matching(query: str | None, *, icon_open: bool = False) -> tuple[CommandDef, ...]:
+    """Rows the composer menu should show. The icon lists every command."""
+    if icon_open:
+        return COMMANDS
+    return filter_commands(query)
 
-    Streamlit 1.64 treats a string written to ``st.session_state[chat_input_key]``
-    as a one-shot field value: the box shows it, ``st.chat_input`` returns
-    None, and the user can keep typing.
-    """
-    text = command_insert_text(token)
-    st.session_state[CHAT_INPUT_KEY] = text
-    return text
+
+def picker_enter_action(
+    text: str,
+    highlight: int = -1,
+    *,
+    icon_open: bool = False,
+) -> dict[str, str]:
+    """Enter: insert a highlighted suggestion, or submit the draft."""
+    rows = commands_matching(text, icon_open=icon_open)
+    if 0 <= highlight < len(rows):
+        return {"kind": "insert", "text": command_insert_text(rows[highlight].token)}
+    if (text or "").strip():
+        return {"kind": "submit", "text": text}
+    return {"kind": "noop"}
 
 
 def apply_command_picker_value(value: Any) -> str | None:
-    """Apply a picker iframe event. Same token is ignored until ``seq`` changes."""
+    """Return submitted composer text. Inserts never reach Python."""
     if not isinstance(value, dict):
         return None
-    token = known_command_token(value.get("insert") if isinstance(value.get("insert"), str) else None)
-    if token is None:
+    text = value.get("submit")
+    if not isinstance(text, str) or not text.strip():
         return None
     seq = value.get("seq")
-    if seq is not None and st.session_state.get("command_picker_applied_seq") == seq:
+    if seq is not None and st.session_state.get("command_picker_submit_seq") == seq:
         return None
     if seq is not None:
-        st.session_state.command_picker_applied_seq = seq
-    return insert_command_into_chat(token)
+        st.session_state.command_picker_submit_seq = seq
+    return text
 
 
-def render_command_picker() -> None:
-    """Mount the sparkle icon beside the pinned chat input (custom component)."""
-    apply_command_picker_value(st.session_state.get(command_picker.COMPONENT_KEY))
-    value = command_picker.mount(commands=commands_for_picker())
-    apply_command_picker_value(value)
+def render_command_picker() -> str | None:
+    """Mount the custom composer (real input + live ``/`` filter). Returns a submit."""
+    pending = apply_command_picker_value(st.session_state.get(command_picker.COMPONENT_KEY))
+    value = command_picker.mount(
+        commands=commands_for_picker(),
+        placeholder=CHAT_COMPOSER_PLACEHOLDER,
+    )
+    return pending or apply_command_picker_value(value)
 
 
 def resolve_skills_dir(directory: Path | str | None = None) -> Path:
@@ -4020,8 +4035,7 @@ def main() -> None:
     # duplicated the host on rerun.
     render_file_panel(store, conversation_id, canvas)
     render_conversation(history, canvas)
-    render_command_picker()
-    handle_prompt(st.chat_input("What's due this week?", key=CHAT_INPUT_KEY))
+    handle_prompt(render_command_picker())
 
 
 if __name__ == "__main__":

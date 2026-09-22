@@ -45,7 +45,7 @@ def test_app_starts_and_shows_chat_input(monkeypatch, tmp_path):
     harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
     assert not harness.exception
     assert harness.title[0].value == "CMU Canvas Study Assistant"
-    assert len(harness.chat_input) == 1
+    assert not harness.chat_input
     assert not harness.error
 
 
@@ -674,7 +674,7 @@ def test_sidebar_timezone_select_persists_across_reruns(monkeypatch, tmp_path):
 def test_file_panel_empty_state_on_new_chat(monkeypatch, tmp_path):
     harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
     assert not harness.exception, harness.exception
-    assert len(harness.chat_input) == 1
+    assert not harness.chat_input
     assert list(harness.session_state.get("opened_files") or []) == []
     assert not any("files-sidebar-choice" in (box.key or "") for box in harness.selectbox)
 

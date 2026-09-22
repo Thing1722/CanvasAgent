@@ -1,4 +1,4 @@
-"""Command picker: shared defs, insert-without-submit, filtering, /files routing."""
+"""Custom composer: live ``/`` filter, insert-without-submit, submit via component."""
 
 from __future__ import annotations
 
@@ -23,30 +23,27 @@ DUMMY_ENV = {
     "CANVAS_BASE_URL": "https://canvas.example.edu",
 }
 
-PICKER_SCRIPT = """
+COMPOSER_SCRIPT = """
 import streamlit as st
 import app
 
-if "command_picker_open" not in st.session_state:
-    st.session_state.command_picker_open = False
+pending = st.session_state.pop("pending_insert", None)
+if pending is not None:
+    st.session_state["draft-box"] = pending
 
-if st.button("Commands", key="command-picker-toggle", help="Commands"):
-    st.session_state.command_picker_open = not st.session_state.command_picker_open
+draft = st.text_input("composer", key="draft-box") or ""
 
-if st.session_state.command_picker_open:
-    for command in app.COMMANDS:
-        if st.button(
-            f"/{command.token}",
-            key=f"command-pick-{command.token}",
-            help=command.description,
-        ):
-            app.insert_command_into_chat(command.token)
-            st.session_state.command_picker_open = False
+for command in app.filter_commands(draft):
+    if st.button(f"/{command.token}", key=f"command-pick-{command.token}"):
+        st.session_state["pending_insert"] = app.command_insert_text(command.token)
 
-prompt = st.chat_input("What's due this week?", key=app.CHAT_INPUT_KEY)
-if prompt:
-    st.session_state["submitted_prompt"] = prompt
-    st.write("SUBMITTED:" + prompt)
+if st.button("Send", key="composer-send"):
+    action = app.picker_enter_action(st.session_state.get("draft-box") or "", -1)
+    if action["kind"] == "submit":
+        sent = app.apply_command_picker_value({"submit": action["text"], "seq": 1})
+        if sent:
+            st.session_state["submitted_prompt"] = sent
+            st.write("SUBMITTED:" + sent)
 """
 
 
@@ -103,30 +100,49 @@ def test_picker_payload_hides_skills_and_filenames():
     assert command_picker.commands_payload(rows) == rows
 
 
-def test_filter_commands_hides_menu_for_ordinary_text():
-    assert app.filter_commands("What's due this week?") == ()
-    assert app.filter_commands("please /schedule my week") == ()
-    assert app.filter_commands("") == ()
-    assert app.filter_commands(None) == ()
-    assert app.filter_commands("/") == app.COMMANDS
-    tokens = [command.token for command in app.filter_commands("/sch")]
-    assert tokens == ["schedule"]
+def test_live_filter_slash_sch_and_sum():
+    assert [command.token for command in app.filter_commands("/")] == [
+        command.token for command in app.COMMANDS
+    ]
+    assert [command.token for command in app.filter_commands("/sch")] == ["schedule"]
+    assert [command.token for command in app.filter_commands("/sum")] == ["summarize"]
     assert [command.token for command in app.filter_commands("/s")] == [
         "schedule",
         "summarize",
     ]
 
 
-def test_insert_command_text_and_unknown_token():
-    assert app.command_insert_text("schedule") == "/schedule "
-    assert app.command_insert_text("/EXAM") == "/exam "
-    with pytest.raises(ValueError):
-        app.command_insert_text("nope")
-    assert app.known_command_token("files") == "files"
-    assert app.known_command_token("/foo") is None
+def test_filter_commands_hides_menu_for_ordinary_text():
+    assert app.filter_commands("What's due this week?") == ()
+    assert app.filter_commands("please /schedule my week") == ()
+    assert app.filter_commands("/schedule plan next week") == ()
+    assert app.filter_commands("/schedule ") == ()
+    assert app.filter_commands("") == ()
+    assert app.filter_commands(None) == ()
 
 
-def test_apply_command_picker_value_prefills_without_duplicate(monkeypatch):
+def test_icon_open_lists_every_command():
+    assert app.commands_matching("What's due this week?", icon_open=True) == app.COMMANDS
+    assert app.commands_matching("/", icon_open=False) == app.COMMANDS
+
+
+def test_enter_inserts_highlight_or_submits():
+    assert app.picker_enter_action("/sch", 0) == {"kind": "insert", "text": "/schedule "}
+    assert app.picker_enter_action("/sum", 0) == {"kind": "insert", "text": "/summarize "}
+    assert app.picker_enter_action("/schedule plan next week", -1) == {
+        "kind": "submit",
+        "text": "/schedule plan next week",
+    }
+    assert app.picker_enter_action("What's due this week?", -1) == {
+        "kind": "submit",
+        "text": "What's due this week?",
+    }
+    assert app.picker_enter_action("", -1) == {"kind": "noop"}
+    assert app.picker_enter_action("/", 0)["kind"] == "insert"
+    assert app.picker_enter_action("/", -1) == {"kind": "submit", "text": "/"}
+
+
+def test_apply_submit_is_idempotent_per_seq(monkeypatch):
     class State(dict):
         def __getattr__(self, name):
             try:
@@ -139,71 +155,82 @@ def test_apply_command_picker_value_prefills_without_duplicate(monkeypatch):
 
     state = State()
     monkeypatch.setattr(app.st, "session_state", state, raising=False)
-    assert app.apply_command_picker_value({"insert": "schedule", "seq": 1}) == "/schedule "
-    assert state[app.CHAT_INPUT_KEY] == "/schedule "
-    assert app.apply_command_picker_value({"insert": "schedule", "seq": 1}) is None
-    assert app.apply_command_picker_value({"insert": "files", "seq": 2}) == "/files "
-    assert state[app.CHAT_INPUT_KEY] == "/files "
+    assert app.apply_command_picker_value({"submit": "What's due?", "seq": 1}) == "What's due?"
+    assert app.apply_command_picker_value({"submit": "What's due?", "seq": 1}) is None
+    assert app.apply_command_picker_value({"submit": "again", "seq": 2}) == "again"
+    assert app.apply_command_picker_value({"insert": "schedule", "seq": 3}) is None
     assert app.apply_command_picker_value("nope") is None
-    assert app.apply_command_picker_value({"insert": "unknown", "seq": 3}) is None
+    assert app.apply_command_picker_value({"submit": "   ", "seq": 4}) is None
 
 
-def test_opening_picker_lists_commands():
-    harness = AppTest.from_string(PICKER_SCRIPT, default_timeout=30).run()
+def test_typing_slash_lists_commands_in_harness():
+    harness = AppTest.from_string(COMPOSER_SCRIPT, default_timeout=30).run()
     assert not harness.exception
-    assert len(harness.chat_input) == 1
-    labels_before = [button.label for button in harness.button]
-    assert "Commands" in labels_before
-    assert "/schedule" not in labels_before
-    harness.button(key="command-picker-toggle").click().run()
-    assert not harness.exception
+    assert not any(button.label.startswith("/") for button in harness.button)
+    harness.text_input(key="draft-box").set_value("/").run()
     labels = [button.label for button in harness.button]
     for command in app.COMMANDS:
         assert f"/{command.token}" in labels
-        assert command.skill == command.token or command.skill not in labels
         assert f"{command.skill}.md" not in labels
     assert "scheduling.md" not in labels
-    assert "files.md" not in labels
+
+
+def test_filter_sch_and_sum_in_harness():
+    harness = AppTest.from_string(COMPOSER_SCRIPT, default_timeout=30).run()
+    harness.text_input(key="draft-box").set_value("/sch").run()
+    labels = [button.label for button in harness.button if button.label.startswith("/")]
+    assert labels == ["/schedule"]
+    harness.text_input(key="draft-box").set_value("/sum").run()
+    labels = [button.label for button in harness.button if button.label.startswith("/")]
+    assert labels == ["/summarize"]
+    harness.text_input(key="draft-box").set_value("What's due this week?").run()
+    assert [button.label for button in harness.button if button.label.startswith("/")] == []
 
 
 def test_selecting_command_inserts_text_without_submitting():
-    harness = AppTest.from_string(PICKER_SCRIPT, default_timeout=30).run()
-    harness.button(key="command-picker-toggle").click().run()
+    harness = AppTest.from_string(COMPOSER_SCRIPT, default_timeout=30).run()
+    harness.text_input(key="draft-box").set_value("/").run()
     harness.button(key="command-pick-schedule").click().run()
+    harness.run()
     assert not harness.exception
     bodies = [str(element.value) for element in harness.markdown]
     assert not any(body.startswith("SUBMITTED:") for body in bodies)
     assert harness.session_state.get("submitted_prompt") is None
-    chat = harness.chat_input(key=app.CHAT_INPUT_KEY)
-    assert chat.proto.set_value
-    assert chat.proto.value == "/schedule "
-    # After the one-shot prefill, the widget has not been submitted.
-    assert harness.session_state.get(app.CHAT_INPUT_KEY) in (None, "/schedule ")
+    assert harness.session_state.get("draft-box") == "/schedule "
+    assert harness.text_input(key="draft-box").value == "/schedule "
 
 
-def test_inserted_command_can_be_edited_then_submitted():
-    harness = AppTest.from_string(PICKER_SCRIPT, default_timeout=30).run()
-    harness.button(key="command-picker-toggle").click().run()
+def test_submit_still_works_after_command_plus_text():
+    harness = AppTest.from_string(COMPOSER_SCRIPT, default_timeout=30).run()
+    harness.text_input(key="draft-box").set_value("/").run()
     harness.button(key="command-pick-schedule").click().run()
-    harness.chat_input(key=app.CHAT_INPUT_KEY).set_value("/schedule plan next week").run()
+    harness.run()
+    harness.text_input(key="draft-box").set_value("/schedule plan next week").run()
+    harness.button(key="composer-send").click().run()
     assert not harness.exception
     assert harness.session_state["submitted_prompt"] == "/schedule plan next week"
     bodies = [str(element.value) for element in harness.markdown]
     assert any(body == "SUBMITTED:/schedule plan next week" for body in bodies)
 
 
-def test_app_mounts_picker_and_keeps_chat_input(monkeypatch, tmp_path):
+def test_ordinary_submit_without_slash():
+    harness = AppTest.from_string(COMPOSER_SCRIPT, default_timeout=30).run()
+    harness.text_input(key="draft-box").set_value("What's due this week?").run()
+    harness.button(key="composer-send").click().run()
+    assert harness.session_state["submitted_prompt"] == "What's due this week?"
+
+
+def test_app_uses_custom_composer_not_st_chat_input(monkeypatch, tmp_path):
     seen: list[list[dict[str, str]]] = []
 
-    def fake_mount(*, commands, key=command_picker.COMPONENT_KEY):
+    def fake_mount(*, commands, placeholder=None, key=command_picker.COMPONENT_KEY):
         seen.append(list(commands))
         return None
 
     monkeypatch.setattr(command_picker, "mount", fake_mount)
     harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
     assert not harness.exception
-    assert len(harness.chat_input) == 1
-    assert harness.chat_input[0].key == app.CHAT_INPUT_KEY
+    assert not harness.chat_input
     assert seen
     assert [row["token"] for row in seen[0]] == [command.token for command in app.COMMANDS]
     dumped = str(seen[0])
@@ -211,64 +238,49 @@ def test_app_mounts_picker_and_keeps_chat_input(monkeypatch, tmp_path):
     assert "assignment_summary" not in dumped
 
 
-def test_app_picker_insert_does_not_submit(monkeypatch, tmp_path):
-    def fake_mount(*, commands, key=command_picker.COMPONENT_KEY):
+def test_app_component_submit_is_not_an_insert(monkeypatch, tmp_path):
+    def fake_mount(*, commands, placeholder=None, key=command_picker.COMPONENT_KEY):
         return {"insert": "schedule", "seq": 99}
 
     monkeypatch.setattr(command_picker, "mount", fake_mount)
     harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
     assert not harness.exception
-    assert len(harness.chat_input) == 1
-    chat = harness.chat_input(key=app.CHAT_INPUT_KEY)
-    assert chat.proto.set_value
-    assert chat.proto.value == "/schedule "
-    assert not harness.chat_message
     store = app.ConversationStore(str(tmp_path / "history.db"))
     conversation_id = harness.session_state["conversation_id"]
     assert store.get_messages(conversation_id) == []
 
 
-def test_ordinary_messages_do_not_open_typeahead():
-    assert app.filter_commands("What's due this week?") == ()
-    assert app.parse_user_message("What's due this week?") == (
-        None,
-        "What's due this week?",
-    )
-
-
-def test_frontend_is_a_declare_component_iframe():
+def test_frontend_owns_a_real_input_and_live_filter():
     html = (command_picker.FRONTEND_DIR / "index.html").read_text()
     assert command_picker.FRONTEND_DIR.is_dir()
-    assert (command_picker.FRONTEND_DIR / "index.html").is_file()
-    assert "streamlit:componentReady" in html
-    assert "streamlit:setComponentValue" in html
-    assert command_picker.HOST_ID in html
-    assert command_picker.MENU_ID in html
-    assert command_picker.STYLE_ID in html
-    assert "command-picker-icon" in html
-    assert 'aria-label", "Commands"' in html or "aria-label" in html
-    assert "title" in html and "Commands" in html
+    assert '<input' in html
+    assert 'class="command-picker-input"' in html
+    assert "filterCommands" in html
+    assert "startsWith(\"/\")" in html or "startsWith('/')" in html
+    assert "setComponentValue({ submit:" in html.replace(" ", "") or 'submit: text' in html
+    assert "insert(token)" in html or "function insert" in html
     assert "ArrowDown" in html
     assert "ArrowUp" in html
     assert "Escape" in html
     assert "Enter" in html
-    assert "insert" in html
+    assert "command-picker-icon" in html
+    assert "aria-label" in html and "Commands" in html
     assert "scheduling.md" not in html
     assert "files.md" not in html
-    assert "doc.body.appendChild(host)" in html
-    assert "parentWin().innerHeight" in html
-    assert "ignoreTypeaheadUntil" in html
+    assert "st.chat_input" not in html
     assert Path(command_picker._component.path) == command_picker.FRONTEND_DIR
 
 
-def test_main_keeps_chat_input_and_files_rail():
+def test_main_replaces_st_chat_input_and_keeps_files_rail():
     main_src = inspect.getsource(app.main)
     assert "render_command_picker" in main_src
-    assert "st.chat_input" in main_src
-    assert "CHAT_INPUT_KEY" in main_src
+    assert "st.chat_input" not in main_src
+    assert "handle_prompt(render_command_picker())" in main_src
     assert "render_file_panel" in main_src
     assert "st.columns([2, 1]" not in main_src
     picker_src = inspect.getsource(app.render_command_picker)
     assert "command_picker.mount" in picker_src
     assert "files.md" not in picker_src
     assert "scheduling.md" not in picker_src
+    assert not hasattr(app, "insert_command_into_chat")
+    assert not hasattr(app, "CHAT_INPUT_KEY")
