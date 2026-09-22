@@ -4053,10 +4053,9 @@ def main() -> None:
             st.session_state.composer_busy = False
 
         render_agent_turn(produced, canvas, user_text=prompt)
-        before = [entry["identity"] for entry in st.session_state.get("opened_files") or []]
-        after = [entry["identity"] for entry in store.list_opened_files(conversation_id)]
-        if after != before:
-            st.rerun()
+        # Remount the composer after the turn so focus returns without a click.
+        # Draft text typed while the agent ran is restored from the parent window.
+        st.rerun()
 
     # Custom component iframe owns the pinned rail. Native columns cannot stay
     # on screen while the transcript scrolls, and docking Streamlit widgets

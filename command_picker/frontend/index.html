@@ -156,6 +156,7 @@
         var livePlaceholder = "What's due this week?";
         var liveStyleId = "canvas-command-picker-style";
         var iconOpen = false;
+        var dismissed = false;
         var highlight = -1;
         var placeHooked = false;
         var built = false;
@@ -327,7 +328,35 @@
           host.setAttribute("aria-busy", localBusy ? "true" : "false");
           sendBtn.disabled = localBusy;
           sendBtn.setAttribute("title", localBusy ? "Checking Canvas…" : "Send");
+          // Keep the textarea usable so queued keystrokes are not dropped.
           input.removeAttribute("disabled");
+        }
+
+        function draftBucket() {
+          try {
+            var win = parentWin();
+            if (!win.__canvasCommandPickerDraft) {
+              win.__canvasCommandPickerDraft = { text: "" };
+            }
+            return win.__canvasCommandPickerDraft;
+          } catch (err) {
+            return { text: "" };
+          }
+        }
+
+        function saveDraft() {
+          draftBucket().text = input.value;
+        }
+
+        function restoreDraft() {
+          var saved = draftBucket().text;
+          if (saved && !input.value) {
+            input.value = saved;
+          }
+        }
+
+        function clearDraft() {
+          draftBucket().text = "";
         }
 
         function focusComposer() {
@@ -353,6 +382,7 @@
 
         function visibleCommands() {
           if (iconOpen) return liveCommands.slice();
+          if (dismissed) return [];
           return filterCommands(input.value);
         }
 
@@ -360,6 +390,7 @@
           input.value = "/" + token + " ";
           iconOpen = false;
           highlight = -1;
+          saveDraft();
           renderMenu();
           focusComposer();
           input.selectionStart = input.selectionEnd = input.value.length;
@@ -371,6 +402,7 @@
           var value = input.value;
           input.value = value.slice(0, start) + "\n" + value.slice(end);
           input.selectionStart = input.selectionEnd = start + 1;
+          saveDraft();
           renderMenu();
           focusComposer();
         }
@@ -382,6 +414,7 @@
           highlight = -1;
           renderMenu();
           setBusy(true);
+          clearDraft();
           setComponentValue({ submit: text, seq: Date.now() });
           input.value = "";
           autosize();
@@ -458,6 +491,7 @@
           iconBtn.addEventListener("click", function (event) {
             event.preventDefault();
             iconOpen = !iconOpen;
+            if (iconOpen) dismissed = false;
             highlight = iconOpen ? 0 : -1;
             renderMenu();
             focusComposer();
@@ -467,6 +501,8 @@
             if (!localBusy) submit();
           });
           input.addEventListener("input", function () {
+            dismissed = false;
+            saveDraft();
             if (!iconOpen) highlight = filterCommands(input.value).length ? 0 : -1;
             if (!/^\s*\//.test(input.value) && !iconOpen) {
               iconOpen = false;
@@ -475,6 +511,7 @@
           });
           input.addEventListener("paste", function () {
             setTimeout(function () {
+              saveDraft();
               renderMenu();
             }, 0);
           });
@@ -495,6 +532,7 @@
               if (open || iconOpen) {
                 event.preventDefault();
                 iconOpen = false;
+                dismissed = true;
                 highlight = -1;
                 renderMenu();
               }
@@ -545,6 +583,7 @@
           input.setAttribute("placeholder", livePlaceholder);
           bindOnce();
           hookPlacement();
+          restoreDraft();
           afterStreamlitPaint(!!args.busy);
           renderMenu();
         }

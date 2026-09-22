@@ -298,7 +298,7 @@ python -m pytest
 | --- | --- |
 | `app.py` | Config, read-only Canvas client, file viewer, tool schemas, DeepSeek client, SQLite history, Streamlit UI, slash-command routing and skill loading |
 | `skills/` | Markdown instruction files the assistant loads (base behavior, Canvas read-only, plus optional task focus) |
-| `command_picker/` | Custom chat composer: real input, live `/` filter, optional sparkle menu |
+| `command_picker/` | Custom chat composer: auto-resizing textarea, live `/` filter, optional sparkle menu |
 | `files_rail/` | Pinned right-hand files panel (custom Streamlit component) |
 | `requirements.txt` | Runtime dependencies |
 | `requirements-dev.txt` | Test dependencies |

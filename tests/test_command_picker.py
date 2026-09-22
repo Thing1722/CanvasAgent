@@ -165,6 +165,9 @@ def test_escape_closes_menu_keeps_text():
         "text": "/sch plan",
     }
     assert app.picker_key_action("Escape", "What's due?")["text"] == "What's due?"
+    html = (command_picker.FRONTEND_DIR / "index.html").read_text()
+    assert "dismissed = true" in html
+    assert "if (dismissed) return []" in html
 
 
 def test_mid_sentence_slash_does_not_open_menu():
@@ -295,6 +298,11 @@ def test_frontend_owns_a_real_textarea_and_parity_keys():
     assert "setBusy" in html
     assert "aria-busy" in html
     assert "input.removeAttribute(\"disabled\")" in html
+    assert "function draftBucket" in html
+    assert "function saveDraft" in html
+    assert "function restoreDraft" in html
+    assert "function clearDraft" in html
+    assert "__canvasCommandPickerDraft" in html
     assert "filterCommands" in html
     assert "ArrowDown" in html
     assert "ArrowUp" in html
@@ -320,3 +328,8 @@ def test_main_replaces_st_chat_input_and_keeps_files_rail():
     assert "scheduling.md" not in picker_src
     assert not hasattr(app, "insert_command_into_chat")
     assert not hasattr(app, "CHAT_INPUT_KEY")
+    # After a reply Streamlit remounts the iframe so focusComposer can run.
+    assert "composer_busy = True" in main_src
+    assert "composer_busy = False" in main_src
+    assert "focus returns" in main_src
+    assert main_src.count("st.rerun()") >= 1
