@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>command picker</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: transparent;
+        height: 100%;
+      }
+      #canvas-command-picker-host {
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        height: 100%;
+        width: 100%;
+        padding: 0 1rem 0.85rem;
+        font-family: Source Sans, Source Sans 3, sans-serif;
+      }
+      #canvas-command-picker-host * { box-sizing: border-box; }
+      #canvas-command-picker-menu {
+        width: 100%;
+        min-width: 0;
+        max-height: 340px;
+        overflow: auto;
+        margin: 0 0 0.45rem;
+        padding: 0.35rem;
+        border: 1px solid var(--picker-border, rgba(49, 51, 63, 0.2));
+        border-radius: 0.6rem;
+        background: var(--picker-bg, #ffffff);
+        color: var(--picker-text, #31333f);
+        box-shadow: 0 8px 24px rgba(49, 51, 63, 0.18);
+      }
+      #canvas-command-picker-menu[hidden] { display: none !important; }
+      .command-picker-item {
+        appearance: none;
+        -webkit-appearance: none;
+        display: block;
+        width: 100%;
+        text-align: left;
+        margin: 0;
+        padding: 0.45rem 0.6rem;
+        border: 0;
+        border-radius: 0.4rem;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+      }
+      .command-picker-item[data-active="true"],
+      .command-picker-item:hover {
+        background: var(--picker-secondary, #f0f2f6);
+      }
+      .command-picker-item:focus-visible {
+        outline: 2px solid var(--picker-primary, #ff4b4b);
+        outline-offset: -2px;
+      }
+      .command-picker-token {
+        display: block;
+        font-weight: 600;
+        font-size: 0.92rem;
+      }
+      .command-picker-desc {
+        display: block;
+        font-size: 0.8rem;
+        opacity: 0.8;
+        line-height: 1.35;
+        margin-top: 0.1rem;
+      }
+      .command-picker-row {
+        display: flex;
+        align-items: center;
+        gap: 0.35rem;
+        width: 100%;
+        min-height: 3.15rem;
+        padding: 0.35rem 0.45rem 0.35rem 0.4rem;
+        border-radius: 1.6rem;
+        background: var(--picker-secondary, #f0f2f6);
+        color: var(--picker-text, #31333f);
+      }
+      .command-picker-icon,
+      .command-picker-send {
+        appearance: none;
+        -webkit-appearance: none;
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.15rem;
+        height: 2.15rem;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+      }
+      .command-picker-icon:hover,
+      .command-picker-send:hover { color: var(--picker-primary, #ff4b4b); }
+      .command-picker-icon:focus-visible,
+      .command-picker-send:focus-visible {
+        outline: 2px solid var(--picker-primary, #ff4b4b);
+        outline-offset: 2px;
+      }
+      .command-picker-icon svg,
+      .command-picker-send svg { width: 18px; height: 18px; display: block; }
+      .command-picker-input {
+        flex: 1 1 auto;
+        min-width: 0;
+        border: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-size: 1rem;
+        line-height: 1.4;
+        outline: none;
+        padding: 0.35rem 0.2rem;
+      }
+      .command-picker-input::placeholder { opacity: 0.55; }
+    </style>
+  </head>
+  <body>
+    <div id="canvas-command-picker-host" data-canvas-command-picker="1">
+      <div id="canvas-command-picker-menu" role="listbox" aria-label="Commands" hidden></div>
+      <div class="command-picker-row">
+        <button type="button" class="command-picker-icon" aria-label="Commands" title="Commands" aria-haspopup="listbox" aria-expanded="false" aria-controls="canvas-command-picker-menu"></button>
+        <input
+          class="command-picker-input"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          data-testid="command-picker-input"
+          aria-label="Chat message"
+        />
+        <button type="button" class="command-picker-send" aria-label="Send" title="Send"></button>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var API = 1;
+        var lastArgsKey = "";
+        var lastTheme = null;
+        var liveCommands = [];
+        var livePlaceholder = "What's due this week?";
+        var liveStyleId = "canvas-command-picker-style";
+        var iconOpen = false;
+        var highlight = -1;
+        var placeHooked = false;
+        var built = false;
+        var BAR_HEIGHT = 78;
+        var MENU_MAX = 360;
+
+        var host = document.getElementById("canvas-command-picker-host");
+        var menu = document.getElementById("canvas-command-picker-menu");
+        var input = host.querySelector(".command-picker-input");
+        var iconBtn = host.querySelector(".command-picker-icon");
+        var sendBtn = host.querySelector(".command-picker-send");
+
+        function send(type, data) {
+          var payload = Object.assign({ isStreamlitMessage: true, type: type }, data || {});
+          window.parent.postMessage(payload, "*");
+        }
+
+        function setFrameHeight(height) {
+          send("streamlit:setFrameHeight", { height: height });
+        }
+
+        function setComponentValue(value) {
+          send("streamlit:setComponentValue", { value: value, dataType: "json" });
+        }
+
+        function parentWin() {
+          try {
+            if (window.parent && window.parent !== window) return window.parent;
+          } catch (err) {}
+          return window;
+        }
+
+        function parentDoc() {
+          try {
+            var doc = parentWin().document;
+            if (doc && doc.documentElement) return doc;
+          } catch (err) {}
+          return null;
+        }
+
+        function themeVars(theme) {
+          theme = theme || {};
+          return {
+            background: theme.backgroundColor || "#ffffff",
+            secondary: theme.secondaryBackgroundColor || "#f0f2f6",
+            text: theme.textColor || "#31333f",
+            primary: theme.primaryColor || "#ff4b4b",
+            font: theme.font || "Source Sans, Source Sans 3, sans-serif",
+            border: "rgba(49, 51, 63, 0.2)",
+          };
+        }
+
+        function applyTheme(theme) {
+          var vars = themeVars(theme);
+          var root = document.documentElement;
+          root.style.setProperty("--picker-bg", vars.background);
+          root.style.setProperty("--picker-secondary", vars.secondary);
+          root.style.setProperty("--picker-text", vars.text);
+          root.style.setProperty("--picker-primary", vars.primary);
+          root.style.setProperty("--picker-border", vars.border);
+          host.style.fontFamily = vars.font;
+          document.body.style.background = vars.background;
+        }
+
+        function ensureParentStyle(doc, css) {
+          var el = doc.getElementById(liveStyleId);
+          if (!el) {
+            el = doc.createElement("style");
+            el.id = liveStyleId;
+            doc.head.appendChild(el);
+          }
+          el.textContent = css;
+        }
+
+        function sidebarLeft(doc) {
+          var sidebar = doc.querySelector('[data-testid="stSidebar"]');
+          if (sidebar) {
+            var rect = sidebar.getBoundingClientRect();
+            if (rect.width > 8 && rect.right > 0) return Math.round(rect.right);
+          }
+          return 0;
+        }
+
+        function railRight(doc) {
+          var rail = doc.getElementById("canvas-files-rail-host");
+          if (rail && rail.getAttribute("data-collapsed") !== "true") {
+            var width = rail.getBoundingClientRect().width;
+            if (width > 8) return Math.round(width);
+          }
+          var raw = "";
+          try {
+            raw = parentWin().getComputedStyle(doc.documentElement).getPropertyValue("--canvas-files-rail-width");
+          } catch (err) {}
+          var n = parseInt(raw, 10);
+          return isFinite(n) ? n : 0;
+        }
+
+        function menuOpen() {
+          return !!(menu && !menu.hidden);
+        }
+
+        function pinIframe(height) {
+          var iframe = window.frameElement;
+          var doc = parentDoc();
+          var left = doc ? sidebarLeft(doc) : 0;
+          var right = doc ? railRight(doc) : 0;
+          if (iframe) {
+            iframe.setAttribute("data-canvas-command-picker-frame", "1");
+            iframe.style.cssText =
+              "position:fixed!important;left:" +
+              left +
+              "px!important;right:" +
+              right +
+              "px!important;bottom:0!important;width:calc(100% - " +
+              (left + right) +
+              "px)!important;height:" +
+              height +
+              "px!important;border:0!important;z-index:1000018!important;background:transparent!important;";
+            var wrap = iframe.parentElement;
+            if (wrap) {
+              wrap.style.cssText =
+                "height:0!important;min-height:0!important;margin:0!important;" +
+                "padding:0!important;overflow:visible!important;border:0!important;";
+            }
+          }
+          if (doc) {
+            ensureParentStyle(
+              doc,
+              "html { --canvas-command-picker-height: " +
+                height +
+                "px; }\n" +
+                '[data-testid="stAppScrollToBottomContainer"],' +
+                '[data-testid="stMain"] {' +
+                " padding-bottom: var(--canvas-command-picker-height) !important; }\n" +
+                'iframe[data-canvas-command-picker-frame="1"] { background: transparent !important; }'
+            );
+          }
+          setFrameHeight(height);
+        }
+
+        function filterCommands(query) {
+          var text = (query || "").replace(/^\s+/, "");
+          if (!text.startsWith("/")) return [];
+          if (/\s/.test(text)) return [];
+          var typed = text.slice(1).toLowerCase();
+          if (!typed) return liveCommands.slice();
+          return liveCommands.filter(function (cmd) {
+            return cmd.token.indexOf(typed) === 0;
+          });
+        }
+
+        function visibleCommands() {
+          if (iconOpen) return liveCommands.slice();
+          return filterCommands(input.value);
+        }
+
+        function insert(token) {
+          input.value = "/" + token + " ";
+          iconOpen = false;
+          highlight = -1;
+          renderMenu();
+          input.focus();
+        }
+
+        function submit() {
+          var text = input.value;
+          if (!String(text).trim()) return;
+          iconOpen = false;
+          highlight = -1;
+          renderMenu();
+          setComponentValue({ submit: text, seq: Date.now() });
+          input.value = "";
+        }
+
+        function renderMenu() {
+          var rows = visibleCommands();
+          while (menu.firstChild) menu.removeChild(menu.firstChild);
+          if (!rows.length) {
+            menu.hidden = true;
+            iconBtn.setAttribute("aria-expanded", "false");
+            pinIframe(BAR_HEIGHT);
+            return;
+          }
+          if (highlight >= rows.length) highlight = rows.length - 1;
+          rows.forEach(function (cmd, index) {
+            var item = document.createElement("button");
+            item.type = "button";
+            item.className = "command-picker-item";
+            item.setAttribute("role", "option");
+            item.setAttribute("data-token", cmd.token);
+            item.setAttribute("data-active", index === highlight ? "true" : "false");
+            var token = document.createElement("span");
+            token.className = "command-picker-token";
+            token.textContent = "/" + cmd.token;
+            var desc = document.createElement("span");
+            desc.className = "command-picker-desc";
+            desc.textContent = cmd.description || "";
+            item.appendChild(token);
+            item.appendChild(desc);
+            item.addEventListener("mousedown", function (event) {
+              event.preventDefault();
+              insert(cmd.token);
+            });
+            menu.appendChild(item);
+          });
+          menu.hidden = false;
+          iconBtn.setAttribute("aria-expanded", "true");
+          pinIframe(BAR_HEIGHT + Math.min(MENU_MAX, 16 + rows.length * 56));
+        }
+
+        function moveHighlight(delta) {
+          var rows = visibleCommands();
+          if (!rows.length) return;
+          if (highlight < 0) highlight = delta > 0 ? 0 : rows.length - 1;
+          else highlight = (highlight + delta + rows.length) % rows.length;
+          renderMenu();
+        }
+
+        function svg(pathD) {
+          var svgEl = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          svgEl.setAttribute("viewBox", "0 0 24 24");
+          svgEl.setAttribute("aria-hidden", "true");
+          svgEl.setAttribute("focusable", "false");
+          var path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+          path.setAttribute("d", pathD);
+          path.setAttribute("fill", "currentColor");
+          svgEl.appendChild(path);
+          return svgEl;
+        }
+
+        function bindOnce() {
+          if (built) return;
+          built = true;
+          iconBtn.appendChild(
+            svg(
+              "M12 2.5l1.35 5.1L18.5 9 13.35 10.4 12 15.5l-1.35-5.1L5.5 9l5.15-1.4L12 2.5zm6.5 9.5l.7 2.65L22 15.5l-2.8.85L18.5 19l-.7-2.65L15 15.5l2.8-.85.7-2.65zM5.5 13.5l.55 2.1L8.2 16.2l-2.15.65L5.5 19l-.55-2.15L2.8 16.2l2.15-.6.55-2.1z"
+            )
+          );
+          sendBtn.appendChild(
+            svg("M12 4l-1.4 1.4 5.6 5.6H4v2h12.2l-5.6 5.6L12 20l8-8z")
+          );
+          iconBtn.addEventListener("click", function (event) {
+            event.preventDefault();
+            iconOpen = !iconOpen;
+            highlight = iconOpen ? 0 : -1;
+            renderMenu();
+            input.focus();
+          });
+          sendBtn.addEventListener("click", function (event) {
+            event.preventDefault();
+            submit();
+          });
+          input.addEventListener("input", function () {
+            if (!iconOpen) highlight = -1;
+            if (!input.value.startsWith("/") && !iconOpen) {
+              iconOpen = false;
+            }
+            renderMenu();
+          });
+          input.addEventListener("keydown", function (event) {
+            var rows = visibleCommands();
+            var open = rows.length > 0;
+            if (open && event.key === "ArrowDown") {
+              event.preventDefault();
+              moveHighlight(1);
+              return;
+            }
+            if (open && event.key === "ArrowUp") {
+              event.preventDefault();
+              moveHighlight(-1);
+              return;
+            }
+            if (event.key === "Escape") {
+              if (open || iconOpen) {
+                event.preventDefault();
+                iconOpen = false;
+                highlight = -1;
+                renderMenu();
+              }
+              return;
+            }
+            if (event.key === "Enter") {
+              event.preventDefault();
+              if (open && highlight >= 0 && rows[highlight]) {
+                insert(rows[highlight].token);
+                return;
+              }
+              submit();
+            }
+          });
+        }
+
+        function hookPlacement() {
+          if (placeHooked) return;
+          placeHooked = true;
+          var win = parentWin();
+          var onPlace = function () {
+            pinIframe(menuOpen() ? host.getBoundingClientRect().height || BAR_HEIGHT : BAR_HEIGHT);
+          };
+          try {
+            win.addEventListener("resize", onPlace);
+            if (win.visualViewport) win.visualViewport.addEventListener("resize", onPlace);
+          } catch (err) {}
+        }
+
+        function render(args, theme) {
+          args = args || {};
+          liveStyleId = args.style_id || "canvas-command-picker-style";
+          liveCommands = Array.isArray(args.commands) ? args.commands : [];
+          livePlaceholder = args.placeholder || "What's due this week?";
+          applyTheme(theme);
+          input.setAttribute("placeholder", livePlaceholder);
+          bindOnce();
+          hookPlacement();
+          renderMenu();
+        }
+
+        window.addEventListener("message", function (event) {
+          var data = event.data || {};
+          if (data.type !== "streamlit:render") return;
+          var args = data.args || {};
+          var key = JSON.stringify(args);
+          if (key === lastArgsKey && lastTheme === data.theme) {
+            pinIframe(menuOpen() ? BAR_HEIGHT + MENU_MAX : BAR_HEIGHT);
+            return;
+          }
+          lastArgsKey = key;
+          lastTheme = data.theme;
+          render(args, data.theme);
+        });
+
+        send("streamlit:componentReady", { apiVersion: API });
+        setFrameHeight(BAR_HEIGHT);
+      })();
+    </script>
+  </body>
+</html>

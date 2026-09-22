@@ -1570,7 +1570,8 @@ def test_files_sidebar_uses_custom_component_not_js_dock():
     frontend = (files_rail.FRONTEND_DIR / "index.html").read_text()
     assert "files_rail.mount" in panel_src
     assert "render_file_panel" in main_src
-    assert "st.chat_input" in main_src
+    assert "st.chat_input" not in main_src
+    assert "render_command_picker" in main_src
     assert "st.columns([2, 1]" not in main_src
     assert "with files_col:" not in main_src
     assert "appendChild" not in main_src

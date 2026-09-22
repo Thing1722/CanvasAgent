@@ -43,6 +43,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from streamlit.errors import StreamlitAPIException
 
+import command_picker
 import files_rail
 
 # ---------------------------------------------------------------------------
@@ -2321,20 +2322,56 @@ class ConversationStore:
 # Streamlit from C:\\Users\\...\\canvas_agent or any other working directory.
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
-# First token of the message, case-insensitive. Unknown /foo is ordinary text.
-SLASH_COMMANDS: dict[str, str] = {
-    "schedule": "scheduling",
-    "summarize": "assignment_summary",
-    "exam": "exam_study",
-    "deadlines": "deadlines",
+# One table for the picker UI and for local slash-command routing.
+# Users see /token; skill keys stay internal (never shown in the chat UI).
+@dataclass(frozen=True)
+class CommandDef:
+    token: str
+    skill: str
+    description: str
+    default_request: str
+
+
+COMMANDS: tuple[CommandDef, ...] = (
+    CommandDef(
+        token="schedule",
+        skill="scheduling",
+        description="Create a balanced schedule from Canvas deadlines.",
+        default_request="Help me schedule my upcoming Canvas work at a healthy pace.",
+    ),
+    CommandDef(
+        token="summarize",
+        skill="assignment_summary",
+        description="Summarize assignment instructions or an opened source.",
+        default_request="Summarize what I need to do for my current assignments.",
+    ),
+    CommandDef(
+        token="exam",
+        skill="exam_study",
+        description="Find and summarize exam-related course materials.",
+        default_request="Help me figure out what I should study for upcoming exams.",
+    ),
+    CommandDef(
+        token="deadlines",
+        skill="deadlines",
+        description="Find upcoming deadlines.",
+        default_request="What deadlines are coming up?",
+    ),
+    CommandDef(
+        token="files",
+        skill="files",
+        description="Search course files, modules, and linked materials.",
+        default_request="Search my course files, modules, and linked materials.",
+    ),
+)
+
+# Derived from COMMANDS — do not edit these by hand.
+SLASH_COMMANDS: dict[str, str] = {command.token: command.skill for command in COMMANDS}
+SLASH_COMMAND_DEFAULTS: dict[str, str] = {
+    command.skill: command.default_request for command in COMMANDS
 }
 
-SLASH_COMMAND_DEFAULTS: dict[str, str] = {
-    "scheduling": "Help me schedule my upcoming Canvas work at a healthy pace.",
-    "assignment_summary": "Summarize what I need to do for my current assignments.",
-    "exam_study": "Help me figure out what I should study for upcoming exams.",
-    "deadlines": "What deadlines are coming up?",
-}
+CHAT_COMPOSER_PLACEHOLDER = "What's due this week?"
 
 REQUIRED_SKILL_FILES: dict[str, str] = {
     "base_behavior": "base_behavior.md",
@@ -2343,6 +2380,7 @@ REQUIRED_SKILL_FILES: dict[str, str] = {
     "assignment_summary": "assignment_summary.md",
     "exam_study": "exam_study.md",
     "deadlines": "deadlines.md",
+    "files": "files.md",
 }
 
 CORE_SKILL_NAMES: tuple[str, ...] = ("base_behavior", "canvas_read_only")
@@ -2392,6 +2430,92 @@ def parse_user_message(text: str | None) -> tuple[str | None, str]:
     if not request:
         request = SLASH_COMMAND_DEFAULTS[skill]
     return skill, request
+
+
+def known_command_token(token: str | None) -> str | None:
+    """Return the canonical slash token, or None if it is not a listed command."""
+    cleaned = (token or "").strip().lstrip("/").lower()
+    return cleaned if cleaned in SLASH_COMMANDS else None
+
+
+def command_insert_text(token: str) -> str:
+    """Text inserted into the chat box when a command is picked: ``/token ``."""
+    canonical = known_command_token(token)
+    if canonical is None:
+        raise ValueError("unknown command")
+    return f"/{canonical} "
+
+
+def commands_for_picker() -> list[dict[str, str]]:
+    """User-facing picker rows: slash token + description only. No skill keys."""
+    return [
+        {"token": command.token, "description": command.description} for command in COMMANDS
+    ]
+
+
+def filter_commands(query: str | None) -> tuple[CommandDef, ...]:
+    """Filter listed commands for a typed slash prefix.
+
+    Ordinary text that does not begin with ``/`` returns no suggestions.
+    ``/`` alone returns every command. A space after the token hides the menu
+    so ``/schedule plan next week`` is just a draft. Matching is prefix-only.
+    """
+    text = "" if query is None else str(query).lstrip()
+    if not text.startswith("/"):
+        return ()
+    if any(character.isspace() for character in text):
+        return ()
+    typed = text[1:].lower()
+    if not typed:
+        return COMMANDS
+    return tuple(command for command in COMMANDS if command.token.startswith(typed))
+
+
+def commands_matching(query: str | None, *, icon_open: bool = False) -> tuple[CommandDef, ...]:
+    """Rows the composer menu should show. The icon lists every command."""
+    if icon_open:
+        return COMMANDS
+    return filter_commands(query)
+
+
+def picker_enter_action(
+    text: str,
+    highlight: int = -1,
+    *,
+    icon_open: bool = False,
+) -> dict[str, str]:
+    """Enter: insert a highlighted suggestion, or submit the draft."""
+    rows = commands_matching(text, icon_open=icon_open)
+    if 0 <= highlight < len(rows):
+        return {"kind": "insert", "text": command_insert_text(rows[highlight].token)}
+    if (text or "").strip():
+        return {"kind": "submit", "text": text}
+    return {"kind": "noop"}
+
+
+def apply_command_picker_value(value: Any) -> str | None:
+    """Return submitted composer text. Inserts never reach Python."""
+    if not isinstance(value, dict):
+        return None
+    text = value.get("submit")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    seq = value.get("seq")
+    if seq is not None and st.session_state.get("command_picker_submit_seq") == seq:
+        return None
+    if seq is not None:
+        st.session_state.command_picker_submit_seq = seq
+    return text
+
+
+def render_command_picker() -> str | None:
+    """Mount the custom composer (real input + live ``/`` filter). Returns a submit."""
+    pending = apply_command_picker_value(st.session_state.get(command_picker.COMPONENT_KEY))
+    value = command_picker.mount(
+        commands=commands_for_picker(),
+        placeholder=CHAT_COMPOSER_PLACEHOLDER,
+    )
+    return pending or apply_command_picker_value(value)
 
 
 def resolve_skills_dir(directory: Path | str | None = None) -> Path:
@@ -3911,7 +4035,7 @@ def main() -> None:
     # duplicated the host on rerun.
     render_file_panel(store, conversation_id, canvas)
     render_conversation(history, canvas)
-    handle_prompt(st.chat_input("What's due this week?"))
+    handle_prompt(render_command_picker())
 
 
 if __name__ == "__main__":

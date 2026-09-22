@@ -22,6 +22,7 @@ SKILL_FILENAMES = (
     "assignment_summary.md",
     "exam_study.md",
     "deadlines.md",
+    "files.md",
 )
 
 
@@ -54,6 +55,7 @@ def test_ordinary_message_that_mentions_a_command_later_is_unchanged():
         ("/summarize what I need to do for the CGA", "assignment_summary", "what I need to do for the CGA"),
         ("/exam what should I study for 21128", "exam_study", "what should I study for 21128"),
         ("/deadlines what's due in the next 3 days", "deadlines", "what's due in the next 3 days"),
+        ("/files syllabus for 21128", "files", "syllabus for 21128"),
     ],
 )
 def test_known_commands_strip_prefix_and_select_skill(message, skill, remainder):
@@ -72,6 +74,8 @@ def test_command_matching_is_case_insensitive():
         ("/summarize   ", "assignment_summary", app.SLASH_COMMAND_DEFAULTS["assignment_summary"]),
         ("/exam", "exam_study", app.SLASH_COMMAND_DEFAULTS["exam_study"]),
         ("/deadlines", "deadlines", app.SLASH_COMMAND_DEFAULTS["deadlines"]),
+        ("/files", "files", app.SLASH_COMMAND_DEFAULTS["files"]),
+        ("/files   ", "files", app.SLASH_COMMAND_DEFAULTS["files"]),
     ],
 )
 def test_empty_remainder_uses_user_facing_default(message, skill, default):
@@ -138,6 +142,18 @@ def test_task_skill_is_included_only_when_selected():
     assert "calendar-style plan" in prompt
     assert "read-only" in prompt
     assert "cannot submit" in prompt
+
+
+def test_files_skill_is_included_and_readonly_stays_last():
+    prompt = app.build_system_prompt(
+        datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc), skill="files"
+    )
+    assert "omit the query to list what is available" in prompt
+    task_at = prompt.find("omit the query to list what is available")
+    readonly_at = prompt.rfind("cannot submit")
+    precedence_at = prompt.find(app.READ_ONLY_PRECEDENCE)
+    assert task_at != -1 and readonly_at != -1
+    assert task_at < precedence_at < readonly_at
 
 
 def test_readonly_block_is_appended_after_the_task_skill():
@@ -259,6 +275,21 @@ def test_unknown_slash_is_sent_to_the_model_unchanged():
     assert deepseek.calls[0]["messages"][-1]["content"] == "/foo bar"
     system = deepseek.calls[0]["messages"][0]["content"]
     assert "healthy rate" not in system
+
+
+def test_files_command_routes_to_files_skill():
+    deepseek = ScriptedDeepSeek([{"role": "assistant", "content": "ok"}])
+    produced = app.run_agent_turn(
+        deepseek, object(), [{"role": "user", "content": "/files"}]
+    )
+    assert deepseek.calls[0]["messages"][-1]["content"] == (
+        "Search my course files, modules, and linked materials."
+    )
+    system = deepseek.calls[0]["messages"][0]["content"]
+    assert "find_course_files" in system
+    assert "cannot submit" in system
+    assert "files.md" not in system
+    assert produced[-1]["content"] == "ok"
 
 
 def test_empty_command_sends_the_default_request_not_the_slash_token():
