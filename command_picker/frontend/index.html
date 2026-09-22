@@ -22,6 +22,8 @@
         font-family: Source Sans, Source Sans 3, sans-serif;
       }
       #canvas-command-picker-host * { box-sizing: border-box; }
+      #canvas-command-picker-host[data-busy="true"] .command-picker-row { opacity: 0.72; }
+      #canvas-command-picker-host[data-busy="true"] .command-picker-send { cursor: wait; }
       #canvas-command-picker-menu {
         width: 100%;
         min-width: 0;
@@ -73,7 +75,7 @@
       }
       .command-picker-row {
         display: flex;
-        align-items: center;
+        align-items: flex-end;
         gap: 0.35rem;
         width: 100%;
         min-height: 3.15rem;
@@ -92,7 +94,7 @@
         justify-content: center;
         width: 2.15rem;
         height: 2.15rem;
-        margin: 0;
+        margin: 0 0 0.1rem;
         padding: 0;
         border: 0;
         border-radius: 999px;
@@ -109,7 +111,7 @@
       }
       .command-picker-icon svg,
       .command-picker-send svg { width: 18px; height: 18px; display: block; }
-      .command-picker-input {
+      textarea.command-picker-input {
         flex: 1 1 auto;
         min-width: 0;
         border: 0;
@@ -119,7 +121,12 @@
         font-size: 1rem;
         line-height: 1.4;
         outline: none;
-        padding: 0.35rem 0.2rem;
+        padding: 0.45rem 0.2rem 0.35rem;
+        resize: none;
+        overflow-y: auto;
+        min-height: 1.4em;
+        max-height: 12.6em;
+        field-sizing: content;
       }
       .command-picker-input::placeholder { opacity: 0.55; }
     </style>
@@ -129,14 +136,14 @@
       <div id="canvas-command-picker-menu" role="listbox" aria-label="Commands" hidden></div>
       <div class="command-picker-row">
         <button type="button" class="command-picker-icon" aria-label="Commands" title="Commands" aria-haspopup="listbox" aria-expanded="false" aria-controls="canvas-command-picker-menu"></button>
-        <input
+        <textarea
           class="command-picker-input"
-          type="text"
+          rows="1"
           autocomplete="off"
           spellcheck="false"
           data-testid="command-picker-input"
           aria-label="Chat message"
-        />
+        ></textarea>
         <button type="button" class="command-picker-send" aria-label="Send" title="Send"></button>
       </div>
     </div>
@@ -149,11 +156,18 @@
         var livePlaceholder = "What's due this week?";
         var liveStyleId = "canvas-command-picker-style";
         var iconOpen = false;
+        var dismissed = false;
         var highlight = -1;
         var placeHooked = false;
+        var insetRO = null;
+        var observedNodes = [];
+        var placeRaf = 0;
         var built = false;
-        var BAR_HEIGHT = 78;
+        var localBusy = false;
+        var LINE = 22;
+        var MAX_LINES = 9;
         var MENU_MAX = 360;
+        var PAD = 28;
 
         var host = document.getElementById("canvas-command-picker-host");
         var menu = document.getElementById("canvas-command-picker-menu");
@@ -223,40 +237,67 @@
           el.textContent = css;
         }
 
-        function sidebarLeft(doc) {
+        function readInsets(doc) {
+          var win = parentWin();
+          var vw = win.innerWidth || (doc.documentElement && doc.documentElement.clientWidth) || 0;
+          var left = 0;
           var sidebar = doc.querySelector('[data-testid="stSidebar"]');
           if (sidebar) {
-            var rect = sidebar.getBoundingClientRect();
-            if (rect.width > 8 && rect.right > 0) return Math.round(rect.right);
+            var expanded = sidebar.getAttribute("aria-expanded");
+            var sr = sidebar.getBoundingClientRect();
+            var visible =
+              expanded !== "false" &&
+              sr.width > 8 &&
+              sr.right > 8 &&
+              sr.left < vw / 2;
+            if (visible) left = Math.round(sr.right);
           }
-          return 0;
+          var right = 0;
+          var rail = doc.getElementById("canvas-files-rail-host");
+          if (rail && rail.getAttribute("data-collapsed") !== "true") {
+            var rr = rail.getBoundingClientRect();
+            if (rr.width > 8 && rr.left < vw) {
+              right = Math.round(Math.max(0, vw - rr.left));
+            }
+          }
+          return { left: left, right: right, vw: vw };
+        }
+
+        function sidebarLeft(doc) {
+          return readInsets(doc).left;
         }
 
         function railRight(doc) {
-          var rail = doc.getElementById("canvas-files-rail-host");
-          if (rail && rail.getAttribute("data-collapsed") !== "true") {
-            var width = rail.getBoundingClientRect().width;
-            if (width > 8) return Math.round(width);
-          }
-          var raw = "";
-          try {
-            raw = parentWin().getComputedStyle(doc.documentElement).getPropertyValue("--canvas-files-rail-width");
-          } catch (err) {}
-          var n = parseInt(raw, 10);
-          return isFinite(n) ? n : 0;
+          return readInsets(doc).right;
         }
 
         function menuOpen() {
           return !!(menu && !menu.hidden);
         }
 
+        function autosize() {
+          input.style.height = "auto";
+          var next = Math.min(LINE * MAX_LINES, Math.max(LINE, input.scrollHeight));
+          input.style.height = next + "px";
+          return next;
+        }
+
+        function barHeight() {
+          var row = host.querySelector(".command-picker-row");
+          var h = row ? row.getBoundingClientRect().height : 50;
+          return Math.round(h + PAD);
+        }
+
         function pinIframe(height) {
           var iframe = window.frameElement;
           var doc = parentDoc();
-          var left = doc ? sidebarLeft(doc) : 0;
-          var right = doc ? railRight(doc) : 0;
+          var box = doc ? readInsets(doc) : { left: 0, right: 0, vw: 0 };
+          var left = box.left;
+          var right = box.right;
           if (iframe) {
             iframe.setAttribute("data-canvas-command-picker-frame", "1");
+            iframe.setAttribute("data-inset-left", String(left));
+            iframe.setAttribute("data-inset-right", String(right));
             iframe.style.cssText =
               "position:fixed!important;left:" +
               left +
@@ -289,6 +330,62 @@
           setFrameHeight(height);
         }
 
+        function layout() {
+          autosize();
+          var extra = 0;
+          if (menuOpen()) {
+            extra = Math.min(MENU_MAX, menu.scrollHeight + 12);
+          }
+          pinIframe(barHeight() + extra);
+        }
+
+        function setBusy(on) {
+          localBusy = !!on;
+          host.setAttribute("data-busy", localBusy ? "true" : "false");
+          host.setAttribute("aria-busy", localBusy ? "true" : "false");
+          sendBtn.disabled = localBusy;
+          sendBtn.setAttribute("title", localBusy ? "Checking Canvas…" : "Send");
+          // Keep the textarea usable so queued keystrokes are not dropped.
+          input.removeAttribute("disabled");
+        }
+
+        function draftBucket() {
+          try {
+            var win = parentWin();
+            if (!win.__canvasCommandPickerDraft) {
+              win.__canvasCommandPickerDraft = { text: "" };
+            }
+            return win.__canvasCommandPickerDraft;
+          } catch (err) {
+            return { text: "" };
+          }
+        }
+
+        function saveDraft() {
+          draftBucket().text = input.value;
+        }
+
+        function restoreDraft() {
+          var saved = draftBucket().text;
+          if (saved && !input.value) {
+            input.value = saved;
+          }
+        }
+
+        function clearDraft() {
+          draftBucket().text = "";
+        }
+
+        function focusComposer() {
+          try {
+            input.focus({ preventScroll: true });
+          } catch (err) {
+            try {
+              input.focus();
+            } catch (focusErr) {}
+          }
+        }
+
         function filterCommands(query) {
           var text = (query || "").replace(/^\s+/, "");
           if (!text.startsWith("/")) return [];
@@ -302,6 +399,7 @@
 
         function visibleCommands() {
           if (iconOpen) return liveCommands.slice();
+          if (dismissed) return [];
           return filterCommands(input.value);
         }
 
@@ -309,8 +407,21 @@
           input.value = "/" + token + " ";
           iconOpen = false;
           highlight = -1;
+          saveDraft();
           renderMenu();
-          input.focus();
+          focusComposer();
+          input.selectionStart = input.selectionEnd = input.value.length;
+        }
+
+        function insertNewline() {
+          var start = input.selectionStart;
+          var end = input.selectionEnd;
+          var value = input.value;
+          input.value = value.slice(0, start) + "\n" + value.slice(end);
+          input.selectionStart = input.selectionEnd = start + 1;
+          saveDraft();
+          renderMenu();
+          focusComposer();
         }
 
         function submit() {
@@ -319,8 +430,11 @@
           iconOpen = false;
           highlight = -1;
           renderMenu();
+          setBusy(true);
+          clearDraft();
           setComponentValue({ submit: text, seq: Date.now() });
           input.value = "";
+          autosize();
         }
 
         function renderMenu() {
@@ -329,9 +443,10 @@
           if (!rows.length) {
             menu.hidden = true;
             iconBtn.setAttribute("aria-expanded", "false");
-            pinIframe(BAR_HEIGHT);
+            layout();
             return;
           }
+          if (highlight < 0) highlight = 0;
           if (highlight >= rows.length) highlight = rows.length - 1;
           rows.forEach(function (cmd, index) {
             var item = document.createElement("button");
@@ -356,7 +471,7 @@
           });
           menu.hidden = false;
           iconBtn.setAttribute("aria-expanded", "true");
-          pinIframe(BAR_HEIGHT + Math.min(MENU_MAX, 16 + rows.length * 56));
+          layout();
         }
 
         function moveHighlight(delta) {
@@ -393,20 +508,29 @@
           iconBtn.addEventListener("click", function (event) {
             event.preventDefault();
             iconOpen = !iconOpen;
+            if (iconOpen) dismissed = false;
             highlight = iconOpen ? 0 : -1;
             renderMenu();
-            input.focus();
+            focusComposer();
           });
           sendBtn.addEventListener("click", function (event) {
             event.preventDefault();
-            submit();
+            if (!localBusy) submit();
           });
           input.addEventListener("input", function () {
-            if (!iconOpen) highlight = -1;
-            if (!input.value.startsWith("/") && !iconOpen) {
+            dismissed = false;
+            saveDraft();
+            if (!iconOpen) highlight = filterCommands(input.value).length ? 0 : -1;
+            if (!/^\s*\//.test(input.value) && !iconOpen) {
               iconOpen = false;
             }
             renderMenu();
+          });
+          input.addEventListener("paste", function () {
+            setTimeout(function () {
+              saveDraft();
+              renderMenu();
+            }, 0);
           });
           input.addEventListener("keydown", function (event) {
             var rows = visibleCommands();
@@ -425,33 +549,155 @@
               if (open || iconOpen) {
                 event.preventDefault();
                 iconOpen = false;
+                dismissed = true;
                 highlight = -1;
                 renderMenu();
               }
               return;
             }
+            if (event.key === "Enter" && event.shiftKey) {
+              event.preventDefault();
+              insertNewline();
+              return;
+            }
             if (event.key === "Enter") {
               event.preventDefault();
-              if (open && highlight >= 0 && rows[highlight]) {
-                insert(rows[highlight].token);
+              if (open) {
+                var index = highlight >= 0 ? highlight : 0;
+                if (rows[index]) insert(rows[index].token);
                 return;
               }
-              submit();
+              if (!localBusy) submit();
             }
           });
+        }
+
+        function schedulePlace() {
+          var win = parentWin();
+          if (placeRaf) return;
+          placeRaf = win.requestAnimationFrame(function () {
+            placeRaf = 0;
+            layout();
+          });
+        }
+
+        function observeInsetTargets() {
+          var win = parentWin();
+          var doc = parentDoc();
+          if (!doc || !win.ResizeObserver) return;
+          if (!insetRO) {
+            insetRO = new win.ResizeObserver(function () {
+              schedulePlace();
+            });
+          }
+          var targets = [
+            doc.documentElement,
+            doc.body,
+            doc.querySelector('[data-testid="stSidebar"]'),
+            doc.querySelector('[data-testid="stSidebarContent"]'),
+            doc.querySelector('[data-testid="stAppViewContainer"]'),
+            doc.querySelector('[data-testid="stMain"]'),
+            doc.querySelector('[data-testid="stAppScrollToBottomContainer"]'),
+            doc.getElementById("canvas-files-rail-host"),
+          ];
+          targets.forEach(function (el) {
+            if (!el) return;
+            if (observedNodes.indexOf(el) !== -1) return;
+            try {
+              insetRO.observe(el);
+              observedNodes.push(el);
+            } catch (err) {}
+          });
+        }
+
+        function railsAreDragging(doc) {
+          var rail = doc.getElementById("canvas-files-rail-host");
+          if (rail && rail.getAttribute("data-resizing") === "true") return true;
+          var sidebar = doc.querySelector('[data-testid="stSidebar"]');
+          if (sidebar && /none/i.test(sidebar.style.userSelect || "")) return true;
+          return false;
         }
 
         function hookPlacement() {
           if (placeHooked) return;
           placeHooked = true;
           var win = parentWin();
+          var doc = parentDoc();
           var onPlace = function () {
-            pinIframe(menuOpen() ? host.getBoundingClientRect().height || BAR_HEIGHT : BAR_HEIGHT);
+            observeInsetTargets();
+            schedulePlace();
           };
           try {
             win.addEventListener("resize", onPlace);
             if (win.visualViewport) win.visualViewport.addEventListener("resize", onPlace);
+            if (doc) {
+              doc.addEventListener(
+                "pointermove",
+                function () {
+                  if (railsAreDragging(doc)) schedulePlace();
+                },
+                true
+              );
+              doc.addEventListener("pointerup", onPlace, true);
+              doc.addEventListener(
+                "click",
+                function (event) {
+                  var target = event.target;
+                  if (!target || !target.closest) return;
+                  if (
+                    target.closest('[data-testid="stSidebarCollapseButton"]') ||
+                    target.closest('[data-testid="stSidebarCollapsedControl"]') ||
+                    target.closest(".files-rail-toggle")
+                  ) {
+                    var n = 0;
+                    var tick = function () {
+                      observeInsetTargets();
+                      schedulePlace();
+                      if (++n < 24) win.setTimeout(tick, 50);
+                    };
+                    tick();
+                  }
+                },
+                true
+              );
+              if (win.MutationObserver) {
+                var obs = new win.MutationObserver(function (records) {
+                  var i;
+                  for (i = 0; i < records.length; i += 1) {
+                    var target = records[i].target;
+                    if (
+                      target &&
+                      target.getAttribute &&
+                      (target.getAttribute("data-canvas-command-picker-frame") === "1" ||
+                        target.id === liveStyleId)
+                    ) {
+                      continue;
+                    }
+                    onPlace();
+                    return;
+                  }
+                });
+                obs.observe(doc.body, {
+                  childList: true,
+                  subtree: true,
+                  attributes: true,
+                  attributeFilter: [
+                    "style",
+                    "data-collapsed",
+                    "aria-expanded",
+                    "data-resizing",
+                  ],
+                });
+              }
+            }
+            observeInsetTargets();
           } catch (err) {}
+        }
+
+        function afterStreamlitPaint(busy) {
+          setBusy(!!busy);
+          if (!busy) focusComposer();
+          layout();
         }
 
         function render(args, theme) {
@@ -463,6 +709,8 @@
           input.setAttribute("placeholder", livePlaceholder);
           bindOnce();
           hookPlacement();
+          restoreDraft();
+          afterStreamlitPaint(!!args.busy);
           renderMenu();
         }
 
@@ -472,7 +720,7 @@
           var args = data.args || {};
           var key = JSON.stringify(args);
           if (key === lastArgsKey && lastTheme === data.theme) {
-            pinIframe(menuOpen() ? BAR_HEIGHT + MENU_MAX : BAR_HEIGHT);
+            afterStreamlitPaint(!!args.busy);
             return;
           }
           lastArgsKey = key;
@@ -481,7 +729,7 @@
         });
 
         send("streamlit:componentReady", { apiVersion: API });
-        setFrameHeight(BAR_HEIGHT);
+        setFrameHeight(78);
       })();
     </script>
   </body>

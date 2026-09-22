@@ -2483,14 +2483,37 @@ def picker_enter_action(
     highlight: int = -1,
     *,
     icon_open: bool = False,
+    shift: bool = False,
 ) -> dict[str, str]:
-    """Enter: insert a highlighted suggestion, or submit the draft."""
-    rows = commands_matching(text, icon_open=icon_open)
-    if 0 <= highlight < len(rows):
-        return {"kind": "insert", "text": command_insert_text(rows[highlight].token)}
-    if (text or "").strip():
-        return {"kind": "submit", "text": text}
-    return {"kind": "noop"}
+    """Enter: newline if Shift; otherwise insert from an open menu, or submit."""
+    return picker_key_action(
+        "Enter", text, highlight, icon_open=icon_open, shift=shift
+    )
+
+
+def picker_key_action(
+    key: str,
+    text: str,
+    highlight: int = -1,
+    *,
+    icon_open: bool = False,
+    shift: bool = False,
+) -> dict[str, str]:
+    """Composer key rules used by tests and mirrored in the iframe."""
+    draft = "" if text is None else str(text)
+    if key == "Escape":
+        return {"kind": "close_menu", "text": draft}
+    if key == "Enter" and shift:
+        return {"kind": "newline", "text": draft + "\n"}
+    if key == "Enter":
+        rows = commands_matching(draft, icon_open=icon_open)
+        if rows:
+            index = highlight if 0 <= highlight < len(rows) else 0
+            return {"kind": "insert", "text": command_insert_text(rows[index].token)}
+        if draft.strip():
+            return {"kind": "submit", "text": draft}
+        return {"kind": "noop"}
+    return {"kind": "noop", "text": draft}
 
 
 def apply_command_picker_value(value: Any) -> str | None:
@@ -2509,11 +2532,12 @@ def apply_command_picker_value(value: Any) -> str | None:
 
 
 def render_command_picker() -> str | None:
-    """Mount the custom composer (real input + live ``/`` filter). Returns a submit."""
+    """Mount the custom composer (real textarea + live ``/`` filter). Returns a submit."""
     pending = apply_command_picker_value(st.session_state.get(command_picker.COMPONENT_KEY))
     value = command_picker.mount(
         commands=commands_for_picker(),
         placeholder=CHAT_COMPOSER_PLACEHOLDER,
+        busy=bool(st.session_state.get("composer_busy")),
     )
     return pending or apply_command_picker_value(value)
 
@@ -3997,6 +4021,7 @@ def main() -> None:
     def handle_prompt(prompt: str | None) -> None:
         if not prompt:
             return
+        st.session_state.composer_busy = True
         user_message = {"role": "user", "content": prompt}
         store.add_message(conversation_id, user_message)
         if not history:
@@ -4014,21 +4039,23 @@ def main() -> None:
             remember_opened_files(store, conversation_id, message)
             produced.append(message)
 
-        with st.spinner("Checking Canvas..."):
-            try:
-                run_agent_turn(deepseek, canvas, history, on_message=persist_and_render)
-            except SkillLoadError as exc:
-                st.error(str(exc))
-            except Exception as exc:
-                # Same Streamlit rerun issue as dispatch_tool: a cached client may
-                # raise an exception class from a previous script run.
-                st.error(redact(exc))
+        try:
+            with st.spinner("Checking Canvas..."):
+                try:
+                    run_agent_turn(deepseek, canvas, history, on_message=persist_and_render)
+                except SkillLoadError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    # Same Streamlit rerun issue as dispatch_tool: a cached client may
+                    # raise an exception class from a previous script run.
+                    st.error(redact(exc))
+        finally:
+            st.session_state.composer_busy = False
 
         render_agent_turn(produced, canvas, user_text=prompt)
-        before = [entry["identity"] for entry in st.session_state.get("opened_files") or []]
-        after = [entry["identity"] for entry in store.list_opened_files(conversation_id)]
-        if after != before:
-            st.rerun()
+        # Remount the composer after the turn so focus returns without a click.
+        # Draft text typed while the agent ran is restored from the parent window.
+        st.rerun()
 
     # Custom component iframe owns the pinned rail. Native columns cannot stay
     # on screen while the transcript scrolls, and docking Streamlit widgets
