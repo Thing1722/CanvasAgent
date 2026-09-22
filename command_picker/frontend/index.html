@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>command picker</title>
+    <style>
+      html, body { margin: 0; padding: 0; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <script>
+      (function () {
+        var API = 1;
+        var lastArgsKey = "";
+        var lastTheme = null;
+        var liveHostId = "canvas-command-picker-host";
+        var liveMenuId = "canvas-command-picker-menu";
+        var liveStyleId = "canvas-command-picker-style";
+        var liveCommands = [];
+        var liveTheme = null;
+        var iconOpen = false;
+        var highlight = -1;
+        var placeHooked = false;
+        var keyHooked = false;
+        var inputHooked = false;
+        var hookedTextarea = null;
+
+        function send(type, data) {
+          var payload = Object.assign({ isStreamlitMessage: true, type: type }, data || {});
+          window.parent.postMessage(payload, "*");
+        }
+
+        function setFrameHeight(height) {
+          send("streamlit:setFrameHeight", { height: height });
+        }
+
+        function setComponentValue(value) {
+          send("streamlit:setComponentValue", { value: value, dataType: "json" });
+        }
+
+        function hideOwnIframe() {
+          var iframe = window.frameElement;
+          if (!iframe) return;
+          iframe.setAttribute("data-canvas-command-picker-frame", "1");
+          iframe.style.cssText =
+            "position:absolute!important;width:0!important;height:0!important;" +
+            "border:0!important;margin:0!important;padding:0!important;" +
+            "visibility:hidden!important;pointer-events:none!important;";
+          var wrap = iframe.parentElement;
+          if (wrap) {
+            wrap.style.cssText =
+              "height:0!important;min-height:0!important;margin:0!important;" +
+              "padding:0!important;overflow:hidden!important;border:0!important;";
+          }
+        }
+
+        function parentWin() {
+          try {
+            if (window.parent && window.parent !== window) return window.parent;
+          } catch (err) {}
+          return window;
+        }
+
+        function parentDoc() {
+          try {
+            var doc = parentWin().document;
+            if (doc && doc.documentElement) return doc;
+          } catch (err) {}
+          return null;
+        }
+
+        function themeVars(theme) {
+          theme = theme || {};
+          return {
+            background: theme.backgroundColor || "var(--background-color, #ffffff)",
+            secondary: theme.secondaryBackgroundColor || "var(--secondary-background-color, #f0f2f6)",
+            text: theme.textColor || "var(--text-color, #31333f)",
+            primary: theme.primaryColor || "var(--primary-color, #ff4b4b)",
+            font: theme.font || "Source Sans, Source Sans 3, sans-serif",
+            border: "rgba(49, 51, 63, 0.2)",
+          };
+        }
+
+        function ensureStyle(doc, styleId, css) {
+          var el = doc.getElementById(styleId);
+          if (!el) {
+            el = doc.createElement("style");
+            el.id = styleId;
+            doc.head.appendChild(el);
+          }
+          el.textContent = css;
+        }
+
+        function chromeCss(theme) {
+          var vars = themeVars(theme);
+          return (
+            '[data-testid="stChatInput"] textarea,' +
+            '[data-testid="stChatInput"] [contenteditable="true"] {' +
+            " padding-left: 2.75rem !important; }\n" +
+            "#canvas-command-picker-host {" +
+            " position: fixed; z-index: 1000030; width: 32px; height: 32px;" +
+            " pointer-events: auto; }\n" +
+            "#canvas-command-picker-host .command-picker-icon {" +
+            " appearance: none; -webkit-appearance: none; display: inline-flex;" +
+            " align-items: center; justify-content: center; width: 32px; height: 32px;" +
+            " margin: 0; padding: 0; border: 0; border-radius: 0.45rem;" +
+            " background: transparent; color: " +
+            vars.text +
+            "; cursor: pointer; font: inherit; }\n" +
+            "#canvas-command-picker-host .command-picker-icon:hover {" +
+            " background: " +
+            vars.secondary +
+            "; color: " +
+            vars.primary +
+            "; }\n" +
+            "#canvas-command-picker-host .command-picker-icon:focus-visible {" +
+            " outline: 2px solid " +
+            vars.primary +
+            "; outline-offset: 2px; }\n" +
+            "#canvas-command-picker-host .command-picker-icon svg { width: 18px; height: 18px; display: block; }\n" +
+            "#canvas-command-picker-menu {" +
+            " position: fixed; z-index: 1000031; min-width: 280px; max-width: 360px;" +
+            " max-height: 280px; overflow: auto; padding: 0.35rem;" +
+            " border: 1px solid " +
+            vars.border +
+            "; border-radius: 0.6rem; background: " +
+            vars.background +
+            "; color: " +
+            vars.text +
+            "; font-family: " +
+            vars.font +
+            "; box-shadow: 0 8px 24px rgba(49, 51, 63, 0.18); }\n" +
+            "#canvas-command-picker-menu[hidden] { display: none !important; }\n" +
+            "#canvas-command-picker-menu .command-picker-item {" +
+            " appearance: none; -webkit-appearance: none; display: block; width: 100%;" +
+            " text-align: left; margin: 0; padding: 0.45rem 0.6rem; border: 0;" +
+            " border-radius: 0.4rem; background: transparent; color: inherit;" +
+            " font: inherit; cursor: pointer; }\n" +
+            "#canvas-command-picker-menu .command-picker-item[data-active='true']," +
+            "#canvas-command-picker-menu .command-picker-item:hover {" +
+            " background: " +
+            vars.secondary +
+            "; }\n" +
+            "#canvas-command-picker-menu .command-picker-item:focus-visible {" +
+            " outline: 2px solid " +
+            vars.primary +
+            "; outline-offset: -2px; }\n" +
+            "#canvas-command-picker-menu .command-picker-token {" +
+            " display: block; font-weight: 600; font-size: 0.92rem; }\n" +
+            "#canvas-command-picker-menu .command-picker-desc {" +
+            " display: block; font-size: 0.8rem; opacity: 0.8; line-height: 1.35;" +
+            " margin-top: 0.1rem; }\n" +
+            'iframe[data-canvas-command-picker-frame="1"] { display: none !important; }'
+          );
+        }
+
+        function findChatInput(doc) {
+          return doc.querySelector('[data-testid="stChatInput"]');
+        }
+
+        function findChatField(doc) {
+          var chat = findChatInput(doc);
+          if (!chat) return null;
+          return (
+            chat.querySelector("textarea") ||
+            chat.querySelector('[contenteditable="true"]')
+          );
+        }
+
+        function fieldValue(field) {
+          if (!field) return "";
+          if ("value" in field && field.value != null) return String(field.value);
+          return String(field.textContent || "");
+        }
+
+        function ensureHost(doc) {
+          var host = doc.getElementById(liveHostId);
+          if (!host) {
+            host = doc.createElement("div");
+            host.id = liveHostId;
+            host.setAttribute("data-canvas-command-picker", "1");
+            doc.body.appendChild(host);
+          }
+          return host;
+        }
+
+        function ensureMenu(doc) {
+          var menu = doc.getElementById(liveMenuId);
+          if (!menu) {
+            menu = doc.createElement("div");
+            menu.id = liveMenuId;
+            menu.setAttribute("role", "listbox");
+            menu.setAttribute("aria-label", "Commands");
+            menu.hidden = true;
+            doc.body.appendChild(menu);
+          }
+          return menu;
+        }
+
+        function placeChrome(doc) {
+          var chat = findChatInput(doc);
+          var host = doc.getElementById(liveHostId);
+          var menu = doc.getElementById(liveMenuId);
+          if (!chat || !host) return;
+          var rect = chat.getBoundingClientRect();
+          var size = 32;
+          host.style.left = Math.round(rect.left + 10) + "px";
+          host.style.top = Math.round(rect.top + (rect.height - size) / 2) + "px";
+          if (menu && !menu.hidden) {
+            var menuWidth = Math.min(360, Math.max(280, rect.width));
+            menu.style.width = menuWidth + "px";
+            menu.style.left = Math.round(rect.left) + "px";
+            menu.style.bottom = Math.round(window.innerHeight - rect.top + 8) + "px";
+            menu.style.top = "auto";
+          }
+        }
+
+        function visibleCommands(query) {
+          var text = (query || "").replace(/^\s+/, "");
+          if (!text.startsWith("/")) {
+            return iconOpen ? liveCommands.slice() : [];
+          }
+          var first = text.split(/\s/, 1)[0];
+          var typed = first.slice(1).toLowerCase();
+          if (!typed) return liveCommands.slice();
+          return liveCommands.filter(function (cmd) {
+            return cmd.token.indexOf(typed) === 0;
+          });
+        }
+
+        function currentQuery(doc) {
+          return fieldValue(findChatField(doc));
+        }
+
+        function menuShouldShow(doc) {
+          if (iconOpen) return true;
+          return currentQuery(doc).replace(/^\s+/, "").indexOf("/") === 0;
+        }
+
+        function closeMenu(doc) {
+          iconOpen = false;
+          highlight = -1;
+          var menu = doc.getElementById(liveMenuId);
+          if (menu) menu.hidden = true;
+          var btn = doc.querySelector("#" + liveHostId + " .command-picker-icon");
+          if (btn) btn.setAttribute("aria-expanded", "false");
+        }
+
+        function pick(doc, token) {
+          closeMenu(doc);
+          var field = findChatField(doc);
+          if (field && "value" in field) {
+            try {
+              var setter = Object.getOwnPropertyDescriptor(
+                field.constructor.prototype,
+                "value"
+              );
+              if (setter && setter.set) setter.set.call(field, "/" + token + " ");
+              else field.value = "/" + token + " ";
+              field.dispatchEvent(new Event("input", { bubbles: true }));
+              field.focus();
+            } catch (err) {
+              try {
+                field.focus();
+              } catch (focusErr) {}
+            }
+          }
+          setComponentValue({ insert: token, seq: Date.now() });
+        }
+
+        function renderMenu(doc) {
+          var menu = ensureMenu(doc);
+          var rows = visibleCommands(currentQuery(doc));
+          while (menu.firstChild) menu.removeChild(menu.firstChild);
+          if (!rows.length || !menuShouldShow(doc)) {
+            menu.hidden = true;
+            return;
+          }
+          if (highlight >= rows.length) highlight = rows.length - 1;
+          rows.forEach(function (cmd, index) {
+            var item = doc.createElement("button");
+            item.type = "button";
+            item.className = "command-picker-item";
+            item.setAttribute("role", "option");
+            item.setAttribute("data-token", cmd.token);
+            item.setAttribute("data-active", index === highlight ? "true" : "false");
+            var token = doc.createElement("span");
+            token.className = "command-picker-token";
+            token.textContent = "/" + cmd.token;
+            var desc = doc.createElement("span");
+            desc.className = "command-picker-desc";
+            desc.textContent = cmd.description || "";
+            item.appendChild(token);
+            item.appendChild(desc);
+            item.addEventListener("click", function (event) {
+              event.preventDefault();
+              event.stopPropagation();
+              pick(doc, cmd.token);
+            });
+            menu.appendChild(item);
+          });
+          menu.hidden = false;
+          var btn = doc.querySelector("#" + liveHostId + " .command-picker-icon");
+          if (btn) btn.setAttribute("aria-expanded", "true");
+          placeChrome(doc);
+        }
+
+        function moveHighlight(doc, delta) {
+          var rows = visibleCommands(currentQuery(doc));
+          if (!rows.length) return;
+          if (highlight < 0) highlight = delta > 0 ? 0 : rows.length - 1;
+          else highlight = (highlight + delta + rows.length) % rows.length;
+          renderMenu(doc);
+          var active = doc.querySelector("#" + liveMenuId + " .command-picker-item[data-active='true']");
+          if (active && active.scrollIntoView) {
+            active.scrollIntoView({ block: "nearest" });
+          }
+        }
+
+        function sparkleSvg(doc) {
+          var svg = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
+          svg.setAttribute("viewBox", "0 0 24 24");
+          svg.setAttribute("aria-hidden", "true");
+          svg.setAttribute("focusable", "false");
+          var path = doc.createElementNS("http://www.w3.org/2000/svg", "path");
+          path.setAttribute(
+            "d",
+            "M12 2.5l1.35 5.1L18.5 9 13.35 10.4 12 15.5l-1.35-5.1L5.5 9l5.15-1.4L12 2.5zm6.5 9.5l.7 2.65L22 15.5l-2.8.85L18.5 19l-.7-2.65L15 15.5l2.8-.85.7-2.65zM5.5 13.5l.55 2.1L8.2 16.2l-2.15.65L5.5 19l-.55-2.15L2.8 16.2l2.15-.6.55-2.1z"
+          );
+          path.setAttribute("fill", "currentColor");
+          svg.appendChild(path);
+          return svg;
+        }
+
+        function bindIcon(doc, button) {
+          button.addEventListener("click", function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            iconOpen = !iconOpen;
+            highlight = iconOpen ? 0 : -1;
+            if (iconOpen) renderMenu(doc);
+            else closeMenu(doc);
+          });
+        }
+
+        function hookPlacement(doc) {
+          if (placeHooked) return;
+          placeHooked = true;
+          var win = parentWin();
+          var onPlace = function () {
+            placeChrome(doc);
+          };
+          try {
+            win.addEventListener("resize", onPlace);
+            win.addEventListener("scroll", onPlace, true);
+            if (win.visualViewport) {
+              win.visualViewport.addEventListener("resize", onPlace);
+            }
+          } catch (err) {}
+        }
+
+        function hookKeys(doc) {
+          if (keyHooked) return;
+          keyHooked = true;
+          doc.addEventListener(
+            "keydown",
+            function (event) {
+              var menu = doc.getElementById(liveMenuId);
+              var open = menu && !menu.hidden;
+              if (!open) return;
+              if (event.key === "Escape") {
+                closeMenu(doc);
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+              }
+              if (event.key === "ArrowDown") {
+                if (!iconOpen && highlight < 0) highlight = -1;
+                moveHighlight(doc, 1);
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+              }
+              if (event.key === "ArrowUp") {
+                moveHighlight(doc, -1);
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+              }
+              if (event.key === "Enter" && highlight >= 0) {
+                var rows = visibleCommands(currentQuery(doc));
+                if (rows[highlight]) {
+                  pick(doc, rows[highlight].token);
+                  event.preventDefault();
+                  event.stopPropagation();
+                }
+              }
+            },
+            true
+          );
+          doc.addEventListener("mousedown", function (event) {
+            var host = doc.getElementById(liveHostId);
+            var menu = doc.getElementById(liveMenuId);
+            var target = event.target;
+            if (host && host.contains(target)) return;
+            if (menu && menu.contains(target)) return;
+            if (menu && !menu.hidden && iconOpen) closeMenu(doc);
+            else if (menu && !menu.hidden && !currentQuery(doc).replace(/^\s+/, "").startsWith("/")) {
+              closeMenu(doc);
+            }
+          });
+        }
+
+        function hookInput(doc) {
+          var field = findChatField(doc);
+          if (!field) return;
+          if (hookedTextarea === field) return;
+          if (hookedTextarea) {
+            try {
+              hookedTextarea.removeEventListener("input", onFieldInput);
+            } catch (err) {}
+          }
+          hookedTextarea = field;
+          inputHooked = true;
+          field.addEventListener("input", onFieldInput);
+        }
+
+        function onFieldInput() {
+          var doc = parentDoc();
+          if (!doc) return;
+          if (!menuShouldShow(doc)) {
+            var menu = doc.getElementById(liveMenuId);
+            if (menu && !iconOpen) menu.hidden = true;
+            return;
+          }
+          if (!iconOpen) highlight = -1;
+          renderMenu(doc);
+        }
+
+        function render(args, theme) {
+          hideOwnIframe();
+          setFrameHeight(0);
+          var doc = parentDoc();
+          if (!doc) return;
+          args = args || {};
+          liveHostId = args.host_id || "canvas-command-picker-host";
+          liveMenuId = args.menu_id || "canvas-command-picker-menu";
+          liveStyleId = args.style_id || "canvas-command-picker-style";
+          liveCommands = Array.isArray(args.commands) ? args.commands : [];
+          liveTheme = theme;
+          ensureStyle(doc, liveStyleId, chromeCss(theme));
+          var host = ensureHost(doc);
+          host.setAttribute("data-canvas-command-picker", "1");
+          while (host.firstChild) host.removeChild(host.firstChild);
+          var button = doc.createElement("button");
+          button.type = "button";
+          button.className = "command-picker-icon";
+          button.setAttribute("aria-label", "Commands");
+          button.setAttribute("title", "Commands");
+          button.setAttribute("aria-haspopup", "listbox");
+          button.setAttribute("aria-expanded", "false");
+          button.setAttribute("aria-controls", liveMenuId);
+          button.appendChild(sparkleSvg(doc));
+          bindIcon(doc, button);
+          host.appendChild(button);
+          ensureMenu(doc);
+          hookPlacement(doc);
+          hookKeys(doc);
+          hookInput(doc);
+          placeChrome(doc);
+          if (menuShouldShow(doc)) renderMenu(doc);
+        }
+
+        window.addEventListener("message", function (event) {
+          var data = event.data || {};
+          if (data.type !== "streamlit:render") return;
+          var args = data.args || {};
+          var key = JSON.stringify(args);
+          if (key === lastArgsKey && lastTheme === data.theme) {
+            var doc = parentDoc();
+            if (doc) {
+              hookInput(doc);
+              placeChrome(doc);
+            }
+            return;
+          }
+          lastArgsKey = key;
+          lastTheme = data.theme;
+          render(args, data.theme);
+        });
+
+        send("streamlit:componentReady", { apiVersion: API });
+        setFrameHeight(0);
+        hideOwnIframe();
+      })();
+    </script>
+  </body>
+</html>

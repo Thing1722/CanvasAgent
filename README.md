@@ -165,20 +165,21 @@ Each new terminal session needs the virtual environment activated again before
 - "Open this PDF: https://..."
 - "What does this assignment formula mean?"
 
-### Slash commands
+### Commands
 
-Type one of these at the start of a message to focus the assistant. The rest of the line is
-ordinary English — no special syntax. A command by itself is fine; the assistant will assume a
-sensible default.
+Click the sparkle icon beside the chat box to insert a command, or type `/` at the start of a
+message. The rest of the line is ordinary English — no special syntax. A command by itself is fine;
+the assistant will assume a sensible default.
 
 | Command | What it focuses on |
 | --- | --- |
-| `/schedule` | Plan upcoming Canvas work at a healthy pace |
-| `/summarize` | What you need to do for a course or assignment |
-| `/exam` | What to study for an upcoming exam |
-| `/deadlines` | What's due soon |
+| `/schedule` | Create a balanced schedule from Canvas deadlines |
+| `/summarize` | Summarize assignment instructions or an opened source |
+| `/exam` | Find and summarize exam-related course materials |
+| `/deadlines` | Find upcoming deadlines |
+| `/files` | Search course files, modules, and linked materials |
 
-Examples: `/schedule help me finish everything at a healthy pace`, `/summarize what I need to do for the CGA`, `/exam what should I study for 21128`.
+Examples: `/schedule plan next week`, `/summarize what I need to do for the CGA`, `/exam what should I study for 21128`.
 
 Anything that does not start with one of these is handled as usual. An unknown `/something` is just
 ordinary text.
@@ -296,6 +297,8 @@ python -m pytest
 | --- | --- |
 | `app.py` | Config, read-only Canvas client, file viewer, tool schemas, DeepSeek client, SQLite history, Streamlit UI, slash-command routing and skill loading |
 | `skills/` | Markdown instruction files the assistant loads (base behavior, Canvas read-only, plus optional task focus) |
+| `command_picker/` | Sparkle icon and command menu beside the chat input (custom Streamlit component) |
+| `files_rail/` | Pinned right-hand files panel (custom Streamlit component) |
 | `requirements.txt` | Runtime dependencies |
 | `requirements-dev.txt` | Test dependencies |
 | `.env.example` | Template for your local `.env` |
