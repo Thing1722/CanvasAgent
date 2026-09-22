@@ -1710,6 +1710,48 @@ def test_agent_turn_executes_tool_calls_then_answers(client_factory):
     assert deepseek.calls[0]["tools"] == app.TOOL_SCHEMAS
 
 
+def test_agent_turn_emits_generic_activity_stages(client_factory):
+    client, _ = client_factory([[{"id": 1, "name": "Course A"}]])
+    deepseek = ScriptedDeepSeek(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "list_my_courses", "arguments": "{}"}}
+                ],
+            },
+            {"role": "assistant", "content": "You are enrolled in Course A."},
+        ]
+    )
+    stages: list[str] = []
+    produced = app.run_agent_turn(
+        deepseek,
+        client,
+        [{"role": "user", "content": "my courses?"}],
+        on_activity=stages.append,
+    )
+    assert stages[0] == app.THINKING_STAGE_THINKING
+    assert app.THINKING_STAGE_CANVAS in stages
+    assert stages[-1] == app.THINKING_STAGE_ANSWER
+    assert "list_my_courses" not in stages
+    assert produced[-1]["content"] == "You are enrolled in Course A."
+    assert all(app.thinking_label(stage) in app.THINKING_LABELS for stage in stages)
+
+
+def test_thinking_copy_is_activity_not_chain_of_thought():
+    joined = " ".join(app.THINKING_LABELS)
+    assert "Thinking…" in joined
+    assert "Checking Canvas…" in joined
+    assert "Preparing your answer…" in joined
+    assert app.THINKING_ARIA_LABEL == "Assistant is working."
+    lowered = joined.lower()
+    assert "chain of thought" not in lowered
+    assert "reasoning" not in lowered
+    assert "tool_call" not in lowered
+    assert app.thinking_placeholder_key(3, 2) == "thinking-3-2"
+
+
 def test_tool_result_has_usable_evidence_distinguishes_empty_error_and_data():
     assert not app.tool_result_has_usable_evidence('{"courses": [], "count": 0}')
     assert not app.tool_result_has_usable_evidence('{"error": "Canvas returned HTTP 404"}')
