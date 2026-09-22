@@ -3,7 +3,10 @@
 A ``declare_component`` iframe holds a real auto-resizing ``<textarea>``.
 Typing a leading ``/`` filters the shared command list in-place. Picking a
 row writes ``/token `` and does not submit. Enter sends ``{submit, seq}``;
-Shift+Enter inserts a newline.
+Shift+Enter inserts a newline. The iframe is pinned to the bottom of the
+main chat: left inset is the Streamlit sidebar, right inset is the files
+rail. ``ResizeObserver`` updates those insets while either rail is dragged
+or collapsed.
 """
 
 from __future__ import annotations

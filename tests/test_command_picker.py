@@ -303,7 +303,15 @@ def test_frontend_owns_a_real_textarea_and_parity_keys():
     assert "function restoreDraft" in html
     assert "function clearDraft" in html
     assert "__canvasCommandPickerDraft" in html
-    assert "setInterval(onPlace" in html
+    assert "function readInsets" in html
+    assert "function observeInsetTargets" in html
+    assert "new win.ResizeObserver" in html
+    assert '[data-testid="stSidebar"]' in html
+    assert '[data-testid="stSidebarCollapseButton"]' in html
+    assert "stSidebarResizeHandle" in html or "userSelect" in html
+    assert "canvas-files-rail-host" in html
+    assert "data-collapsed" in html
+    assert "setInterval(onPlace" not in html
     assert "filterCommands" in html
     assert "ArrowDown" in html
     assert "ArrowUp" in html
@@ -314,6 +322,21 @@ def test_frontend_owns_a_real_textarea_and_parity_keys():
     assert "files.md" not in html
     assert "st.chat_input" not in html
     assert Path(command_picker._component.path) == command_picker.FRONTEND_DIR
+
+
+def test_frontend_tracks_sidebar_and_rail_insets():
+    html = (command_picker.FRONTEND_DIR / "index.html").read_text()
+    assert "function readInsets" in html
+    assert "function observeInsetTargets" in html
+    assert "function schedulePlace" in html
+    assert "ResizeObserver" in html
+    assert "railsAreDragging" in html
+    assert '[data-testid="stSidebar"]' in html
+    assert '[data-testid="stSidebarCollapseButton"]' in html
+    assert "files-rail-toggle" in html
+    assert 'data-inset-left' in html
+    assert 'data-inset-right' in html
+    assert "setInterval(onPlace" not in html
 
 
 def test_main_replaces_st_chat_input_and_keeps_files_rail():

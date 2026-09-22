@@ -159,6 +159,9 @@
         var dismissed = false;
         var highlight = -1;
         var placeHooked = false;
+        var insetRO = null;
+        var observedNodes = [];
+        var placeRaf = 0;
         var built = false;
         var localBusy = false;
         var LINE = 22;
@@ -234,27 +237,38 @@
           el.textContent = css;
         }
 
-        function sidebarLeft(doc) {
+        function readInsets(doc) {
+          var win = parentWin();
+          var vw = win.innerWidth || (doc.documentElement && doc.documentElement.clientWidth) || 0;
+          var left = 0;
           var sidebar = doc.querySelector('[data-testid="stSidebar"]');
           if (sidebar) {
-            var rect = sidebar.getBoundingClientRect();
-            if (rect.width > 8 && rect.right > 0) return Math.round(rect.right);
+            var expanded = sidebar.getAttribute("aria-expanded");
+            var sr = sidebar.getBoundingClientRect();
+            var visible =
+              expanded !== "false" &&
+              sr.width > 8 &&
+              sr.right > 8 &&
+              sr.left < vw / 2;
+            if (visible) left = Math.round(sr.right);
           }
-          return 0;
+          var right = 0;
+          var rail = doc.getElementById("canvas-files-rail-host");
+          if (rail && rail.getAttribute("data-collapsed") !== "true") {
+            var rr = rail.getBoundingClientRect();
+            if (rr.width > 8 && rr.left < vw) {
+              right = Math.round(Math.max(0, vw - rr.left));
+            }
+          }
+          return { left: left, right: right, vw: vw };
+        }
+
+        function sidebarLeft(doc) {
+          return readInsets(doc).left;
         }
 
         function railRight(doc) {
-          var rail = doc.getElementById("canvas-files-rail-host");
-          if (rail && rail.getAttribute("data-collapsed") !== "true") {
-            var width = rail.getBoundingClientRect().width;
-            if (width > 8) return Math.round(width);
-          }
-          var raw = "";
-          try {
-            raw = parentWin().getComputedStyle(doc.documentElement).getPropertyValue("--canvas-files-rail-width");
-          } catch (err) {}
-          var n = parseInt(raw, 10);
-          return isFinite(n) ? n : 0;
+          return readInsets(doc).right;
         }
 
         function menuOpen() {
@@ -277,10 +291,13 @@
         function pinIframe(height) {
           var iframe = window.frameElement;
           var doc = parentDoc();
-          var left = doc ? sidebarLeft(doc) : 0;
-          var right = doc ? railRight(doc) : 0;
+          var box = doc ? readInsets(doc) : { left: 0, right: 0, vw: 0 };
+          var left = box.left;
+          var right = box.right;
           if (iframe) {
             iframe.setAttribute("data-canvas-command-picker-frame", "1");
+            iframe.setAttribute("data-inset-left", String(left));
+            iframe.setAttribute("data-inset-right", String(right));
             iframe.style.cssText =
               "position:fixed!important;left:" +
               left +
@@ -555,25 +572,125 @@
           });
         }
 
+        function schedulePlace() {
+          var win = parentWin();
+          if (placeRaf) return;
+          placeRaf = win.requestAnimationFrame(function () {
+            placeRaf = 0;
+            layout();
+          });
+        }
+
+        function observeInsetTargets() {
+          var win = parentWin();
+          var doc = parentDoc();
+          if (!doc || !win.ResizeObserver) return;
+          if (!insetRO) {
+            insetRO = new win.ResizeObserver(function () {
+              schedulePlace();
+            });
+          }
+          var targets = [
+            doc.documentElement,
+            doc.body,
+            doc.querySelector('[data-testid="stSidebar"]'),
+            doc.querySelector('[data-testid="stSidebarContent"]'),
+            doc.querySelector('[data-testid="stAppViewContainer"]'),
+            doc.querySelector('[data-testid="stMain"]'),
+            doc.querySelector('[data-testid="stAppScrollToBottomContainer"]'),
+            doc.getElementById("canvas-files-rail-host"),
+          ];
+          targets.forEach(function (el) {
+            if (!el) return;
+            if (observedNodes.indexOf(el) !== -1) return;
+            try {
+              insetRO.observe(el);
+              observedNodes.push(el);
+            } catch (err) {}
+          });
+        }
+
+        function railsAreDragging(doc) {
+          var rail = doc.getElementById("canvas-files-rail-host");
+          if (rail && rail.getAttribute("data-resizing") === "true") return true;
+          var sidebar = doc.querySelector('[data-testid="stSidebar"]');
+          if (sidebar && /none/i.test(sidebar.style.userSelect || "")) return true;
+          return false;
+        }
+
         function hookPlacement() {
           if (placeHooked) return;
           placeHooked = true;
           var win = parentWin();
+          var doc = parentDoc();
           var onPlace = function () {
-            layout();
+            observeInsetTargets();
+            schedulePlace();
           };
           try {
             win.addEventListener("resize", onPlace);
             if (win.visualViewport) win.visualViewport.addEventListener("resize", onPlace);
-            win.setInterval(onPlace, 400);
-            var doc = parentDoc();
-            if (doc && win.MutationObserver) {
-              var obs = new win.MutationObserver(onPlace);
-              obs.observe(doc.documentElement, {
-                attributes: true,
-                attributeFilter: ["style"],
-              });
+            if (doc) {
+              doc.addEventListener(
+                "pointermove",
+                function () {
+                  if (railsAreDragging(doc)) schedulePlace();
+                },
+                true
+              );
+              doc.addEventListener("pointerup", onPlace, true);
+              doc.addEventListener(
+                "click",
+                function (event) {
+                  var target = event.target;
+                  if (!target || !target.closest) return;
+                  if (
+                    target.closest('[data-testid="stSidebarCollapseButton"]') ||
+                    target.closest('[data-testid="stSidebarCollapsedControl"]') ||
+                    target.closest(".files-rail-toggle")
+                  ) {
+                    var n = 0;
+                    var tick = function () {
+                      observeInsetTargets();
+                      schedulePlace();
+                      if (++n < 24) win.setTimeout(tick, 50);
+                    };
+                    tick();
+                  }
+                },
+                true
+              );
+              if (win.MutationObserver) {
+                var obs = new win.MutationObserver(function (records) {
+                  var i;
+                  for (i = 0; i < records.length; i += 1) {
+                    var target = records[i].target;
+                    if (
+                      target &&
+                      target.getAttribute &&
+                      (target.getAttribute("data-canvas-command-picker-frame") === "1" ||
+                        target.id === liveStyleId)
+                    ) {
+                      continue;
+                    }
+                    onPlace();
+                    return;
+                  }
+                });
+                obs.observe(doc.body, {
+                  childList: true,
+                  subtree: true,
+                  attributes: true,
+                  attributeFilter: [
+                    "style",
+                    "data-collapsed",
+                    "aria-expanded",
+                    "data-resizing",
+                  ],
+                });
+              }
             }
+            observeInsetTargets();
           } catch (err) {}
         }
 
