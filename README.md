@@ -227,6 +227,11 @@ submitted (file upload, text entry, a URL, on paper), which file extensions are 
 attempts you get, the rubric, any files attached to the prompt, other http(s) links in the prompt,
 and whether you've submitted yet. Attached files and linked URLs can be opened from there.
 
+The chat shows at most three links, and only for sources the assistant actually opened or used —
+not every Canvas URL a lookup returned. An assignment summary includes one “Open assignment in
+Canvas” link when that assignment is the source; exam-study and course-content answers do not
+automatically link assignment pages.
+
 Ask what you turned in and the assistant GETs only **your** submission (`/submissions/self`): text
 entry, the URL you posted, uploaded files (openable in chat), grader/self comments, and your
 grade/status. It cannot list classmates' work or submit/comment.

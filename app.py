@@ -561,6 +561,21 @@ class _HtmlExtractor(HTMLParser):
 
 FILE_LINK_PATTERN = re.compile(r"/files/(\d+)")
 ASSIGNMENT_URL_PATTERN = re.compile(r"/courses/(\d+)/assignments/(\d+)")
+COURSE_URL_PATTERN = re.compile(r"/courses/(\d+)(?:/|$)")
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+_BARE_HTTP_URL_RE = re.compile(r"(?<!\()(https?://[^\s<>\]\)]+)")
+MAX_DISPLAYED_SOURCE_LINKS = 3
+OPEN_ASSIGNMENT_IN_CANVAS = "Open assignment in Canvas"
+SOURCE_TYPE_ASSIGNMENT = "assignment"
+SOURCE_TYPE_FILE = "file"
+SOURCE_TYPE_URL = "url"
+SOURCE_TYPE_PAGE = "page"
+SOURCE_TYPE_COURSE = "course"
+INTENT_ASSIGNMENT_SUMMARY = "assignment_summary"
+INTENT_EXAM_STUDY = "exam_study"
+INTENT_COURSE_CONTENT = "course_content"
+SOURCE_RECORD_FIELDS = ("title", "source_type", "canonical_url")
+EXPLICIT_OPEN_TOOLS = frozenset({"open_file", "open_url"})
 _MATH_SCRIPT_RE = re.compile(
     r'<script([^>]*type=["\']math/tex[^"\']*["\'][^>]*)>(.*?)</script>',
     re.IGNORECASE | re.DOTALL,
@@ -1898,11 +1913,14 @@ def _open_url_result(client: CanvasClient, url: str) -> dict[str, Any]:
         return {
             "url": raw,
             "assignment": details,
-            "displayed_to_student": True,
+            "displayed_to_student": False,
             "opened_via": "get_assignment_details",
             "note": (
-                "This is a Canvas assignment page. Instructions are shown in the chat. "
-                "Call open_url on any linked_urls, or open_file on attached_files."
+                "This is a Canvas assignment page. html_url is metadata until the "
+                "final answer. Do not dump the assignment object or every linked URL. "
+                "If this assignment is the source of a summary, the UI shows one "
+                f"{OPEN_ASSIGNMENT_IN_CANVAS!r} link. Call open_file on attached_files "
+                "or open_url on linked_urls you actually use."
             ),
         }
 
@@ -1985,7 +2003,14 @@ def dispatch_tool(client: CanvasClient, name: str, arguments: dict[str, Any]) ->
                 "assignment": client.get_assignment_details(
                     assignment_id=int(args["assignment_id"]),
                     course_id=int(args["course_id"]) if args.get("course_id") else None,
-                )
+                ),
+                "displayed_to_student": False,
+                "note": (
+                    "Assignment html_url is metadata. Do not paste every URL or render "
+                    "the whole page. If this assignment is the source of a summary, "
+                    f"the UI shows one {OPEN_ASSIGNMENT_IN_CANVAS!r} link. Open "
+                    "attached files only with open_file when you use them."
+                ),
             }
         if name == "get_my_submission":
             if args.get("assignment_id") in (None, ""):
@@ -2837,6 +2862,380 @@ def _tool_payload(message: dict[str, Any]) -> Any:
         return None
 
 
+def make_source_record(
+    *,
+    title: str,
+    source_type: str,
+    canonical_url: str | None,
+    explicitly_opened: bool = False,
+    used_in_answer: bool = False,
+    from_tool: str | None = None,
+) -> dict[str, Any]:
+    """Title, type, and canonical URL stay separate fields — never a mashed string."""
+    record: dict[str, Any] = {
+        "title": title or "",
+        "source_type": source_type,
+        "canonical_url": (canonical_url or "").strip(),
+        "explicitly_opened": bool(explicitly_opened),
+        "used_in_answer": bool(used_in_answer),
+    }
+    if from_tool:
+        record["from_tool"] = from_tool
+    return record
+
+
+def is_canvas_assignment_url(url: str | None) -> bool:
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    path = urlparse(raw).path or raw
+    return bool(ASSIGNMENT_URL_PATTERN.search(path))
+
+
+def is_canvas_lms_url(url: str | None) -> bool:
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    path = urlparse(raw).path or raw
+    return bool(COURSE_URL_PATTERN.search(path) or ASSIGNMENT_URL_PATTERN.search(path))
+
+
+def _assignment_canonical_url(
+    assignment: dict[str, Any], fallback: str | None = None
+) -> str:
+    return str(assignment.get("html_url") or fallback or "").strip()
+
+
+def _file_canonical_url(file_dict: dict[str, Any], fallback: str | None = None) -> str:
+    return str(
+        file_dict.get("url")
+        or file_dict.get("html_url")
+        or fallback
+        or ""
+    ).strip()
+
+
+def tool_result_should_render_assignment_page(
+    name: str | None, payload: Any
+) -> bool:
+    """Never turn an assignment object in a tool payload into a full page."""
+    return False
+
+
+def tool_result_should_preview_file(name: str | None, payload: Any) -> bool:
+    """File previews only for files the agent explicitly opened."""
+    if not isinstance(payload, dict) or payload.get("error"):
+        return False
+    if name == "open_file" and payload.get("file"):
+        return True
+    if name == "open_url" and payload.get("file"):
+        return True
+    return False
+
+
+def source_records_from_tool_message(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect source metadata from one tool row. Presence is not display."""
+    if message.get("role") != "tool":
+        return []
+    payload = _tool_payload(message)
+    if not isinstance(payload, dict) or payload.get("error"):
+        return []
+    name = message.get("name") or ""
+    records: list[dict[str, Any]] = []
+
+    if name in {"list_upcoming_assignments", "find_due_dates"}:
+        for item in payload.get("assignments") or []:
+            if not isinstance(item, dict):
+                continue
+            url = _assignment_canonical_url(item)
+            if not url:
+                continue
+            records.append(
+                make_source_record(
+                    title=str(item.get("title") or "Assignment"),
+                    source_type=SOURCE_TYPE_ASSIGNMENT,
+                    canonical_url=url,
+                    explicitly_opened=False,
+                    used_in_answer=False,
+                    from_tool=name,
+                )
+            )
+        return records
+
+    if name == "list_my_courses":
+        for item in payload.get("courses") or []:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("html_url") or "").strip()
+            if not url:
+                continue
+            records.append(
+                make_source_record(
+                    title=str(item.get("name") or item.get("course_code") or "Course"),
+                    source_type=SOURCE_TYPE_COURSE,
+                    canonical_url=url,
+                    explicitly_opened=False,
+                    used_in_answer=False,
+                    from_tool=name,
+                )
+            )
+        return records
+
+    if name == "get_assignment_details" and isinstance(payload.get("assignment"), dict):
+        assignment = payload["assignment"]
+        url = _assignment_canonical_url(assignment)
+        records.append(
+            make_source_record(
+                title=str(assignment.get("title") or "Assignment"),
+                source_type=SOURCE_TYPE_ASSIGNMENT,
+                canonical_url=url,
+                explicitly_opened=False,
+                used_in_answer=False,
+                from_tool=name,
+            )
+        )
+        return records
+
+    if name == "open_url" and isinstance(payload.get("assignment"), dict):
+        assignment = payload["assignment"]
+        url = _assignment_canonical_url(assignment, payload.get("url"))
+        records.append(
+            make_source_record(
+                title=str(assignment.get("title") or "Assignment"),
+                source_type=SOURCE_TYPE_ASSIGNMENT,
+                canonical_url=url,
+                explicitly_opened=True,
+                used_in_answer=True,
+                from_tool=name,
+            )
+        )
+        return records
+
+    if name in EXPLICIT_OPEN_TOOLS and isinstance(payload.get("file"), dict):
+        file_dict = payload["file"]
+        url = _file_canonical_url(file_dict, payload.get("url"))
+        records.append(
+            make_source_record(
+                title=str(file_dict.get("filename") or file_dict.get("title") or "File"),
+                source_type=SOURCE_TYPE_FILE,
+                canonical_url=url,
+                explicitly_opened=True,
+                used_in_answer=True,
+                from_tool=name,
+            )
+        )
+        return records
+
+    if name == "open_url":
+        resource = payload.get("resource") if isinstance(payload.get("resource"), dict) else {}
+        url = str(resource.get("url") or payload.get("url") or "").strip()
+        title = str(
+            resource.get("filename")
+            or resource.get("title")
+            or (filename_from_url(url, resource.get("content_type") or "") if url else "")
+            or "Page"
+        )
+        records.append(
+            make_source_record(
+                title=title,
+                source_type=SOURCE_TYPE_URL,
+                canonical_url=url,
+                explicitly_opened=True,
+                used_in_answer=True,
+                from_tool=name,
+            )
+        )
+    return records
+
+
+def collect_source_records(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge source records from a turn, OR-ing opened/used flags on the same URL."""
+    by_key: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for message in messages:
+        for record in source_records_from_tool_message(message):
+            key = record["canonical_url"] or f"{record['source_type']}:{record['title']}"
+            existing = by_key.get(key)
+            if existing is None:
+                by_key[key] = dict(record)
+                order.append(key)
+                continue
+            existing["explicitly_opened"] = existing["explicitly_opened"] or record["explicitly_opened"]
+            existing["used_in_answer"] = existing["used_in_answer"] or record["used_in_answer"]
+            if record.get("title") and (
+                record["explicitly_opened"] or not existing.get("title")
+            ):
+                existing["title"] = record["title"]
+            if record.get("from_tool") in {"get_assignment_details", "open_file", "open_url"}:
+                existing["from_tool"] = record["from_tool"]
+    return [by_key[key] for key in order]
+
+
+def infer_source_intent(
+    user_text: str | None,
+    tool_names: list[str] | None = None,
+) -> str:
+    """Decide assignment-summary vs exam-study / course-content vs general."""
+    skill, remainder = parse_user_message(user_text or "")
+    if skill in {INTENT_ASSIGNMENT_SUMMARY, INTENT_EXAM_STUDY}:
+        return skill
+    names = [name for name in (tool_names or []) if name]
+    name_set = set(names)
+    content_tools = {"find_course_files", "open_file"}
+    if name_set & content_tools and "get_assignment_details" not in name_set:
+        return INTENT_COURSE_CONTENT
+    if "find_course_files" in name_set and "get_assignment_details" in name_set:
+        return INTENT_COURSE_CONTENT
+    if "get_assignment_details" in name_set:
+        return INTENT_ASSIGNMENT_SUMMARY
+    text = (remainder or user_text or "").lower()
+    if any(
+        phrase in text
+        for phrase in ("what to study", "study for", "exam", "study guide", "review session")
+    ):
+        return INTENT_EXAM_STUDY
+    if any(
+        phrase in text
+        for phrase in (
+            "what does this assignment",
+            "what do i need to do",
+            "how do i submit",
+        )
+    ):
+        return INTENT_ASSIGNMENT_SUMMARY
+    return "general"
+
+
+def select_displayed_sources(
+    records: list[dict[str, Any]],
+    *,
+    intent: str | None = None,
+) -> list[dict[str, Any]]:
+    """Keep at most three directly used / explicitly opened sources.
+
+    Exam-study and course-content answers never get automatic assignment-page
+    links. Assignment summaries get at most one Canvas assignment link, and
+    only when that assignment is the used source.
+    """
+    no_auto_assignment = intent in {INTENT_EXAM_STUDY, INTENT_COURSE_CONTENT}
+    displayed: list[dict[str, Any]] = []
+    assignment_added = False
+    for record in records:
+        url = (record.get("canonical_url") or "").strip()
+        if not url:
+            continue
+        is_assignment = record.get("source_type") == SOURCE_TYPE_ASSIGNMENT or is_canvas_assignment_url(
+            url
+        )
+        if is_assignment:
+            if no_auto_assignment:
+                continue
+            if not (record.get("explicitly_opened") or record.get("used_in_answer")):
+                continue
+            if assignment_added:
+                continue
+            displayed.append(record)
+            assignment_added = True
+        else:
+            if not record.get("explicitly_opened"):
+                continue
+            displayed.append(record)
+        if len(displayed) >= MAX_DISPLAYED_SOURCE_LINKS:
+            break
+    return displayed
+
+
+def displayed_sources_for_turn(
+    turn: list[dict[str, Any]],
+    *,
+    user_text: str | None = None,
+) -> list[dict[str, Any]]:
+    records = collect_source_records(turn)
+    tool_names = [
+        str(message.get("name"))
+        for message in turn
+        if message.get("role") == "tool" and message.get("name")
+    ]
+    intent = infer_source_intent(user_text, tool_names)
+    if intent == INTENT_ASSIGNMENT_SUMMARY:
+        for record in records:
+            if record.get("source_type") == SOURCE_TYPE_ASSIGNMENT and record.get("from_tool") in {
+                "get_assignment_details",
+                "open_url",
+            }:
+                record["used_in_answer"] = True
+    return select_displayed_sources(records, intent=intent)
+
+
+def _normalize_source_url(url: str) -> str:
+    return url.rstrip("/").split("?", 1)[0].split("#", 1)[0]
+
+
+def filter_unrelated_canvas_urls(text: str, allowed_urls: set[str] | None = None) -> str:
+    """Drop Canvas course/assignment URLs that are not selected source links."""
+    if not text:
+        return text
+    allowed = {_normalize_source_url(url) for url in (allowed_urls or set()) if url}
+
+    def allowed_url(url: str) -> bool:
+        return _normalize_source_url(url) in allowed
+
+    def replace_md(match: re.Match[str]) -> str:
+        label, url = match.group(1), match.group(2)
+        if is_canvas_lms_url(url) and not allowed_url(url):
+            return label
+        return match.group(0)
+
+    rewritten = _MD_LINK_RE.sub(replace_md, text)
+
+    def replace_bare(match: re.Match[str]) -> str:
+        url = match.group(1)
+        if is_canvas_lms_url(url) and not allowed_url(url):
+            return ""
+        return url
+
+    rewritten = _BARE_HTTP_URL_RE.sub(replace_bare, rewritten)
+    rewritten = re.sub(r"[ \t]+\n", "\n", rewritten)
+    rewritten = re.sub(r"\n{3,}", "\n\n", rewritten)
+    return rewritten.strip()
+
+
+def format_source_link_markdown(record: dict[str, Any]) -> str:
+    url = record.get("canonical_url") or ""
+    if record.get("source_type") == SOURCE_TYPE_ASSIGNMENT or is_canvas_assignment_url(url):
+        label = OPEN_ASSIGNMENT_IN_CANVAS
+    else:
+        label = record.get("title") or url
+    return f"[{label}]({url})"
+
+
+def format_displayed_source_links(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return ""
+    return "\n".join(f"- {format_source_link_markdown(record)}" for record in records)
+
+
+def assistant_content_with_sources(content: str, sources: list[dict[str, Any]]) -> str:
+    """Final-answer text plus at most three curated source links."""
+    allowed = {record["canonical_url"] for record in sources if record.get("canonical_url")}
+    text = filter_unrelated_canvas_urls(content or "", allowed)
+    extra: list[str] = []
+    for record in sources:
+        url = record.get("canonical_url") or ""
+        if not url:
+            continue
+        if url in text or _normalize_source_url(url) in {
+            _normalize_source_url(found) for found in _BARE_HTTP_URL_RE.findall(text)
+        }:
+            continue
+        extra.append(format_source_link_markdown(record))
+        if len(extra) + sum(1 for _ in _MD_LINK_RE.finditer(text)) >= MAX_DISPLAYED_SOURCE_LINKS:
+            break
+    if extra:
+        text = (text.rstrip() + "\n\n" + "\n".join(f"- {line}" for line in extra)).strip()
+    return text
+
+
 def _canvas_file_panel_entry(
     file_dict: dict[str, Any], *, tool_call_id: str | None = None
 ) -> dict[str, Any] | None:
@@ -2953,25 +3352,38 @@ def assistant_is_user_facing(message: dict[str, Any]) -> bool:
 
 
 def render_tool_message(message: dict[str, Any], canvas: CanvasClient | None = None) -> None:
-    """Show student-facing artifacts from a tool row; never dump the JSON payload."""
+    """Show student-facing artifacts from a tool row; never dump the JSON payload.
+
+    Assignment objects and leftover html_urls stay metadata. File previews
+    render only when the agent explicitly opened the file.
+    """
     payload = _tool_payload(message)
     name = message.get("name")
     tool_call_id = message.get("tool_call_id")
     if not canvas or not isinstance(payload, dict) or payload.get("error"):
         return
-    if payload.get("file") and name in {"open_file", "open_url"}:
+    if tool_result_should_render_assignment_page(name, payload):
+        render_assignment_instructions(payload.get("assignment") or {})
+        return
+    if tool_result_should_preview_file(name, payload):
         render_file_preview(canvas, payload, tool_call_id=tool_call_id)
-    elif name == "open_url" and payload.get("assignment"):
-        render_assignment_instructions(payload["assignment"])
-    elif name == "open_url" and payload.get("url"):
+        return
+    if name == "open_url" and payload.get("assignment"):
+        return
+    if name == "open_url" and payload.get("url"):
         render_url_preview(canvas, payload, tool_call_id=tool_call_id)
-    elif name == "get_assignment_details" and (payload.get("assignment") or {}).get("instructions"):
-        render_assignment_instructions(payload["assignment"])
-    elif name == "get_my_submission" and payload.get("submission"):
+        return
+    if name == "get_assignment_details":
+        return
+    if name == "get_my_submission" and payload.get("submission"):
         render_own_submission(canvas, payload["submission"], tool_call_id=tool_call_id)
 
 
-def render_message(message: dict[str, Any], canvas: CanvasClient | None = None) -> None:
+def render_message(
+    message: dict[str, Any],
+    canvas: CanvasClient | None = None,
+    displayed_sources: list[dict[str, Any]] | None = None,
+) -> None:
     """Show one student-facing chat row. A failure here must not kill the page.
 
     Tool-call captions, reasoning, retry text, and Canvas JSON dumps stay out of
@@ -2986,7 +3398,14 @@ def render_message(message: dict[str, Any], canvas: CanvasClient | None = None) 
             if not assistant_is_user_facing(message):
                 return
             with st.chat_message("assistant"):
-                st.markdown(to_streamlit_math(message["content"]))
+                st.markdown(
+                    to_streamlit_math(
+                        assistant_content_with_sources(
+                            message.get("content") or "",
+                            displayed_sources or [],
+                        )
+                    )
+                )
             return
         if role == "user" and message.get("content"):
             with st.chat_message("user"):
@@ -3089,12 +3508,15 @@ def render_turn_traces(turn: list[dict[str, Any]]) -> None:
 
 
 def render_agent_turn(
-    turn: list[dict[str, Any]], canvas: CanvasClient | None = None
+    turn: list[dict[str, Any]],
+    canvas: CanvasClient | None = None,
+    user_text: str | None = None,
 ) -> None:
     """Render one model turn: final answer first, then file previews, then traces."""
+    sources = displayed_sources_for_turn(turn, user_text=user_text)
     for message in turn:
         if assistant_is_user_facing(message):
-            render_message(message, canvas)
+            render_message(message, canvas, displayed_sources=sources)
     for message in turn:
         if message.get("role") == "tool":
             render_message(message, canvas)
@@ -3106,8 +3528,10 @@ def render_conversation(
 ) -> None:
     """Replay stored history without showing tool traces as normal bubbles."""
     index = 0
+    last_user_text: str | None = None
     while index < len(messages):
         if messages[index].get("role") == "user":
+            last_user_text = messages[index].get("content")
             render_message(messages[index], canvas)
             index += 1
             continue
@@ -3115,7 +3539,7 @@ def render_conversation(
         while index < len(messages) and messages[index].get("role") != "user":
             turn.append(messages[index])
             index += 1
-        render_agent_turn(turn, canvas)
+        render_agent_turn(turn, canvas, user_text=last_user_text)
 
 
 def panel_select_key(conversation_id: int) -> str:
@@ -3476,7 +3900,7 @@ def main() -> None:
                 # raise an exception class from a previous script run.
                 st.error(redact(exc))
 
-        render_agent_turn(produced, canvas)
+        render_agent_turn(produced, canvas, user_text=prompt)
         before = [entry["identity"] for entry in st.session_state.get("opened_files") or []]
         after = [entry["identity"] for entry in store.list_opened_files(conversation_id)]
         if after != before:

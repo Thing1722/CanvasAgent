@@ -120,7 +120,10 @@ def test_app_renders_seeded_math_and_assignment_instructions(monkeypatch, tmp_pa
     store.add_message(conversation_id, {"role": "user", "content": "what does the formula mean?"})
     store.add_message(
         conversation_id,
-        {"role": "assistant", "content": r"That is the mass-energy relation $E=mc^2$."},
+        {
+            "role": "assistant",
+            "content": r"That is the mass-energy relation $E=mc^2$ and half is $\frac{1}{2}$.",
+        },
     )
     store.add_message(
         conversation_id,
@@ -132,7 +135,7 @@ def test_app_renders_seeded_math_and_assignment_instructions(monkeypatch, tmp_pa
                 {
                     "assignment": {
                         "title": "Homework 4",
-                        "instructions": r"Compute $\frac{1}{2}$ and then $$ \int_0^1 x\,dx $$.",
+                        "instructions": r"Compute $\int_0^1 x\,dx$ from a leftover assignment object.",
                     }
                 }
             ),
@@ -143,6 +146,8 @@ def test_app_renders_seeded_math_and_assignment_instructions(monkeypatch, tmp_pa
     rendered = " ".join(str(element.value) for element in harness.markdown)
     assert "E=mc^2" in rendered
     assert r"\frac{1}{2}" in rendered or "frac" in rendered
+    # An assignment object in a tool payload must not become a full page preview.
+    assert "leftover assignment object" not in rendered
 
 
 def test_content_preview_handles_html_tex_and_unknown_types():
@@ -903,4 +908,88 @@ def test_file_panel_isolated_when_switching_conversations(monkeypatch, tmp_path)
     opened_files = list(harness.session_state.get("opened_files") or [])
     assert [entry.get("filename") for entry in opened_files] == ["notes.txt"]
     assert not any((box.key or "").startswith("files-sidebar-choice-") for box in harness.selectbox)
+
+
+def test_chat_hides_unrelated_assignment_urls_and_caps_summary_link():
+    """List html_urls stay off-screen; assignment-summary shows one Canvas link."""
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import json
+import sys
+sys.path.insert(0, {repo!r})
+import app
+
+hw4 = "https://canvas.cmu.edu/courses/1/assignments/3100"
+hw5 = "https://canvas.cmu.edu/courses/1/assignments/3101"
+app.render_conversation(
+    [
+        {{"role": "user", "content": "what's due?"}},
+        {{
+            "role": "assistant",
+            "content": "Searching.",
+            "tool_calls": [
+                {{
+                    "id": "call_list",
+                    "type": "function",
+                    "function": {{"name": "list_upcoming_assignments", "arguments": "{{}}"}},
+                }}
+            ],
+        }},
+        {{
+            "role": "tool",
+            "name": "list_upcoming_assignments",
+            "tool_call_id": "call_list",
+            "content": json.dumps(
+                {{
+                    "count": 2,
+                    "assignments": [
+                        {{"title": "Homework 4", "html_url": hw4}},
+                        {{"title": "Homework 5", "html_url": hw5}},
+                    ],
+                }}
+            ),
+        }},
+        {{
+            "role": "assistant",
+            "content": f"Homework 4 and Homework 5 are due. {{hw4}} {{hw5}}",
+        }},
+        {{"role": "user", "content": "/summarize what I need to do for Homework 4"}},
+        {{
+            "role": "assistant",
+            "content": "Looking up the prompt.",
+            "tool_calls": [
+                {{
+                    "id": "call_details",
+                    "type": "function",
+                    "function": {{"name": "get_assignment_details", "arguments": '{{"assignment_id": 3100}}'}},
+                }}
+            ],
+        }},
+        {{
+            "role": "tool",
+            "name": "get_assignment_details",
+            "tool_call_id": "call_details",
+            "content": json.dumps(
+                {{
+                    "assignment": {{
+                        "title": "Homework 4",
+                        "html_url": hw4,
+                        "instructions": "Write 1200 words from a leftover assignment object.",
+                    }}
+                }}
+            ),
+        }},
+        {{"role": "assistant", "content": "Write a 1200-word comparative analysis."}},
+    ]
+)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    visible = _default_visible_text(harness)
+    assert "Homework 4 and Homework 5 are due." in visible
+    assert "Write a 1200-word comparative analysis." in visible
+    assert "leftover assignment object" not in visible
+    assert visible.count("https://canvas.cmu.edu/courses/1/assignments/3100") == 1
+    assert "https://canvas.cmu.edu/courses/1/assignments/3101" not in visible
+    assert visible.count("Open assignment in Canvas") == 1
 
