@@ -64,6 +64,18 @@ def test_frontend_is_a_declare_component_iframe():
     assert "button.files-rail-download" in html
     assert "createElement(\"button\")" in html
     assert "a.files-rail-download" not in html
+    assert "files-rail-preview" in html
+    assert "files-rail-preview-pdf" in html
+    pdf_chunk = html[
+        html.find("#canvas-files-rail-host iframe.files-rail-pdf") : html.find(
+            "#canvas-files-rail-host button.files-rail-download"
+        )
+    ]
+    assert "height: 100%" in pdf_chunk
+    assert "flex: 1 1 auto" in pdf_chunk
+    assert "min-height: 0" in pdf_chunk
+    assert "min(55vh" not in html
+    assert "max-height: 55vh" not in html
     assert "bottom: 0" in html
     assert "height: 100vh" in html
     assert "height: 100dvh" in html

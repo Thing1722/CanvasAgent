@@ -1612,6 +1612,9 @@ def test_files_sidebar_uses_custom_component_not_js_dock():
     assert "border-left: 1px solid" in frontend
     assert "button.files-rail-download" in frontend
     assert "a.files-rail-download" not in frontend
+    assert "files-rail-preview" in frontend
+    assert "min(55vh" not in frontend
+    assert "max-height: 55vh" not in frontend
     assert "bottom: 0" in frontend
     assert "100dvh" in frontend
     assert "position: sticky" not in frontend
