@@ -165,6 +165,24 @@ Each new terminal session needs the virtual environment activated again before
 - "Open this PDF: https://..."
 - "What does this assignment formula mean?"
 
+### Slash commands
+
+Type one of these at the start of a message to focus the assistant. The rest of the line is
+ordinary English — no special syntax. A command by itself is fine; the assistant will assume a
+sensible default.
+
+| Command | What it focuses on |
+| --- | --- |
+| `/schedule` | Plan upcoming Canvas work at a healthy pace |
+| `/summarize` | What you need to do for a course or assignment |
+| `/exam` | What to study for an upcoming exam |
+| `/deadlines` | What's due soon |
+
+Examples: `/schedule help me finish everything at a healthy pace`, `/summarize what I need to do for the CGA`, `/exam what should I study for 21128`.
+
+Anything that does not start with one of these is handled as usual. An unknown `/something` is just
+ordinary text.
+
 It cannot submit work, upload files or message anyone; ask it and it will tell you to do that in
 Canvas yourself. JavaScript-heavy sites and Google Drive / login walls will show as HTML or an
 error, not as a rendered app.
@@ -244,6 +262,10 @@ python -m pytest
 
 ## Troubleshooting
 
+- **"Required skill file ... is missing" / "is empty"** — a file under `skills/` next to `app.py`
+  is gone or blank. Restore it from the repo. The app loads those files from the folder beside
+  `app.py`, not from your current working directory, so `streamlit run` from another folder is
+  fine as long as the `skills/` directory is intact.
 - **"Missing environment variables"** — `.env` is missing, empty, or in a different folder than the
   one you ran `streamlit run app.py` from. The app reads `.env` from the current directory.
 - **"Canvas rejected the API token (401)"** — the token expired or was deleted. Generate a new one
@@ -267,7 +289,8 @@ python -m pytest
 
 | File | Purpose |
 | --- | --- |
-| `app.py` | Everything: config, read-only Canvas client, file viewer, tool schemas, DeepSeek client, SQLite history, Streamlit UI |
+| `app.py` | Config, read-only Canvas client, file viewer, tool schemas, DeepSeek client, SQLite history, Streamlit UI, slash-command routing and skill loading |
+| `skills/` | Markdown instruction files the assistant loads (base behavior, Canvas read-only, plus optional task focus) |
 | `requirements.txt` | Runtime dependencies |
 | `requirements-dev.txt` | Test dependencies |
 | `.env.example` | Template for your local `.env` |
