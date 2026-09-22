@@ -24,6 +24,7 @@
         var keyHooked = false;
         var inputHooked = false;
         var hookedTextarea = null;
+        var ignoreTypeaheadUntil = 0;
 
         function send(type, data) {
           var payload = Object.assign({ isStreamlitMessage: true, type: type }, data || {});
@@ -104,7 +105,9 @@
             " appearance: none; -webkit-appearance: none; display: inline-flex;" +
             " align-items: center; justify-content: center; width: 32px; height: 32px;" +
             " margin: 0; padding: 0; border: 0; border-radius: 0.45rem;" +
-            " background: transparent; color: " +
+            " background: " +
+            vars.secondary +
+            "; color: " +
             vars.text +
             "; cursor: pointer; font: inherit; }\n" +
             "#canvas-command-picker-host .command-picker-icon:hover {" +
@@ -208,9 +211,13 @@
           host.style.top = Math.round(rect.top + (rect.height - size) / 2) + "px";
           if (menu && !menu.hidden) {
             var menuWidth = Math.min(360, Math.max(280, rect.width));
+            var vh =
+              (parentWin().innerHeight ||
+                (doc.documentElement && doc.documentElement.clientHeight) ||
+                0);
             menu.style.width = menuWidth + "px";
             menu.style.left = Math.round(rect.left) + "px";
-            menu.style.bottom = Math.round(window.innerHeight - rect.top + 8) + "px";
+            menu.style.bottom = Math.round(vh - rect.top + 8) + "px";
             menu.style.top = "auto";
           }
         }
@@ -234,6 +241,7 @@
 
         function menuShouldShow(doc) {
           if (iconOpen) return true;
+          if (Date.now() < ignoreTypeaheadUntil) return false;
           return currentQuery(doc).replace(/^\s+/, "").indexOf("/") === 0;
         }
 
@@ -248,6 +256,7 @@
 
         function pick(doc, token) {
           closeMenu(doc);
+          ignoreTypeaheadUntil = Date.now() + 800;
           var field = findChatField(doc);
           if (field && "value" in field) {
             try {

@@ -256,6 +256,8 @@ def test_frontend_is_a_declare_component_iframe():
     assert "scheduling.md" not in html
     assert "files.md" not in html
     assert "doc.body.appendChild(host)" in html
+    assert "parentWin().innerHeight" in html
+    assert "ignoreTypeaheadUntil" in html
     assert Path(command_picker._component.path) == command_picker.FRONTEND_DIR
 
 
