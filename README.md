@@ -262,6 +262,10 @@ python -m pytest
 
 ## Troubleshooting
 
+- **"Required skill file ... is missing" / "is empty"** — a file under `skills/` next to `app.py`
+  is gone or blank. Restore it from the repo. The app loads those files from the folder beside
+  `app.py`, not from your current working directory, so `streamlit run` from another folder is
+  fine as long as the `skills/` directory is intact.
 - **"Missing environment variables"** — `.env` is missing, empty, or in a different folder than the
   one you ran `streamlit run app.py` from. The app reads `.env` from the current directory.
 - **"Canvas rejected the API token (401)"** — the token expired or was deleted. Generate a new one

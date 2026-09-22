@@ -99,6 +99,27 @@ def test_parse_user_message_is_pure_and_does_not_call_a_model():
 # --- composition / loader ----------------------------------------------------
 
 
+def test_packaged_skill_files_exist_and_are_nonempty():
+    skills = Path(app.__file__).resolve().parent / "skills"
+    assert app.SKILLS_DIR == skills
+    assert app.resolve_skills_dir() == skills
+    for filename in SKILL_FILENAMES:
+        path = skills / filename
+        assert path.is_file(), filename
+        assert path.read_text(encoding="utf-8").strip(), filename
+
+
+def test_loader_resolves_via_file_parent_not_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert Path.cwd() == tmp_path
+    assert not (tmp_path / "skills").exists()
+    text = app.load_skill_text("base_behavior")
+    assert "You are a study assistant" in text
+    prompt = app.compose_system_prompt()
+    assert "read-only" in prompt
+    assert "cannot submit" in prompt
+
+
 def test_default_prompt_is_base_plus_readonly_without_task_skills():
     prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
     assert "You are a study assistant" in prompt
@@ -152,26 +173,51 @@ def test_task_skill_cannot_override_readonly(tmp_path):
     assert app.READ_ONLY_PRECEDENCE in prompt
 
 
-def test_missing_skill_file_fallback_does_not_crash_and_stays_readonly(tmp_path):
-    # Empty directory: every load uses the safe fallback.
-    prompt = app.compose_system_prompt(
-        "scheduling",
-        now=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
-        skills_dir=tmp_path,
-    )
-    assert "You are a study assistant" in prompt
-    assert "read-only" in prompt
-    assert "cannot submit" in prompt
-    assert "GET-only" in prompt
-    assert "America/New_York" in prompt
+def test_missing_required_file_is_a_loud_failure(tmp_path):
+    with pytest.raises(app.SkillLoadError, match="base_behavior.md") as missing:
+        app.compose_system_prompt(
+            now=datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc),
+            skills_dir=tmp_path,
+        )
+    assert "missing" in str(missing.value).lower()
+    assert "You are a study assistant" not in str(missing.value)
 
-
-def test_missing_readonly_file_still_includes_readonly_fallback(tmp_path):
     (tmp_path / "base_behavior.md").write_text("You are a study assistant.")
     (tmp_path / "exam_study.md").write_text("Focus on exam scope.")
-    prompt = app.compose_system_prompt("exam_study", skills_dir=tmp_path)
-    assert "cannot submit" in prompt
-    assert "read-only" in prompt
+    with pytest.raises(app.SkillLoadError, match="canvas_read_only.md") as readonly:
+        app.compose_system_prompt("exam_study", skills_dir=tmp_path)
+    assert "missing" in str(readonly.value).lower()
+
+
+def test_empty_required_file_is_a_loud_failure(tmp_path):
+    (tmp_path / "base_behavior.md").write_text("   \n")
+    (tmp_path / "canvas_read_only.md").write_text(
+        "read-only access. cannot submit. Tools are GET-only."
+    )
+    with pytest.raises(app.SkillLoadError, match="base_behavior.md") as empty:
+        app.compose_system_prompt(skills_dir=tmp_path)
+    assert "empty" in str(empty.value).lower()
+
+
+def test_missing_selected_task_skill_is_a_loud_failure(tmp_path):
+    (tmp_path / "base_behavior.md").write_text("You are a study assistant.")
+    (tmp_path / "canvas_read_only.md").write_text(
+        "read-only access. cannot submit. Tools are GET-only."
+    )
+    with pytest.raises(app.SkillLoadError, match="scheduling.md"):
+        app.compose_system_prompt("scheduling", skills_dir=tmp_path)
+
+
+def test_missing_skill_does_not_call_deepseek(tmp_path):
+    deepseek = ScriptedDeepSeek([{"role": "assistant", "content": "should not run"}])
+    with pytest.raises(app.SkillLoadError, match="base_behavior.md"):
+        app.run_agent_turn(
+            deepseek,
+            object(),
+            [{"role": "user", "content": "What's due?"}],
+            skills_dir=tmp_path,
+        )
+    assert deepseek.calls == []
 
 
 # --- agent turn wiring -------------------------------------------------------
@@ -247,9 +293,11 @@ def test_user_facing_path_does_not_leak_skill_filenames_or_file_contents():
     main_src = inspect.getsource(app.main)
     handle = main_src[main_src.index("def handle_prompt") :]
     assert "st.write" not in handle
+    assert "st.error" in handle
     for filename in SKILL_FILENAMES:
         assert filename not in handle
         assert filename not in inspect.getsource(app.parse_user_message)
+        assert filename not in inspect.getsource(app.route_history_for_model)
 
     skill, request = app.parse_user_message("/exam what should I study for 21128")
     assert skill == "exam_study"

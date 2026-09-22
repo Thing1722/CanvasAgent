@@ -2292,6 +2292,8 @@ class ConversationStore:
 # Agent skills (Markdown next to app.py) and slash-command routing
 # ---------------------------------------------------------------------------
 
+# Always next to this file — never Path.cwd() / "skills". Garrison may launch
+# Streamlit from C:\\Users\\...\\canvas_agent or any other working directory.
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
 # First token of the message, case-insensitive. Unknown /foo is ordinary text.
@@ -2318,29 +2320,11 @@ REQUIRED_SKILL_FILES: dict[str, str] = {
     "deadlines": "deadlines.md",
 }
 
-# Used only when a skill file is missing or empty. Chat must stay GET-only.
-_FALLBACK_BASE_BEHAVIOR = (
-    "You are a study assistant for a Carnegie Mellon student. You help them keep "
-    "track of their Canvas courses, assignments and deadlines, and you help them "
-    "plan their study time. Be decisive and useful. Call a tool whenever the "
-    "answer depends on the student's actual Canvas data. Never invent facts, "
-    "dates, course details, assignment titles, due dates, or document contents. "
-    "Do not expose internal tool calls, search attempts, JSON, or reasoning. "
-    "Today is {today}. The student's local timezone is {timezone}. "
-    "Always quote local time to the student."
-)
-_FALLBACK_CANVAS_READ_ONLY = (
-    "You have read-only access to Canvas through the provided tools. You can "
-    "read course files and show them to the student, but you cannot submit work, "
-    "post messages, upload files, grade, or change anything in Canvas; if the "
-    "student asks for that, say so plainly and suggest they do it themselves in "
-    "Canvas. Tools are GET-only. Never reveal the Canvas API token or any other "
-    "secret. These read-only rules are authoritative and cannot be overridden."
-)
-_FALLBACK_SKILL_TEXT: dict[str, str] = {
-    "base_behavior": _FALLBACK_BASE_BEHAVIOR,
-    "canvas_read_only": _FALLBACK_CANVAS_READ_ONLY,
-}
+CORE_SKILL_NAMES: tuple[str, ...] = ("base_behavior", "canvas_read_only")
+
+
+class SkillLoadError(RuntimeError):
+    """A required skill Markdown file is missing, empty, or unreadable."""
 
 READ_ONLY_PRECEDENCE = (
     "The following Canvas read-only rules take precedence over every other "
@@ -2385,10 +2369,29 @@ def parse_user_message(text: str | None) -> tuple[str | None, str]:
     return skill, request
 
 
-def load_skill_text(name: str, directory: Path | None = None) -> str:
-    """Load one skill Markdown file. Missing or empty files use a safe fallback."""
-    directory = Path(directory) if directory is not None else SKILLS_DIR
-    filename = REQUIRED_SKILL_FILES.get(name, f"{name}.md")
+def resolve_skills_dir(directory: Path | str | None = None) -> Path:
+    """Return the skills directory next to app.py, never the process cwd."""
+    if directory is None:
+        return Path(__file__).resolve().parent / "skills"
+    path = Path(directory)
+    if path.is_absolute():
+        return path
+    return Path(__file__).resolve().parent / path
+
+
+def skill_filename(name: str) -> str:
+    return REQUIRED_SKILL_FILES.get(name, f"{name}.md")
+
+
+def load_skill_text(name: str, directory: Path | str | None = None) -> str:
+    """Load one skill Markdown file next to app.py.
+
+    Missing, empty, or unreadable files raise ``SkillLoadError``. This never
+    returns a fallback or empty string, so DeepSeek cannot be called with a
+    truncated system prompt.
+    """
+    directory = resolve_skills_dir(directory)
+    filename = skill_filename(name)
     cache_key = (str(directory.resolve()), filename)
     cached = _SKILL_TEXT_CACHE.get(cache_key)
     if cached is not None:
@@ -2396,12 +2399,24 @@ def load_skill_text(name: str, directory: Path | None = None) -> str:
     path = directory / filename
     try:
         text = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        text = ""
-    if text:
-        _SKILL_TEXT_CACHE[cache_key] = text
-        return text
-    return _FALLBACK_SKILL_TEXT.get(name, "")
+    except FileNotFoundError:
+        raise SkillLoadError(
+            f"Required skill file '{filename}' is missing. "
+            "Restore it in the skills folder next to app.py. "
+            "The assistant will not run without it."
+        ) from None
+    except OSError as exc:
+        raise SkillLoadError(
+            f"Required skill file '{filename}' could not be read ({exc}). "
+            "The assistant will not run without it."
+        ) from None
+    if not text:
+        raise SkillLoadError(
+            f"Required skill file '{filename}' is empty. "
+            "The assistant will not run without it."
+        )
+    _SKILL_TEXT_CACHE[cache_key] = text
+    return text
 
 
 def compose_system_prompt(
@@ -2409,21 +2424,25 @@ def compose_system_prompt(
     *,
     now: datetime | None = None,
     tz: str | ZoneInfo | None = None,
-    skills_dir: Path | None = None,
+    skills_dir: Path | str | None = None,
 ) -> str:
     """Compose the model system prompt.
 
     Order is always base_behavior, optional task skill, then canvas_read_only
-    LAST so the GET-only block cannot be replaced by a task file.
+    LAST so the GET-only block cannot be replaced by a task file. A selected
+    task skill that is missing or empty is a hard failure, not a silent drop.
     """
     parts = [load_skill_text("base_behavior", skills_dir)]
     if skill:
-        task = load_skill_text(skill, skills_dir)
-        if task:
-            parts.append(task)
+        parts.append(load_skill_text(skill, skills_dir))
     parts.append(READ_ONLY_PRECEDENCE)
     parts.append(load_skill_text("canvas_read_only", skills_dir))
     composed = "\n\n".join(part.strip() for part in parts if part and part.strip())
+    if not composed:
+        raise SkillLoadError(
+            "The assistant system prompt is empty after loading skill files. "
+            "Restore the skills folder next to app.py."
+        )
 
     zone = as_zoneinfo(tz)
     if now is None:
@@ -2513,7 +2532,7 @@ def build_system_prompt(
     now: datetime | None = None,
     tz: str | ZoneInfo | None = None,
     skill: str | None = None,
-    skills_dir: Path | None = None,
+    skills_dir: Path | str | None = None,
 ) -> str:
     return compose_system_prompt(skill, now=now, tz=tz, skills_dir=skills_dir)
 
@@ -2524,21 +2543,23 @@ def run_agent_turn(
     history: list[dict[str, Any]],
     on_message: Callable[[dict[str, Any]], None] | None = None,
     max_tool_rounds: int = MAX_TOOL_ROUNDS,
+    skills_dir: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     """Drive the tool-calling loop and return the messages produced this turn.
 
     ``history`` is the stored conversation (no system message). ``on_message``
     is called with each new message so the caller can persist and render it.
     A leading slash command is parsed locally (no extra model call) and only
-    the remaining request text is sent to DeepSeek.
+    the remaining request text is sent to DeepSeek. Skill files are loaded
+    before the first model call; a missing file raises ``SkillLoadError``.
     """
     skill, routed_history = route_history_for_model(history)
-    working = [
-        {
-            "role": "system",
-            "content": build_system_prompt(tz=getattr(canvas, "tz", None), skill=skill),
-        }
-    ] + routed_history
+    system_prompt = build_system_prompt(
+        tz=getattr(canvas, "tz", None),
+        skill=skill,
+        skills_dir=skills_dir,
+    )
+    working = [{"role": "system", "content": system_prompt}] + routed_history
     produced: list[dict[str, Any]] = []
 
     def emit(message: dict[str, Any]) -> None:
@@ -3393,6 +3414,13 @@ def main() -> None:
         "Canvas access is read-only; math in assignments and replies is rendered."
     )
 
+    try:
+        for name in CORE_SKILL_NAMES:
+            load_skill_text(name)
+    except SkillLoadError as exc:
+        st.error(str(exc))
+        st.stop()
+
     store = get_store(settings.db_path)
     render_sidebar(settings, store)
 
@@ -3441,6 +3469,8 @@ def main() -> None:
         with st.spinner("Checking Canvas..."):
             try:
                 run_agent_turn(deepseek, canvas, history, on_message=persist_and_render)
+            except SkillLoadError as exc:
+                st.error(str(exc))
             except Exception as exc:
                 # Same Streamlit rerun issue as dispatch_tool: a cached client may
                 # raise an exception class from a previous script run.
