@@ -1620,6 +1620,8 @@ def test_files_sidebar_uses_custom_component_not_js_dock():
     assert "100dvh" in frontend
     assert "position: sticky" not in frontend
     assert '[data-testid="stColumn"]' not in frontend
+    assert '[data-testid="stMain"]' in frontend
+    assert "padding-right: var(--canvas-files-rail-width)" in frontend
     assert "chevron_right" not in frontend
     assert "chevron_left" not in frontend
 

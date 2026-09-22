@@ -4,6 +4,8 @@ The visible rail is HTML we own. A ``declare_component`` iframe with a stable
 key stays mounted across Streamlit 1.64 reruns and paints one
 ``#canvas-files-rail-host`` on ``document.body``. Streamlit widgets are never
 moved; collapse / selection / width return through ``setComponentValue``.
+``--canvas-files-rail-width`` is a live right inset on ``stMain`` so the
+transcript shrinks with the rail instead of sliding under it.
 """
 
 from __future__ import annotations

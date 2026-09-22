@@ -43,6 +43,9 @@ def test_frontend_is_a_declare_component_iframe():
     assert files_rail.STYLE_ID in html
     assert "position: fixed" in html
     assert "stAppScrollToBottomContainer" in html
+    assert '[data-testid="stMain"]' in html
+    assert "padding-right: var(--canvas-files-rail-width)" in html
+    assert '[data-testid="stChatMessage"]' in html
     assert "doc.body.appendChild(host)" in html
     assert "files-rail-toggle" in html
     assert "files-rail-chevron" in html
@@ -87,6 +90,17 @@ def test_frontend_is_a_declare_component_iframe():
     assert "chevron_left" not in html
     assert "AppViewContainer" not in html
     assert Path(files_rail._component.path) == files_rail.FRONTEND_DIR
+
+
+def test_frontend_insets_stmain_by_live_rail_width():
+    html = (files_rail.FRONTEND_DIR / "index.html").read_text()
+    main_rule = html[html.find('[data-testid="stMain"]') : html.find('[data-testid="stChatMessage"]')]
+    assert "padding-right: var(--canvas-files-rail-width)" in main_rule
+    assert "box-sizing: border-box" in main_rule
+    assert '[data-testid="stColumn"]' not in html
+    assert "position: sticky" not in html
+    chrome = html[html.find("function chromeCss") : html.find("function applyChrome")]
+    assert "collapsed ? \"0px\"" in chrome or "collapsed ? \"0px\"" in html
 
 
 def test_clamp_width_matches_sidebar_band():
