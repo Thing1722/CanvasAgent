@@ -10,6 +10,7 @@
         overflow: hidden;
         background: transparent;
         height: 100%;
+        min-height: 4.2rem;
       }
       #canvas-command-picker-host {
         box-sizing: border-box;
@@ -18,12 +19,18 @@
         justify-content: flex-end;
         height: 100%;
         width: 100%;
+        min-height: 4.2rem;
         padding: 0 1rem 0.85rem;
         font-family: Source Sans, Source Sans 3, sans-serif;
       }
       #canvas-command-picker-host * { box-sizing: border-box; }
       #canvas-command-picker-host[data-busy="true"] .command-picker-row { opacity: 0.72; }
       #canvas-command-picker-host[data-busy="true"] .command-picker-send { cursor: wait; }
+      #canvas-command-picker-host[data-busy="true"] .command-picker-icon,
+      #canvas-command-picker-host[data-busy="true"] .command-picker-send {
+        display: inline-flex !important;
+        visibility: visible !important;
+      }
       #canvas-command-picker-menu {
         width: 100%;
         min-width: 0;
@@ -79,6 +86,7 @@
         gap: 0.35rem;
         width: 100%;
         min-height: 3.15rem;
+        flex-shrink: 0;
         padding: 0.35rem 0.45rem 0.35rem 0.4rem;
         border-radius: 1.6rem;
         background: var(--picker-secondary, #f0f2f6);
@@ -89,7 +97,9 @@
         appearance: none;
         -webkit-appearance: none;
         flex: 0 0 auto;
-        display: inline-flex;
+        flex-shrink: 0;
+        display: inline-flex !important;
+        visibility: visible !important;
         align-items: center;
         justify-content: center;
         width: 2.15rem;
@@ -168,6 +178,8 @@
         var MAX_LINES = 9;
         var MENU_MAX = 360;
         var PAD = 28;
+        var MIN_BAR = 78;
+        var recoverTicks = 0;
 
         var host = document.getElementById("canvas-command-picker-host");
         var menu = document.getElementById("canvas-command-picker-menu");
@@ -284,11 +296,79 @@
 
         function barHeight() {
           var row = host.querySelector(".command-picker-row");
-          var h = row ? row.getBoundingClientRect().height : 50;
-          return Math.round(h + PAD);
+          var measured = 50;
+          if (row) {
+            measured = Math.max(
+              row.scrollHeight || 0,
+              row.offsetHeight || 0,
+              (row.getBoundingClientRect() && row.getBoundingClientRect().height) || 0,
+              50
+            );
+          }
+          return Math.round(Math.max(MIN_BAR, measured + PAD));
+        }
+
+        function parentCss(height, left, right) {
+          return (
+            "html { --canvas-command-picker-height: " +
+              height +
+              "px; --canvas-command-picker-left: " +
+              left +
+              "px; --canvas-command-picker-right: " +
+              right +
+              "px; }\n" +
+            '[data-testid="stAppScrollToBottomContainer"],' +
+            '[data-testid="stMain"] {' +
+            " padding-bottom: var(--canvas-command-picker-height) !important; }\n" +
+            'iframe[data-canvas-command-picker-frame="1"] {' +
+            " position: fixed !important;" +
+            " left: var(--canvas-command-picker-left) !important;" +
+            " right: var(--canvas-command-picker-right) !important;" +
+            " bottom: 0 !important;" +
+            " width: calc(100% - (var(--canvas-command-picker-left) + var(--canvas-command-picker-right))) !important;" +
+            " height: var(--canvas-command-picker-height) !important;" +
+            " min-height: " +
+            MIN_BAR +
+            "px !important;" +
+            " max-height: none !important;" +
+            " border: 0 !important;" +
+            " display: block !important;" +
+            " visibility: visible !important;" +
+            " z-index: 1000018 !important;" +
+            " background: transparent !important; }\n" +
+            '[data-canvas-command-picker-wrap="1"],' +
+            'div:has(> iframe[data-canvas-command-picker-frame="1"]) {' +
+            " height: 0 !important; min-height: 0 !important; margin: 0 !important;" +
+            " padding: 0 !important; overflow: visible !important; border: 0 !important;" +
+            " display: block !important; }"
+          );
+        }
+
+        function applyImportant(el, name, value) {
+          if (!el || !el.style) return;
+          try {
+            el.style.setProperty(name, value, "important");
+          } catch (err) {
+            el.style[name] = value;
+          }
+        }
+
+        function isPinned(iframe) {
+          if (!iframe) return false;
+          if (iframe.getAttribute("data-canvas-command-picker-frame") !== "1") return false;
+          var pos = "";
+          try {
+            var win = parentWin();
+            if (win.getComputedStyle) pos = win.getComputedStyle(iframe).position || "";
+          } catch (err) {}
+          if (!pos) pos = (iframe.style && iframe.style.position) || "";
+          if (!/fixed/i.test(pos)) return false;
+          var box = iframe.getBoundingClientRect();
+          return !!(box && box.height >= 40 && box.width >= 40);
         }
 
         function pinIframe(height) {
+          height = Math.max(MIN_BAR, Math.round(height || MIN_BAR));
           var iframe = window.frameElement;
           var doc = parentDoc();
           var box = doc ? readInsets(doc) : { left: 0, right: 0, vw: 0 };
@@ -298,36 +378,62 @@
             iframe.setAttribute("data-canvas-command-picker-frame", "1");
             iframe.setAttribute("data-inset-left", String(left));
             iframe.setAttribute("data-inset-right", String(right));
-            iframe.style.cssText =
-              "position:fixed!important;left:" +
-              left +
-              "px!important;right:" +
-              right +
-              "px!important;bottom:0!important;width:calc(100% - " +
-              (left + right) +
-              "px)!important;height:" +
-              height +
-              "px!important;border:0!important;z-index:1000018!important;background:transparent!important;";
+            applyImportant(iframe, "position", "fixed");
+            applyImportant(iframe, "left", left + "px");
+            applyImportant(iframe, "right", right + "px");
+            applyImportant(iframe, "bottom", "0px");
+            applyImportant(
+              iframe,
+              "width",
+              "calc(100% - " + (left + right) + "px)"
+            );
+            applyImportant(iframe, "height", height + "px");
+            applyImportant(iframe, "min-height", MIN_BAR + "px");
+            applyImportant(iframe, "max-height", "none");
+            applyImportant(iframe, "border", "0");
+            applyImportant(iframe, "display", "block");
+            applyImportant(iframe, "visibility", "visible");
+            applyImportant(iframe, "z-index", "1000018");
+            applyImportant(iframe, "background", "transparent");
             var wrap = iframe.parentElement;
             if (wrap) {
-              wrap.style.cssText =
-                "height:0!important;min-height:0!important;margin:0!important;" +
-                "padding:0!important;overflow:visible!important;border:0!important;";
+              wrap.setAttribute("data-canvas-command-picker-wrap", "1");
+              applyImportant(wrap, "height", "0px");
+              applyImportant(wrap, "min-height", "0px");
+              applyImportant(wrap, "margin", "0px");
+              applyImportant(wrap, "padding", "0px");
+              applyImportant(wrap, "overflow", "visible");
+              applyImportant(wrap, "border", "0");
+              applyImportant(wrap, "display", "block");
             }
           }
           if (doc) {
-            ensureParentStyle(
-              doc,
-              "html { --canvas-command-picker-height: " +
-                height +
-                "px; }\n" +
-                '[data-testid="stAppScrollToBottomContainer"],' +
-                '[data-testid="stMain"] {' +
-                " padding-bottom: var(--canvas-command-picker-height) !important; }\n" +
-                'iframe[data-canvas-command-picker-frame="1"] { background: transparent !important; }'
-            );
+            ensureParentStyle(doc, parentCss(height, left, right));
           }
           setFrameHeight(height);
+        }
+
+        function recoverPin() {
+          var iframe = window.frameElement;
+          if (!iframe || !isPinned(iframe)) {
+            layout();
+            return;
+          }
+          var doc = parentDoc();
+          if (doc && !doc.getElementById(liveStyleId)) {
+            layout();
+          }
+        }
+
+        function pulseRecover() {
+          var win = parentWin();
+          recoverTicks = 24;
+          var tick = function () {
+            recoverPin();
+            recoverTicks -= 1;
+            if (recoverTicks > 0) win.setTimeout(tick, 50);
+          };
+          tick();
         }
 
         function layout() {
@@ -345,6 +451,10 @@
           host.setAttribute("aria-busy", localBusy ? "true" : "false");
           sendBtn.disabled = localBusy;
           sendBtn.setAttribute("title", localBusy ? "Checking Canvas…" : "Send");
+          sendBtn.style.display = "inline-flex";
+          iconBtn.style.display = "inline-flex";
+          sendBtn.removeAttribute("hidden");
+          iconBtn.removeAttribute("hidden");
           // Keep the textarea usable so queued keystrokes are not dropped.
           input.removeAttribute("disabled");
         }
@@ -435,6 +545,8 @@
           setComponentValue({ submit: text, seq: Date.now() });
           input.value = "";
           autosize();
+          layout();
+          pulseRecover();
         }
 
         function renderMenu() {
@@ -665,12 +777,15 @@
                   var i;
                   for (i = 0; i < records.length; i += 1) {
                     var target = records[i].target;
+                    if (target && target.id === liveStyleId) {
+                      continue;
+                    }
                     if (
                       target &&
                       target.getAttribute &&
-                      (target.getAttribute("data-canvas-command-picker-frame") === "1" ||
-                        target.id === liveStyleId)
+                      target.getAttribute("data-canvas-command-picker-frame") === "1"
                     ) {
+                      if (!isPinned(target)) onPlace();
                       continue;
                     }
                     onPlace();
@@ -698,6 +813,7 @@
           setBusy(!!busy);
           if (!busy) focusComposer();
           layout();
+          recoverPin();
         }
 
         function render(args, theme) {
@@ -728,8 +844,11 @@
           render(args, data.theme);
         });
 
+        bindOnce();
+        hookPlacement();
+        layout();
         send("streamlit:componentReady", { apiVersion: API });
-        setFrameHeight(78);
+        setFrameHeight(MIN_BAR);
       })();
     </script>
   </body>

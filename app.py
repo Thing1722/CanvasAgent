@@ -2516,6 +2516,26 @@ def picker_key_action(
     return {"kind": "noop", "text": draft}
 
 
+COMMAND_PICKER_GEN_KEY = "command_picker_gen"
+
+
+def command_picker_generation() -> int:
+    """How many submits have been consumed. Bumps the iframe widget key."""
+    return int(st.session_state.get(COMMAND_PICKER_GEN_KEY) or 0)
+
+
+def command_picker_instance_key() -> str:
+    """Unique ``declare_component`` key for the current composer generation."""
+    return command_picker.instance_key(command_picker_generation())
+
+
+def advance_command_picker_generation() -> int:
+    """Retire the iframe that still holds ``{submit, seq}`` so the next mount is empty."""
+    nxt = command_picker_generation() + 1
+    st.session_state[COMMAND_PICKER_GEN_KEY] = nxt
+    return nxt
+
+
 def apply_command_picker_value(value: Any) -> str | None:
     """Return submitted composer text. Inserts never reach Python."""
     if not isinstance(value, dict):
@@ -2533,13 +2553,22 @@ def apply_command_picker_value(value: Any) -> str | None:
 
 def render_command_picker() -> str | None:
     """Mount the custom composer (real textarea + live ``/`` filter). Returns a submit."""
-    pending = apply_command_picker_value(st.session_state.get(command_picker.COMPONENT_KEY))
+    gen = command_picker_generation()
+    key = command_picker.instance_key(gen)
+    pending = apply_command_picker_value(st.session_state.get(key))
     value = command_picker.mount(
         commands=commands_for_picker(),
         placeholder=CHAT_COMPOSER_PLACEHOLDER,
         busy=bool(st.session_state.get("composer_busy")),
+        mount_seq=gen,
+        key=key,
     )
-    return pending or apply_command_picker_value(value)
+    submitted = pending or apply_command_picker_value(value)
+    if submitted:
+        # Next rerun (setComponentValue and the post-turn remount) uses a new
+        # key so Streamlit does not keep an empty iframe stuck on the last value.
+        advance_command_picker_generation()
+    return submitted
 
 
 def resolve_skills_dir(directory: Path | str | None = None) -> Path:

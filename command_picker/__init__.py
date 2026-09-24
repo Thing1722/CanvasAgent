@@ -26,6 +26,18 @@ DEFAULT_PLACEHOLDER = "What's due this week?"
 _component = components.declare_component("command_picker", path=str(FRONTEND_DIR))
 
 
+def instance_key(generation: int = 0) -> str:
+    """Widget key for one composer generation.
+
+    After a submit is consumed, Python advances the generation so Streamlit
+    mounts a fresh iframe instead of one still holding ``{submit, seq}``.
+    """
+    gen = int(generation or 0)
+    if gen <= 0:
+        return COMPONENT_KEY
+    return f"{COMPONENT_KEY}-{gen}"
+
+
 def commands_payload(commands: list[dict[str, Any]]) -> list[dict[str, str]]:
     """Strip anything that is not a user-facing token + description."""
     rows: list[dict[str, str]] = []
@@ -43,6 +55,7 @@ def mount(
     commands: list[dict[str, Any]],
     placeholder: str = DEFAULT_PLACEHOLDER,
     busy: bool = False,
+    mount_seq: int = 0,
     key: str = COMPONENT_KEY,
 ) -> Any:
     """Render the composer. Returns ``{submit, seq}`` only when the user sends."""
@@ -50,6 +63,7 @@ def mount(
         commands=commands_payload(commands),
         placeholder=placeholder or DEFAULT_PLACEHOLDER,
         busy=bool(busy),
+        mount_seq=int(mount_seq or 0),
         host_id=HOST_ID,
         menu_id=MENU_ID,
         style_id=STYLE_ID,
