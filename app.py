@@ -2752,6 +2752,7 @@ THINKING_STAGE_LABELS: dict[str, str] = {
 THINKING_LABELS: tuple[str, ...] = tuple(THINKING_STAGE_LABELS.values())
 THINKING_ARIA_LABEL = "Assistant is working."
 THINKING_STATE_KEY = "assistant_thinking"
+TURN_IN_PROGRESS_KEY = "turn_in_progress"
 
 
 def thinking_label(stage: str | None = None) -> str:
@@ -2771,6 +2772,128 @@ def get_thinking_state() -> dict[str, Any]:
     if isinstance(state, dict):
         return state
     return {"active": False, "label": None, "key": None}
+
+
+def get_turn_in_progress() -> dict[str, Any]:
+    """Session-only in-flight turn. Never written to SQLite."""
+    state = st.session_state.get(TURN_IN_PROGRESS_KEY)
+    if isinstance(state, dict):
+        return state
+    return {"active": False}
+
+
+def turn_is_active(conversation_id: int | None = None) -> bool:
+    state = get_turn_in_progress()
+    if not state.get("active"):
+        return False
+    if conversation_id is None:
+        return True
+    try:
+        return int(state.get("conversation_id") or 0) == int(conversation_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def mark_turn_in_progress(
+    *,
+    conversation_id: int,
+    prompt: str,
+    turn_seq: int,
+    submit_seq: Any = None,
+) -> dict[str, Any]:
+    """Remember an accepted prompt so a Streamlit rerun can restore the spinner."""
+    existing = get_turn_in_progress()
+    same = (
+        existing.get("active")
+        and int(existing.get("conversation_id") or 0) == int(conversation_id)
+        and existing.get("prompt") == prompt
+    )
+    if same:
+        existing["turn_seq"] = int(existing.get("turn_seq") or turn_seq)
+        if submit_seq is not None:
+            existing["submit_seq"] = submit_seq
+        st.session_state[TURN_IN_PROGRESS_KEY] = existing
+        st.session_state.composer_busy = True
+        return existing
+    state = {
+        "active": True,
+        "conversation_id": int(conversation_id),
+        "prompt": prompt,
+        "turn_seq": int(turn_seq),
+        "submit_seq": (
+            submit_seq
+            if submit_seq is not None
+            else st.session_state.get("command_picker_submit_seq")
+        ),
+        "user_persisted": False,
+        "agent_started": False,
+        "error": None,
+    }
+    st.session_state[TURN_IN_PROGRESS_KEY] = state
+    st.session_state.composer_busy = True
+    return state
+
+
+def clear_turn_in_progress() -> None:
+    """Drop the in-flight turn after a final answer or user-facing error."""
+    state = get_turn_in_progress()
+    if state:
+        cleared = dict(state)
+        cleared["active"] = False
+        st.session_state[TURN_IN_PROGRESS_KEY] = cleared
+    st.session_state.composer_busy = False
+
+
+def latest_user_prompt(history: list[dict[str, Any]]) -> str | None:
+    for message in reversed(history):
+        if message.get("role") == "user":
+            content = message.get("content")
+            return content if isinstance(content, str) else None
+    return None
+
+
+def user_prompt_already_accepted(history: list[dict[str, Any]], prompt: str) -> bool:
+    """True when SQLite already has this accepted user turn (rerun / resume)."""
+    return latest_user_prompt(history) == prompt
+
+
+def history_has_final_reply(history: list[dict[str, Any]], prompt: str | None = None) -> bool:
+    """True when the latest user turn already has a student-facing assistant answer."""
+    last_user = None
+    for index, message in enumerate(history):
+        if message.get("role") == "user":
+            last_user = index
+    if last_user is None:
+        return False
+    if prompt is not None and history[last_user].get("content") != prompt:
+        return False
+    return any(assistant_is_user_facing(message) for message in history[last_user + 1 :])
+
+
+def restore_thinking_for_active_turn(
+    conversation_id: int,
+    history: list[dict[str, Any]] | None = None,
+) -> AssistantThinking | None:
+    """Re-create the last-assistant-slot spinner after a rerun. Does not touch SQLite.
+
+    A files-rail click aborts the previous script (typical Streamlit). History
+    replay never stored the indicator, so the next run must build it again from
+    ``turn_in_progress``. Hide it once a final answer or error is already stored.
+    """
+    if not turn_is_active(conversation_id):
+        return None
+    turn = get_turn_in_progress()
+    if turn.get("error"):
+        return None
+    if history is not None and history_has_final_reply(history, turn.get("prompt")):
+        return None
+    with st.chat_message("assistant"):
+        slot = st.empty()
+        thinking = AssistantThinking(
+            slot, conversation_id, turn_seq=int(turn.get("turn_seq") or 0)
+        )
+        thinking.show()
+        return thinking
 
 
 def run_agent_turn(
@@ -3872,14 +3995,47 @@ def handle_user_prompt(
 
     The thinking indicator is a UI placeholder only. Tool-loop messages still go
     to SQLite so the next DeepSeek call has context; the indicator text does not.
+
+    A files-rail click (or any other widget) typically aborts this script mid-turn.
+    ``turn_in_progress`` stays in session_state so the next run can re-show the
+    spinner and finish without inserting a second user row or re-consuming the
+    composer submit seq.
     """
+    already_user = user_prompt_already_accepted(history, prompt)
+    turn_seq = len(history) + (0 if already_user else 1)
+    turn = mark_turn_in_progress(
+        conversation_id=conversation_id,
+        prompt=prompt,
+        turn_seq=turn_seq,
+    )
     st.session_state.composer_busy = True
-    user_message = {"role": "user", "content": prompt}
-    store.add_message(conversation_id, user_message)
-    if not history:
-        store.set_title(conversation_id, prompt.strip().splitlines()[0])
-    render_message(user_message)
-    history.append(user_message)
+
+    if not already_user:
+        user_message = {"role": "user", "content": prompt}
+        store.add_message(conversation_id, user_message)
+        if not history:
+            store.set_title(conversation_id, prompt.strip().splitlines()[0])
+        render_message(user_message)
+        history.append(user_message)
+        turn["user_persisted"] = True
+        st.session_state[TURN_IN_PROGRESS_KEY] = turn
+    else:
+        turn["user_persisted"] = True
+        st.session_state[TURN_IN_PROGRESS_KEY] = turn
+
+    if history_has_final_reply(history, prompt):
+        # Rerun after the model already finished: history replay showed the
+        # answer. Do not start another DeepSeek call for this submit.
+        clear_turn_in_progress()
+        st.session_state.composer_busy = False
+        return
+
+    if turn.get("error"):
+        with st.chat_message("assistant"):
+            st.error(turn["error"])
+        clear_turn_in_progress()
+        st.session_state.composer_busy = False
+        return
 
     produced: list[dict[str, Any]] = []
 
@@ -3891,11 +4047,16 @@ def handle_user_prompt(
         remember_opened_files(store, conversation_id, message)
         produced.append(message)
 
+    finished = False
     with st.chat_message("assistant"):
         slot = st.empty()
-        thinking = AssistantThinking(slot, conversation_id, turn_seq=len(history))
+        thinking = AssistantThinking(
+            slot, conversation_id, turn_seq=int(turn.get("turn_seq") or turn_seq)
+        )
         try:
             with thinking:
+                turn["agent_started"] = True
+                st.session_state[TURN_IN_PROGRESS_KEY] = turn
                 run_agent_turn(
                     deepseek,
                     canvas,
@@ -3904,15 +4065,29 @@ def handle_user_prompt(
                     on_activity=thinking.advance,
                 )
         except SkillLoadError as exc:
+            turn["error"] = str(exc)
+            st.session_state[TURN_IN_PROGRESS_KEY] = turn
             st.error(str(exc))
+            finished = True
         except Exception as exc:
             # Same Streamlit rerun issue as dispatch_tool: a cached client may
             # raise an exception class from a previous script run.
+            # Script-control exceptions (st.rerun / widget abort) inherit
+            # BaseException, so they still unwind without clearing the turn.
+            turn["error"] = redact(exc)
+            st.session_state[TURN_IN_PROGRESS_KEY] = turn
             st.error(redact(exc))
+            finished = True
         else:
             write_assistant_answer(slot, produced, user_text=prompt)
+            finished = True
         finally:
-            st.session_state.composer_busy = False
+            if finished:
+                clear_turn_in_progress()
+                st.session_state.composer_busy = False
+
+    if not finished:
+        return
 
     render_turn_artifacts(produced, canvas)
     # Remount the composer after the turn so focus returns without a click.
@@ -4270,7 +4445,14 @@ def main() -> None:
 
     def handle_prompt(prompt: str | None) -> None:
         if not prompt:
-            return
+            # Files-rail (and other widget) reruns do not re-submit the composer
+            # seq. Resume the accepted turn so the spinner comes back.
+            turn = get_turn_in_progress()
+            if not turn_is_active(conversation_id):
+                return
+            prompt = turn.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                return
         handle_user_prompt(
             prompt,
             store=store,
