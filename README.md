@@ -6,12 +6,13 @@ that can pull up course files and https links, showing PDFs, images, pages and m
 
 It runs entirely on your own machine: a Streamlit web UI in your browser, conversation history in a
 local SQLite file, and **read-only** access to Canvas. Data that leaves your machine goes to the
-Canvas instance you configure, to the DeepSeek API that powers the chat, and — only when you ask
-the assistant to open a link — to that public https URL. The Canvas token is never sent off the
-Canvas origin (redirects included).
+Canvas instance you configure, to the LLM provider you select (DeepSeek, OpenAI, or Anthropic),
+and — only when you ask the assistant to open a link — to that public https URL. The Canvas token
+is never sent off the Canvas origin (redirects included). LLM API keys are never sent to Canvas,
+never stored in SQLite, and never shown in the UI.
 
 - UI: [Streamlit](https://streamlit.io/)
-- LLM: DeepSeek (`deepseek-flash`), with function/tool calling
+- LLM: DeepSeek (`deepseek-flash` by default), OpenAI, or Anthropic Claude, with tool calling
 - Data: Canvas LMS REST API at `https://canvas.cmu.edu` (configurable)
 - History: SQLite (`canvas_assistant.db`)
 - File text extraction: [pypdf](https://pypi.org/project/pypdf/)
@@ -113,13 +114,22 @@ config with `copy .env.example .env`.
 
 | Variable | Required | What it is |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` | yes | DeepSeek API key, from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) |
+| `LLM_PROVIDER` | no | `deepseek` (default), `openai`, or `anthropic`. The app does **not** switch providers if the selected one fails. |
+| `LLM_MODEL` | DeepSeek: no. OpenAI / Anthropic: yes | Model name. DeepSeek defaults to `deepseek-flash`. |
+| `DEEPSEEK_API_KEY` | when `LLM_PROVIDER=deepseek` | DeepSeek API key, from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) |
+| `OPENAI_API_KEY` | when `LLM_PROVIDER=openai` | OpenAI API key, from [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| `ANTHROPIC_API_KEY` | when `LLM_PROVIDER=anthropic` | Anthropic API key, from [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) |
 | `CANVAS_API_TOKEN` | yes | Your Canvas personal access token (below) |
 | `CANVAS_BASE_URL` | no | Canvas instance, defaults to `https://canvas.cmu.edu` |
 | `DEEPSEEK_BASE_URL` | no | Defaults to `https://api.deepseek.com` |
-| `DEEPSEEK_MODEL` | no | Defaults to `deepseek-flash` |
+| `OPENAI_BASE_URL` | no | Defaults to `https://api.openai.com/v1` |
+| `ANTHROPIC_BASE_URL` | no | Defaults to `https://api.anthropic.com` |
+| `DEEPSEEK_MODEL` | no | Older alias for the DeepSeek model if `LLM_MODEL` is unset. Defaults to `deepseek-flash`. |
 | `CANVAS_ASSISTANT_DB` | no | SQLite file path, defaults to `canvas_assistant.db` |
 | `CANVAS_ASSISTANT_TZ` | no | IANA timezone for due dates and "today". Defaults to `America/New_York` (Pittsburgh / Eastern). Do not use a fixed UTC offset; EST/EDT follow the calendar. |
+
+Fill in **only** the API key for the provider you selected. Unused keys can stay blank. Keys are
+read from `.env` or Streamlit secrets; they are never written to the database.
 
 **Where to get a Canvas API token:** sign in at <https://canvas.cmu.edu>, then go to **Account →
 Settings**, scroll to **Approved Integrations**, click **+ New Access Token**, give it a purpose
@@ -257,8 +267,8 @@ not a second `st.sidebar`.
 
 ## Tests
 
-No Canvas or DeepSeek credentials are needed — Canvas HTTP traffic is faked at the transport layer
-and the UI runs through Streamlit's headless test harness.
+No Canvas or LLM credentials are needed — Canvas HTTP traffic is faked at the transport layer,
+LLM provider calls are mocked, and the UI runs through Streamlit's headless test harness.
 
 Activate the venv first (`source .venv/bin/activate` or `.\.venv\Scripts\Activate.ps1`), then:
 
@@ -274,11 +284,17 @@ python -m pytest
   `app.py`, not from your current working directory, so `streamlit run` from another folder is
   fine as long as the `skills/` directory is intact.
 - **"Missing environment variables"** — `.env` is missing, empty, or in a different folder than the
-  one you ran `streamlit run app.py` from. The app reads `.env` from the current directory.
+  one you ran `streamlit run app.py` from. The app reads `.env` from the current directory. Only
+  the selected provider's key (`DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`) and
+  `CANVAS_API_TOKEN` are required.
+- **"Unknown LLM_PROVIDER"** — `LLM_PROVIDER` must be `deepseek`, `openai`, or `anthropic`. The
+  app will not silently pick another provider.
+- **"LLM_MODEL is missing"** — set `LLM_MODEL` when using OpenAI or Anthropic.
 - **"Canvas rejected the API token (401)"** — the token expired or was deleted. Generate a new one
   and update `.env`, then restart the app.
-- **"DeepSeek rejected the API key (401)"** — check `DEEPSEEK_API_KEY`, and that the account has
-  credit.
+- **"DeepSeek rejected the API key (401)"** / **"OpenAI rejected…"** / **"Anthropic rejected…"** —
+  check the selected provider's API key, and that the account has credit. The app does not try
+  another provider.
 - **It can't find a file you know exists** — the assistant searches Files, then Modules, and finds
   assignment attachments through the assignment itself. A file linked only from a Page or an
   Announcement still won't be found unless you paste the URL. Naming the course ("in 76-101")
@@ -296,7 +312,8 @@ python -m pytest
 
 | File | Purpose |
 | --- | --- |
-| `app.py` | Config, read-only Canvas client, file viewer, tool schemas, DeepSeek client, SQLite history, Streamlit UI, slash-command routing and skill loading |
+| `app.py` | Config, read-only Canvas client, file viewer, tool schemas, SQLite history, Streamlit UI, slash-command routing and skill loading |
+| `llm/` | Provider-agnostic `LLMClient` plus DeepSeek, OpenAI, and Anthropic adapters |
 | `skills/` | Markdown instruction files the assistant loads (base behavior, Canvas read-only, plus optional task focus) |
 | `command_picker/` | Custom chat composer: auto-resizing textarea, live `/` filter, optional sparkle menu |
 | `files_rail/` | Pinned right-hand files panel (custom Streamlit component) |

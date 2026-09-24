@@ -6,3 +6,7 @@ python-dotenv>=1.0,<2.0
 pypdf>=5.0,<7.0
 # IANA tz database for zoneinfo on Windows; harmless where the OS already has it.
 tzdata>=2024.1
+# Official provider SDKs are optional. Adapters talk HTTP via requests, so a
+# DeepSeek-only install does not need the openai or anthropic packages.
+# openai>=1.40
+# anthropic>=0.40
