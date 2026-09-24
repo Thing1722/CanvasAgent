@@ -1279,6 +1279,7 @@ class InterruptDeepSeek:
         st.session_state[f"_think_{{n}}"] = dict(app.get_thinking_state())
         st.session_state[f"_busy_{{n}}"] = bool(st.session_state.get("composer_busy"))
         st.session_state[f"_turn_{{n}}"] = dict(app.get_turn_in_progress())
+        st.session_state[f"_stored_at_call_{{n}}"] = store.get_messages(cid)
         if n == 1:
             st.session_state[files_rail.COMPONENT_KEY] = {{
                 "collapsed": True,
@@ -1313,6 +1314,11 @@ st.session_state["_stored"] = store.get_messages(cid)
     harness = AppTest.from_string(script, default_timeout=30).run()
     assert not harness.exception, harness.exception
     assert harness.session_state["_calls"] == 2
+    stored_at_first = harness.session_state["_stored_at_call_1"]
+    stored_at_resume = harness.session_state["_stored_at_call_2"]
+    assert [message["role"] for message in stored_at_first] == ["user"]
+    assert [message["role"] for message in stored_at_resume] == ["user"]
+    assert stored_at_resume[0]["content"] == "when is homework 4 due?"
     first = harness.session_state["_think_1"]
     second = harness.session_state["_think_2"]
     assert first["active"] is True
@@ -1341,6 +1347,79 @@ st.session_state["_stored"] = store.get_messages(cid)
     for label in app.THINKING_LABELS:
         assert label not in contents
     assert app.THINKING_ARIA_LABEL not in contents
+
+
+def test_handle_prompt_none_restarts_complete_when_no_answer(tmp_path):
+    """B: handle_prompt(None) after an aborted turn with no assistant row calls complete()."""
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+class ResumeDeepSeek:
+    def complete(self, messages, tools=None, temperature=0.2):
+        st.session_state["_resume_complete"] = True
+        st.session_state["_resume_stored_before"] = store.get_messages(cid)
+        return {{"role": "assistant", "content": "Homework 4 is due Friday."}}
+
+class FakeCanvas:
+    tz = None
+
+store = app.ConversationStore({db_path!r})
+cid = store.create_conversation("Resume via handle_prompt")
+prompt = "when is homework 4 due?"
+store.add_message(cid, {{"role": "user", "content": prompt}})
+app.mark_turn_in_progress(conversation_id=cid, prompt=prompt, turn_seq=1)
+st.session_state.command_picker_submit_seq = 9
+history = store.get_messages(cid)
+deepseek = ResumeDeepSeek()
+canvas = FakeCanvas()
+
+def handle_prompt(prompt_text):
+    if not prompt_text:
+        turn = app.get_turn_in_progress()
+        if not app.turn_is_active(cid):
+            return
+        prompt_text = turn.get("prompt")
+        if not isinstance(prompt_text, str) or not prompt_text.strip():
+            return
+    app.handle_user_prompt(
+        prompt_text,
+        store=store,
+        conversation_id=cid,
+        history=history,
+        deepseek=deepseek,
+        canvas=canvas,
+        rerun=False,
+    )
+
+handle_prompt(None)
+st.session_state["_stored"] = store.get_messages(cid)
+st.session_state["_after"] = dict(app.get_thinking_state())
+st.session_state["_turn"] = dict(app.get_turn_in_progress())
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    assert harness.session_state["_resume_complete"] is True
+    before = harness.session_state["_resume_stored_before"]
+    assert [message["role"] for message in before] == ["user"]
+    assert before[0]["content"] == "when is homework 4 due?"
+    stored = harness.session_state["_stored"]
+    users = [message["content"] for message in stored if message.get("role") == "user"]
+    assistants = [message["content"] for message in stored if message.get("role") == "assistant"]
+    assert users == ["when is homework 4 due?"]
+    assert assistants == ["Homework 4 is due Friday."]
+    assert harness.session_state["_after"]["active"] is False
+    assert harness.session_state["_turn"]["active"] is False
+    visible = _default_visible_text(harness)
+    assert "Homework 4 is due Friday." in visible
+    assert harness.status == []
+    contents = [message.get("content") or "" for message in stored]
+    for label in app.THINKING_LABELS:
+        assert label not in contents
 
 
 def test_thinking_indicator_restored_on_files_rail_value_change(tmp_path):
