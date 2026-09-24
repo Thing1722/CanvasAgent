@@ -322,11 +322,14 @@ def test_user_facing_path_does_not_leak_skill_filenames_or_file_contents():
         assert "st.markdown" not in source or name == "main"
 
     main_src = inspect.getsource(app.main)
-    handle = main_src[main_src.index("def handle_prompt") :]
+    handle = inspect.getsource(app.handle_user_prompt)
     assert "st.write" not in handle
     assert "st.error" in handle
+    prompt_src = main_src[main_src.index("def handle_prompt") :]
+    assert "st.write" not in prompt_src
     for filename in SKILL_FILENAMES:
         assert filename not in handle
+        assert filename not in prompt_src
         assert filename not in inspect.getsource(app.parse_user_message)
         assert filename not in inspect.getsource(app.route_history_for_model)
 

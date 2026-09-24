@@ -2710,6 +2710,40 @@ def build_system_prompt(
     return compose_system_prompt(skill, now=now, tz=tz, skills_dir=skills_dir)
 
 
+# Activity stages for the student-facing thinking row. Labels stay generic —
+# never tool names, JSON, retries, or model reasoning.
+THINKING_STAGE_THINKING = "thinking"
+THINKING_STAGE_CANVAS = "canvas"
+THINKING_STAGE_ANSWER = "answer"
+THINKING_STAGE_LABELS: dict[str, str] = {
+    THINKING_STAGE_THINKING: "Thinking…",
+    THINKING_STAGE_CANVAS: "Checking Canvas…",
+    THINKING_STAGE_ANSWER: "Preparing your answer…",
+}
+THINKING_LABELS: tuple[str, ...] = tuple(THINKING_STAGE_LABELS.values())
+THINKING_ARIA_LABEL = "Assistant is working."
+THINKING_STATE_KEY = "assistant_thinking"
+
+
+def thinking_label(stage: str | None = None) -> str:
+    """Student-facing activity copy for one workflow stage."""
+    if not stage:
+        return THINKING_STAGE_LABELS[THINKING_STAGE_THINKING]
+    return THINKING_STAGE_LABELS.get(stage, THINKING_STAGE_LABELS[THINKING_STAGE_THINKING])
+
+
+def thinking_placeholder_key(conversation_id: int, turn_seq: int = 0) -> str:
+    """One identity per in-flight turn so Streamlit reruns reuse a single slot."""
+    return f"thinking-{int(conversation_id)}-{int(turn_seq)}"
+
+
+def get_thinking_state() -> dict[str, Any]:
+    state = st.session_state.get(THINKING_STATE_KEY)
+    if isinstance(state, dict):
+        return state
+    return {"active": False, "label": None, "key": None}
+
+
 def run_agent_turn(
     deepseek: DeepSeekClient,
     canvas: CanvasClient,
@@ -2717,15 +2751,28 @@ def run_agent_turn(
     on_message: Callable[[dict[str, Any]], None] | None = None,
     max_tool_rounds: int = MAX_TOOL_ROUNDS,
     skills_dir: Path | str | None = None,
+    on_activity: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Drive the tool-calling loop and return the messages produced this turn.
 
     ``history`` is the stored conversation (no system message). ``on_message``
     is called with each new message so the caller can persist and render it.
+    ``on_activity`` receives generic stage keys (thinking / canvas / answer) so
+    the UI can keep a spinner alive without exposing tool traces.
     A leading slash command is parsed locally (no extra model call) and only
     the remaining request text is sent to DeepSeek. Skill files are loaded
     before the first model call; a missing file raises ``SkillLoadError``.
     """
+
+    def activity(stage: str) -> None:
+        if not on_activity:
+            return
+        try:
+            on_activity(stage)
+        except Exception:
+            logger.exception("Thinking indicator update failed")
+
+    activity(THINKING_STAGE_THINKING)
     skill, routed_history = route_history_for_model(history)
     system_prompt = build_system_prompt(
         tz=getattr(canvas, "tz", None),
@@ -2755,6 +2802,7 @@ def run_agent_turn(
         if not tool_calls:
             return produced
 
+        activity(THINKING_STAGE_CANVAS)
         for call in tool_calls:
             function = call.get("function") or {}
             name = function.get("name", "")
@@ -2774,6 +2822,7 @@ def run_agent_turn(
                     "content": json.dumps(result, default=str),
                 }
             )
+        activity(THINKING_STAGE_ANSWER)
 
     emit(
         {
@@ -3655,6 +3704,40 @@ def render_turn_traces(turn: list[dict[str, Any]]) -> None:
         st.error(redact(exc))
 
 
+def assistant_answer_markdown(
+    turn: list[dict[str, Any]], user_text: str | None = None
+) -> str | None:
+    """Return the student-facing final answer markdown, or None."""
+    sources = displayed_sources_for_turn(turn, user_text=user_text)
+    for message in turn:
+        if assistant_is_user_facing(message):
+            return to_streamlit_math(
+                assistant_content_with_sources(message.get("content") or "", sources)
+            )
+    return None
+
+
+def write_assistant_answer(
+    slot: Any, turn: list[dict[str, Any]], user_text: str | None = None
+) -> bool:
+    """Replace the thinking placeholder with the final answer. Not used for history."""
+    markdown = assistant_answer_markdown(turn, user_text=user_text)
+    if not markdown:
+        return False
+    slot.markdown(markdown)
+    return True
+
+
+def render_turn_artifacts(
+    turn: list[dict[str, Any]], canvas: CanvasClient | None = None
+) -> None:
+    """File previews and the collapsed Details expander; not the thinking row."""
+    for message in turn:
+        if message.get("role") == "tool":
+            render_message(message, canvas)
+    render_turn_traces(turn)
+
+
 def render_agent_turn(
     turn: list[dict[str, Any]],
     canvas: CanvasClient | None = None,
@@ -3665,10 +3748,148 @@ def render_agent_turn(
     for message in turn:
         if assistant_is_user_facing(message):
             render_message(message, canvas, displayed_sources=sources)
-    for message in turn:
-        if message.get("role") == "tool":
-            render_message(message, canvas)
-    render_turn_traces(turn)
+    render_turn_artifacts(turn, canvas)
+
+
+class AssistantThinking:
+    """Native status spinner in the last assistant slot. Never persisted to SQLite.
+
+    Shown with ``st.status`` (running spinner + sequential labels) inside an
+    ``st.empty()`` placeholder so clearing the slot removes it before the
+    answer is written. A second ``show()`` for the same turn is a no-op so
+    Streamlit reruns cannot stack duplicate rows.
+    """
+
+    def __init__(self, slot: Any, conversation_id: int, turn_seq: int = 0) -> None:
+        self.slot = slot
+        self.conversation_id = int(conversation_id)
+        self.turn_seq = int(turn_seq)
+        self.key = thinking_placeholder_key(self.conversation_id, self.turn_seq)
+        self._status: Any = None
+        self._shown = False
+
+    @property
+    def active(self) -> bool:
+        state = get_thinking_state()
+        return bool(state.get("active") and state.get("key") == self.key)
+
+    @property
+    def label(self) -> str | None:
+        return get_thinking_state().get("label")
+
+    def _write_state(self, *, active: bool, label: str | None) -> None:
+        st.session_state[THINKING_STATE_KEY] = {
+            "active": active,
+            "label": label,
+            "key": self.key,
+        }
+
+    def show(self, stage: str = THINKING_STAGE_THINKING) -> "AssistantThinking":
+        label = thinking_label(stage)
+        if self._shown:
+            self.advance(stage)
+            return self
+        self._shown = True
+        with self.slot.container():
+            st.markdown(
+                (
+                    f'<span class="canvas-sr-only" role="status" aria-live="polite">'
+                    f"{html_module.escape(THINKING_ARIA_LABEL)}</span>"
+                    "<style>.canvas-sr-only{position:absolute;width:1px;height:1px;"
+                    "padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);"
+                    "white-space:nowrap;border:0}</style>"
+                ),
+                unsafe_allow_html=True,
+            )
+            # Do not `with st.status`: exiting marks it complete (checkmark).
+            self._status = st.status(label, expanded=False, state="running")
+        self._write_state(active=True, label=label)
+        return self
+
+    def advance(self, stage: str) -> None:
+        if not self._shown:
+            self.show(stage)
+            return
+        label = thinking_label(stage)
+        if self._status is not None:
+            self._status.update(label=label, state="running")
+        self._write_state(active=True, label=label)
+
+    def clear(self) -> None:
+        self.slot.empty()
+        self._status = None
+        self._shown = False
+        self._write_state(active=False, label=None)
+
+    def __enter__(self) -> "AssistantThinking":
+        return self.show()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.clear()
+        return False
+
+
+def handle_user_prompt(
+    prompt: str,
+    *,
+    store: ConversationStore,
+    conversation_id: int,
+    history: list[dict[str, Any]],
+    deepseek: DeepSeekClient,
+    canvas: CanvasClient,
+    rerun: bool = True,
+) -> None:
+    """Persist a submitted prompt, keep a thinking row in the assistant slot, then reply.
+
+    The thinking indicator is a UI placeholder only. Tool-loop messages still go
+    to SQLite so the next DeepSeek call has context; the indicator text does not.
+    """
+    st.session_state.composer_busy = True
+    user_message = {"role": "user", "content": prompt}
+    store.add_message(conversation_id, user_message)
+    if not history:
+        store.set_title(conversation_id, prompt.strip().splitlines()[0])
+    render_message(user_message)
+    history.append(user_message)
+
+    produced: list[dict[str, Any]] = []
+
+    def persist_message(message: dict[str, Any]) -> None:
+        # Keep the full tool loop in SQLite so get_messages can rebuild DeepSeek
+        # context. Student-facing bubbles wait until the turn finishes so the
+        # thinking row covers in-flight progress without being stored.
+        store.add_message(conversation_id, message)
+        remember_opened_files(store, conversation_id, message)
+        produced.append(message)
+
+    with st.chat_message("assistant"):
+        slot = st.empty()
+        thinking = AssistantThinking(slot, conversation_id, turn_seq=len(history))
+        try:
+            with thinking:
+                run_agent_turn(
+                    deepseek,
+                    canvas,
+                    history,
+                    on_message=persist_message,
+                    on_activity=thinking.advance,
+                )
+        except SkillLoadError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            # Same Streamlit rerun issue as dispatch_tool: a cached client may
+            # raise an exception class from a previous script run.
+            st.error(redact(exc))
+        else:
+            write_assistant_answer(slot, produced, user_text=prompt)
+        finally:
+            st.session_state.composer_busy = False
+
+    render_turn_artifacts(produced, canvas)
+    # Remount the composer after the turn so focus returns without a click.
+    # Draft text typed while the agent ran is restored from the parent window.
+    if rerun:
+        st.rerun()
 
 
 def render_conversation(
@@ -4021,41 +4242,14 @@ def main() -> None:
     def handle_prompt(prompt: str | None) -> None:
         if not prompt:
             return
-        st.session_state.composer_busy = True
-        user_message = {"role": "user", "content": prompt}
-        store.add_message(conversation_id, user_message)
-        if not history:
-            store.set_title(conversation_id, prompt.strip().splitlines()[0])
-        render_message(user_message)
-        history.append(user_message)
-
-        produced: list[dict[str, Any]] = []
-
-        def persist_and_render(message: dict[str, Any]) -> None:
-            # Keep the full tool loop in SQLite so get_messages can rebuild DeepSeek
-            # context. Student-facing bubbles wait until the turn finishes so the
-            # final answer appears first (spinner already covers in-flight progress).
-            store.add_message(conversation_id, message)
-            remember_opened_files(store, conversation_id, message)
-            produced.append(message)
-
-        try:
-            with st.spinner("Checking Canvas..."):
-                try:
-                    run_agent_turn(deepseek, canvas, history, on_message=persist_and_render)
-                except SkillLoadError as exc:
-                    st.error(str(exc))
-                except Exception as exc:
-                    # Same Streamlit rerun issue as dispatch_tool: a cached client may
-                    # raise an exception class from a previous script run.
-                    st.error(redact(exc))
-        finally:
-            st.session_state.composer_busy = False
-
-        render_agent_turn(produced, canvas, user_text=prompt)
-        # Remount the composer after the turn so focus returns without a click.
-        # Draft text typed while the agent ran is restored from the parent window.
-        st.rerun()
+        handle_user_prompt(
+            prompt,
+            store=store,
+            conversation_id=conversation_id,
+            history=history,
+            deepseek=deepseek,
+            canvas=canvas,
+        )
 
     # Custom component iframe owns the pinned rail. Native columns cannot stay
     # on screen while the transcript scrolls, and docking Streamlit widgets

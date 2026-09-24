@@ -353,7 +353,9 @@ def test_main_replaces_st_chat_input_and_keeps_files_rail():
     assert not hasattr(app, "insert_command_into_chat")
     assert not hasattr(app, "CHAT_INPUT_KEY")
     # After a reply Streamlit remounts the iframe so focusComposer can run.
-    assert "composer_busy = True" in main_src
-    assert "composer_busy = False" in main_src
-    assert "focus returns" in main_src
-    assert main_src.count("st.rerun()") >= 1
+    turn_src = inspect.getsource(app.handle_user_prompt)
+    assert "composer_busy = True" in turn_src
+    assert "composer_busy = False" in turn_src
+    assert "focus returns" in turn_src
+    assert "st.rerun()" in turn_src
+    assert "handle_user_prompt" in main_src

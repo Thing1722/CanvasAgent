@@ -13,6 +13,10 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import app  # noqa: E402
+
 APP_PATH = str(Path(__file__).resolve().parents[1] / "app.py")
 
 DUMMY_ENV = {
@@ -992,4 +996,267 @@ app.render_conversation(
     assert visible.count("https://canvas.cmu.edu/courses/1/assignments/3100") == 1
     assert "https://canvas.cmu.edu/courses/1/assignments/3101" not in visible
     assert visible.count("Open assignment in Canvas") == 1
+
+
+def test_thinking_indicator_visible_until_cleared():
+    """Leave the assistant-slot status open: spinner + sequential label + aria text."""
+    repo = str(Path(__file__).resolve().parents[1])
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+with st.chat_message("user"):
+    st.markdown("when is homework 4 due?")
+with st.chat_message("assistant"):
+    slot = st.empty()
+    thinking = app.AssistantThinking(slot, conversation_id=7, turn_seq=1)
+    thinking.show()
+    thinking.advance(app.THINKING_STAGE_CANVAS)
+    thinking.show()
+    thinking.advance(app.THINKING_STAGE_ANSWER)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    assert len(harness.status) == 1
+    assert harness.status[0].icon == "spinner"
+    assert harness.status[0].label == app.thinking_label(app.THINKING_STAGE_ANSWER)
+    rendered = " ".join(str(element.value) for element in harness.markdown)
+    assert app.THINKING_ARIA_LABEL in rendered
+    assert len(harness.chat_message) == 2
+    assert harness.chat_message[1].name == "assistant"
+    state = harness.session_state[app.THINKING_STATE_KEY]
+    assert state["active"] is True
+    assert state["key"] == app.thinking_placeholder_key(7, 1)
+
+
+def test_thinking_indicator_appears_during_turn_and_clears_after_success(tmp_path):
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+class SlowDeepSeek:
+    def complete(self, messages, tools=None, temperature=0.2):
+        st.session_state["_during"] = dict(app.get_thinking_state())
+        st.session_state["_during_busy"] = bool(st.session_state.get("composer_busy"))
+        st.session_state["_during_status_label"] = app.get_thinking_state().get("label")
+        return {{"role": "assistant", "content": "Homework 4 is due Friday."}}
+
+class FakeCanvas:
+    tz = None
+
+store = app.ConversationStore({db_path!r})
+cid = store.create_conversation("Thinking chat")
+history = store.get_messages(cid)
+app.handle_user_prompt(
+    "when is homework 4 due?",
+    store=store,
+    conversation_id=cid,
+    history=history,
+    deepseek=SlowDeepSeek(),
+    canvas=FakeCanvas(),
+    rerun=False,
+)
+st.session_state["_after"] = dict(app.get_thinking_state())
+st.session_state["_after_busy"] = bool(st.session_state.get("composer_busy"))
+st.session_state["_stored"] = store.get_messages(cid)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    during = harness.session_state["_during"]
+    assert during["active"] is True
+    assert during["label"] in app.THINKING_LABELS
+    assert harness.session_state["_during_busy"] is True
+    assert harness.status == []
+    visible = _default_visible_text(harness)
+    assert "Homework 4 is due Friday." in visible
+    assert "when is homework 4 due?" in visible
+    assert "Calling" not in visible
+    after = harness.session_state["_after"]
+    assert after["active"] is False
+    assert after["label"] is None
+    assert harness.session_state["_after_busy"] is False
+    stored = harness.session_state["_stored"]
+    contents = [message.get("content") or "" for message in stored]
+    assert "Homework 4 is due Friday." in contents
+    for label in app.THINKING_LABELS:
+        assert label not in contents
+    assert app.THINKING_ARIA_LABEL not in contents
+    assert [message["role"] for message in stored] == ["user", "assistant"]
+
+
+def test_thinking_indicator_clears_after_failure_and_shows_error(tmp_path):
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+class BoomDeepSeek:
+    def complete(self, messages, tools=None, temperature=0.2):
+        st.session_state["_during"] = dict(app.get_thinking_state())
+        raise RuntimeError("model unavailable")
+
+class FakeCanvas:
+    tz = None
+
+store = app.ConversationStore({db_path!r})
+cid = store.create_conversation("Error chat")
+history = store.get_messages(cid)
+app.handle_user_prompt(
+    "when is homework 4 due?",
+    store=store,
+    conversation_id=cid,
+    history=history,
+    deepseek=BoomDeepSeek(),
+    canvas=FakeCanvas(),
+    rerun=False,
+)
+st.session_state["_after"] = dict(app.get_thinking_state())
+st.session_state["_stored"] = store.get_messages(cid)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    assert harness.session_state["_during"]["active"] is True
+    assert harness.status == []
+    assert harness.error
+    assert "model unavailable" in str(harness.error[0].value)
+    stored = harness.session_state["_stored"]
+    contents = [message.get("content") or "" for message in stored]
+    for label in app.THINKING_LABELS:
+        assert label not in contents
+    assert app.THINKING_ARIA_LABEL not in contents
+    assert stored[0]["role"] == "user"
+
+
+def test_thinking_indicator_does_not_duplicate_on_rerun(tmp_path):
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+class InstantDeepSeek:
+    def complete(self, messages, tools=None, temperature=0.2):
+        return {{"role": "assistant", "content": "You are enrolled in Course A."}}
+
+class FakeCanvas:
+    tz = None
+
+store = app.ConversationStore({db_path!r})
+cid = store.create_conversation("Replay chat")
+history = store.get_messages(cid)
+app.handle_user_prompt(
+    "what courses am I in?",
+    store=store,
+    conversation_id=cid,
+    history=history,
+    deepseek=InstantDeepSeek(),
+    canvas=FakeCanvas(),
+    rerun=False,
+)
+# Same-run replay path: history render must not stack another thinking row.
+app.render_conversation(store.get_messages(cid), FakeCanvas())
+with st.chat_message("assistant"):
+    slot = st.empty()
+    thinking = app.AssistantThinking(slot, conversation_id=cid, turn_seq=1)
+    thinking.show()
+    thinking.show()
+    thinking.show(app.THINKING_STAGE_CANVAS)
+st.session_state["_replayed"] = store.get_messages(cid)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    # One leftover status from the explicit second show(); the completed turn added none.
+    assert len(harness.status) == 1
+    assert harness.status[0].icon == "spinner"
+    visible = _default_visible_text(harness)
+    assert visible.count("You are enrolled in Course A.") >= 1
+    stored = harness.session_state["_replayed"]
+    contents = [message.get("content") or "" for message in stored]
+    for label in app.THINKING_LABELS:
+        assert label not in contents
+
+
+def test_thinking_indicator_advances_through_tool_workflow(tmp_path):
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+class TwoStepDeepSeek:
+    def __init__(self):
+        self.n = 0
+
+    def complete(self, messages, tools=None, temperature=0.2):
+        snaps = st.session_state.setdefault("_snaps", [])
+        snaps.append(dict(app.get_thinking_state()))
+        self.n += 1
+        if self.n == 1:
+            return {{
+                "role": "assistant",
+                "content": "Let me look that up.",
+                "reasoning_content": "Call list_my_courses with ZZZ_TOOL_ARG.",
+                "tool_calls": [
+                    {{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {{
+                            "name": "list_my_courses",
+                            "arguments": '{{"ZZZ_TOOL_ARG": 4242}}',
+                        }},
+                    }}
+                ],
+            }}
+        return {{"role": "assistant", "content": "You are enrolled in Course A."}}
+
+class FakeCanvas:
+    tz = None
+
+    def list_courses(self, include_concluded=False):
+        return [{{"id": 1, "name": "Course A"}}]
+
+store = app.ConversationStore({db_path!r})
+cid = store.create_conversation("Tools chat")
+history = store.get_messages(cid)
+app.handle_user_prompt(
+    "what courses am I in?",
+    store=store,
+    conversation_id=cid,
+    history=history,
+    deepseek=TwoStepDeepSeek(),
+    canvas=FakeCanvas(),
+    rerun=False,
+)
+st.session_state["_stored"] = store.get_messages(cid)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    snaps = list(harness.session_state["_snaps"])
+    assert snaps[0]["active"] is True
+    assert snaps[0]["label"] == app.thinking_label(app.THINKING_STAGE_THINKING)
+    assert snaps[-1]["label"] == app.thinking_label(app.THINKING_STAGE_ANSWER)
+    assert harness.status == []
+    visible = _default_visible_text(harness)
+    assert "You are enrolled in Course A." in visible
+    assert "Let me look that up." not in visible
+    assert "ZZZ_TOOL_ARG" not in visible
+    assert "list_my_courses" not in visible
+    stored = harness.session_state["_stored"]
+    contents = [message.get("content") or "" for message in stored]
+    for label in app.THINKING_LABELS:
+        assert label not in contents
+    assert stored[-1]["content"] == "You are enrolled in Course A."
 
