@@ -5363,7 +5363,9 @@ def main() -> None:
     canvas.set_timezone(st.session_state.get("timezone") or settings.timezone)
     try:
         deepseek = get_llm_client(
-            settings, f"{settings.llm_provider}:{settings.model}"
+            settings,
+            f"{settings.llm_provider}:{settings.model}:"
+            f"{settings.deepseek_base_url}:{settings.openai_base_url}:{settings.anthropic_base_url}",
         )
     except LLMConfigError as exc:
         st.error(str(exc))
