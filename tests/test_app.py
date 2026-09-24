@@ -1822,8 +1822,8 @@ def test_agent_turn_system_prompt_follows_canvas_timezone(client_factory):
 
 
 def test_agent_turn_stops_after_max_tool_rounds(client_factory):
-    # Empty course lists are not usable evidence, so the exhausted-loop
-    # fallback may honestly say it could not settle.
+    # Empty course lists produce course_not_found, so the exhausted-loop
+    # reply is a specific outcome message rather than the generic fallback.
     client, _ = client_factory([[] for _ in range(10)])
     loop_reply = {
         "role": "assistant",
@@ -1837,8 +1837,11 @@ def test_agent_turn_stops_after_max_tool_rounds(client_factory):
     assert len(deepseek.calls) == 2
     assert produced[-1]["role"] == "assistant"
     assert json.loads(produced[1]["content"])["count"] == 0
-    assert "could not settle" in produced[-1]["content"]
-    assert produced[-1]["content"] == app.MAX_TOOL_ROUNDS_NO_EVIDENCE
+    lookup = json.loads(produced[1]["content"])["lookup"]
+    assert lookup["outcome"] == app.LOOKUP_OUTCOME_COURSE_NOT_FOUND
+    assert produced[-1]["content"] == app.compose_lookup_reply([lookup], user_text="loop")
+    assert "Here's what I found" not in produced[-1]["content"]
+    assert produced[-1]["content"] != app.GENERIC_LOOKUP_FALLBACK
 
 
 def test_agent_turn_max_rounds_does_not_claim_no_answer_when_tools_found_evidence(client_factory):
@@ -1855,9 +1858,13 @@ def test_agent_turn_max_rounds_does_not_claim_no_answer_when_tools_found_evidenc
     assert len(deepseek.calls) == 2
     assert json.loads(produced[1]["content"])["count"] == 1
     assert produced[-1]["role"] == "assistant"
+    lookup = json.loads(produced[1]["content"])["lookup"]
+    assert lookup["outcome"] == app.LOOKUP_OUTCOME_SUCCESSFUL
+    assert produced[-1]["content"] == app.compose_lookup_reply([lookup], user_text="loop")
     assert "could not settle" not in produced[-1]["content"]
-    assert produced[-1]["content"] == app.MAX_TOOL_ROUNDS_WITH_EVIDENCE
-    assert "Here's what I found" in produced[-1]["content"]
+    assert "Here's what I found" not in produced[-1]["content"]
+    assert produced[-1]["content"] != app.GENERIC_LOOKUP_FALLBACK
+    assert "Course A" in produced[-1]["content"]
 
 
 def test_agent_turn_survives_malformed_tool_arguments(client_factory):

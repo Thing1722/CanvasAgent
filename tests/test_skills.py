@@ -134,6 +134,23 @@ def test_default_prompt_is_base_plus_readonly_without_task_skills():
     assert prompt.count("You are a study assistant") == 1
 
 
+def test_system_prompt_forbids_generic_lookup_fallback():
+    prompt = app.build_system_prompt(datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc))
+    assert "Never use a generic fallback" in prompt
+    assert "course_ambiguous" in prompt
+    assert "do not pretend those alternatives were searched" in prompt
+    assert "Canvas could not be reached" in prompt
+    assert "Never invent a file, course, title, deadline, or search result" in prompt
+    files_prompt = app.build_system_prompt(
+        datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc), skill="files"
+    )
+    assert "resource types were searched" in files_prompt
+    deadlines = app.build_system_prompt(
+        datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc), skill="deadlines"
+    )
+    assert "Never invent due dates" in deadlines
+
+
 def test_task_skill_is_included_only_when_selected():
     prompt = app.build_system_prompt(
         datetime(2026, 9, 21, 9, 0, tzinfo=timezone.utc), skill="scheduling"
