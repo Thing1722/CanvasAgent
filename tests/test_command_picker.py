@@ -258,7 +258,7 @@ def test_ordinary_submit_without_slash():
 def test_app_uses_custom_composer_not_st_chat_input(monkeypatch, tmp_path):
     seen: list[list[dict[str, str]]] = []
 
-    def fake_mount(*, commands, placeholder=None, busy=False, key=command_picker.COMPONENT_KEY):
+    def fake_mount(*, commands, placeholder=None, busy=False, key=command_picker.COMPONENT_KEY, **kwargs):
         seen.append(list(commands))
         return None
 
@@ -274,7 +274,7 @@ def test_app_uses_custom_composer_not_st_chat_input(monkeypatch, tmp_path):
 
 
 def test_app_component_submit_is_not_an_insert(monkeypatch, tmp_path):
-    def fake_mount(*, commands, placeholder=None, busy=False, key=command_picker.COMPONENT_KEY):
+    def fake_mount(*, commands, placeholder=None, busy=False, key=command_picker.COMPONENT_KEY, **kwargs):
         return {"insert": "schedule", "seq": 99}
 
     monkeypatch.setattr(command_picker, "mount", fake_mount)
@@ -283,6 +283,168 @@ def test_app_component_submit_is_not_an_insert(monkeypatch, tmp_path):
     store = app.ConversationStore(str(tmp_path / "history.db"))
     conversation_id = harness.session_state["conversation_id"]
     assert store.get_messages(conversation_id) == []
+
+
+def test_composer_still_renders_send_and_skills_after_prompt(tmp_path):
+    """After handle_prompt, sparkle + send stay in the HTML contract and a second submit works."""
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import command_picker
+import streamlit as st
+
+class InstantDeepSeek:
+    def complete(self, messages, tools=None, temperature=0.2):
+        n = int(st.session_state.get("_turns") or 0) + 1
+        st.session_state["_turns"] = n
+        return {{"role": "assistant", "content": f"Answer {{n}}."}}
+
+class FakeCanvas:
+    tz = None
+
+if "mounts" not in st.session_state:
+    st.session_state.mounts = []
+if "mount_queue" not in st.session_state:
+    st.session_state.mount_queue = []
+
+def fake_mount(*, commands, placeholder=None, busy=False, key=None, mount_seq=0, **kwargs):
+    st.session_state.mounts.append(
+        {{
+            "busy": bool(busy),
+            "key": key,
+            "mount_seq": mount_seq,
+            "tokens": [row["token"] for row in commands],
+        }}
+    )
+    queue = st.session_state.mount_queue
+    if queue:
+        return queue.pop(0)
+    return None
+
+_orig_mount = command_picker.mount
+command_picker.mount = fake_mount
+try:
+    store = app.ConversationStore({db_path!r})
+    cid = store.create_conversation("Composer chat")
+    history = store.get_messages(cid)
+    app.handle_user_prompt(
+        "What's due this week?",
+        store=store,
+        conversation_id=cid,
+        history=history,
+        deepseek=InstantDeepSeek(),
+        canvas=FakeCanvas(),
+        rerun=False,
+    )
+    st.session_state["_idle"] = app.render_command_picker()
+    st.session_state["_after_busy"] = bool(st.session_state.get("composer_busy"))
+    st.session_state["_after_thinking"] = dict(app.get_thinking_state())
+    st.session_state["_key_after_first"] = app.command_picker_instance_key()
+
+    st.session_state.mount_queue.append({{"submit": "and homework 5?", "seq": 2}})
+    second = app.render_command_picker()
+    st.session_state["_second"] = second
+    if second:
+        history = store.get_messages(cid)
+        app.handle_user_prompt(
+            second,
+            store=store,
+            conversation_id=cid,
+            history=history,
+            deepseek=InstantDeepSeek(),
+            canvas=FakeCanvas(),
+            rerun=False,
+        )
+        st.session_state["_remount"] = app.render_command_picker()
+    st.session_state["_stored"] = store.get_messages(cid)
+    st.session_state["_final_busy"] = bool(st.session_state.get("composer_busy"))
+    st.session_state["_final_key"] = app.command_picker_instance_key()
+    st.session_state["_cid"] = cid
+finally:
+    command_picker.mount = _orig_mount
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    html = (command_picker.FRONTEND_DIR / "index.html").read_text()
+    assert 'class="command-picker-send"' in html
+    assert 'class="command-picker-icon"' in html
+    assert 'aria-label="Send"' in html
+    assert 'aria-label="Commands"' in html
+    assert "function recoverPin" in html
+    assert "MIN_BAR" in html
+    assert harness.session_state["_idle"] is None
+    assert harness.session_state["_after_busy"] is False
+    assert harness.session_state["_after_thinking"]["active"] is False
+    assert harness.session_state["_second"] == "and homework 5?"
+    assert harness.session_state["_remount"] is None
+    assert harness.session_state["_final_busy"] is False
+    assert harness.session_state["_final_key"] != harness.session_state["_key_after_first"]
+    mounts = list(harness.session_state["mounts"])
+    assert mounts
+    assert all(mount["busy"] is False for mount in mounts)
+    assert mounts[0]["tokens"] == [command.token for command in app.COMMANDS]
+    stored = harness.session_state["_stored"]
+    users = [message["content"] for message in stored if message.get("role") == "user"]
+    assistants = [message["content"] for message in stored if message.get("role") == "assistant"]
+    assert users == ["What's due this week?", "and homework 5?"]
+    assert assistants == ["Answer 1.", "Answer 2."]
+    for label in app.THINKING_LABELS:
+        assert label not in "".join(str(message.get("content") or "") for message in stored)
+    assert app.THINKING_ARIA_LABEL not in "".join(
+        str(message.get("content") or "") for message in stored
+    )
+
+
+def test_main_second_submit_works_after_first_prompt(monkeypatch, tmp_path):
+    """Full main() path: first component submit remounts idle, second submit is handled."""
+    queue = [{"submit": "What's due this week?", "seq": 1}]
+    mounts: list[dict[str, object]] = []
+
+    def fake_mount(*, commands, placeholder=None, busy=False, key=None, mount_seq=0, **kwargs):
+        mounts.append({"busy": bool(busy), "key": key, "mount_seq": mount_seq})
+        if queue:
+            return queue.pop(0)
+        return None
+
+    class InstantDeepSeek:
+        def complete(self, messages, tools=None, temperature=0.2):
+            return {"role": "assistant", "content": "Friday."}
+
+    class FakeCanvas:
+        tz = None
+
+        def set_timezone(self, tz):
+            self.tz = tz
+
+    monkeypatch.setattr(command_picker, "mount", fake_mount)
+    monkeypatch.setattr(app, "get_deepseek_client", lambda *args, **kwargs: InstantDeepSeek())
+    monkeypatch.setattr(app, "get_canvas_client", lambda *args, **kwargs: FakeCanvas())
+    harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)
+    assert not harness.exception, harness.exception
+    assert mounts
+    assert mounts[-1]["busy"] is False
+    assert mounts[-1]["key"] == command_picker.instance_key(1)
+    html = (command_picker.FRONTEND_DIR / "index.html").read_text()
+    assert 'class="command-picker-send"' in html
+    assert 'class="command-picker-icon"' in html
+    store = app.ConversationStore(str(tmp_path / "history.db"))
+    first = store.get_messages(harness.session_state["conversation_id"])
+    assert [message["content"] for message in first if message["role"] == "user"] == [
+        "What's due this week?"
+    ]
+    queue.append({"submit": "and homework 5?", "seq": 2})
+    harness.run()
+    assert not harness.exception, harness.exception
+    assert mounts[-1]["busy"] is False
+    assert mounts[-1]["key"] == command_picker.instance_key(2)
+    stored = store.get_messages(harness.session_state["conversation_id"])
+    assert [message["content"] for message in stored if message["role"] == "user"] == [
+        "What's due this week?",
+        "and homework 5?",
+    ]
 
 
 def test_frontend_owns_a_real_textarea_and_parity_keys():
@@ -305,6 +467,15 @@ def test_frontend_owns_a_real_textarea_and_parity_keys():
     assert "__canvasCommandPickerDraft" in html
     assert "function readInsets" in html
     assert "function observeInsetTargets" in html
+    assert "function isPinned" in html
+    assert "function recoverPin" in html
+    assert "function pulseRecover" in html
+    assert "function parentCss" in html
+    assert "MIN_BAR" in html
+    assert 'min-height: " +' in html and "MIN_BAR" in html
+    assert "--canvas-command-picker-left" in html
+    assert "data-canvas-command-picker-wrap" in html
+    assert "bindOnce();\n        hookPlacement();" in html
     assert "new win.ResizeObserver" in html
     assert '[data-testid="stSidebar"]' in html
     assert '[data-testid="stSidebarCollapseButton"]' in html
@@ -312,6 +483,8 @@ def test_frontend_owns_a_real_textarea_and_parity_keys():
     assert "canvas-files-rail-host" in html
     assert "data-collapsed" in html
     assert "setInterval(onPlace" not in html
+    assert '[data-busy="true"] .command-picker-send { display: none' not in html
+    assert '[data-busy="true"] .command-picker-icon { display: none' not in html
     assert "filterCommands" in html
     assert "ArrowDown" in html
     assert "ArrowUp" in html
@@ -348,6 +521,8 @@ def test_main_replaces_st_chat_input_and_keeps_files_rail():
     assert "st.columns([2, 1]" not in main_src
     picker_src = inspect.getsource(app.render_command_picker)
     assert "command_picker.mount" in picker_src
+    assert "mount_seq" in picker_src
+    assert "advance_command_picker_generation" in picker_src
     assert "files.md" not in picker_src
     assert "scheduling.md" not in picker_src
     assert not hasattr(app, "insert_command_into_chat")
@@ -359,3 +534,6 @@ def test_main_replaces_st_chat_input_and_keeps_files_rail():
     assert "focus returns" in turn_src
     assert "st.rerun()" in turn_src
     assert "handle_user_prompt" in main_src
+    assert command_picker.instance_key(0) == command_picker.COMPONENT_KEY
+    assert command_picker.instance_key(1) == f"{command_picker.COMPONENT_KEY}-1"
+    assert command_picker.instance_key(2) != command_picker.instance_key(1)
