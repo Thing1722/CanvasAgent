@@ -531,9 +531,15 @@ def test_main_replaces_st_chat_input_and_keeps_files_rail():
     turn_src = inspect.getsource(app.handle_user_prompt)
     assert "composer_busy = True" in turn_src
     assert "composer_busy = False" in turn_src
+    assert "turn_in_progress" in turn_src
+    assert "user_prompt_already_accepted" in turn_src
     assert "focus returns" in turn_src
     assert "st.rerun()" in turn_src
     assert "handle_user_prompt" in main_src
+    handle_src = inspect.getsource(app.main)
+    handle_src = handle_src[handle_src.index("def handle_prompt") :]
+    assert "turn_is_active" in handle_src
+    assert "get_turn_in_progress" in handle_src
     assert command_picker.instance_key(0) == command_picker.COMPONENT_KEY
     assert command_picker.instance_key(1) == f"{command_picker.COMPONENT_KEY}-1"
     assert command_picker.instance_key(2) != command_picker.instance_key(1)

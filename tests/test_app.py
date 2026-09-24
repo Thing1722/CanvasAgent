@@ -1752,6 +1752,55 @@ def test_thinking_copy_is_activity_not_chain_of_thought():
     assert app.thinking_placeholder_key(3, 2) == "thinking-3-2"
 
 
+def test_turn_in_progress_helpers_are_session_only(monkeypatch):
+    class State(dict):
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+    state = State()
+    monkeypatch.setattr(app.st, "session_state", state, raising=False)
+    assert app.turn_is_active() is False
+    turn = app.mark_turn_in_progress(conversation_id=4, prompt="when is homework 4 due?", turn_seq=2)
+    assert turn["active"] is True
+    assert state["composer_busy"] is True
+    assert app.turn_is_active(4) is True
+    assert app.turn_is_active(9) is False
+    again = app.mark_turn_in_progress(
+        conversation_id=4, prompt="when is homework 4 due?", turn_seq=2, submit_seq=7
+    )
+    assert again["submit_seq"] == 7
+    assert again["turn_seq"] == 2
+    app.clear_turn_in_progress()
+    assert app.turn_is_active() is False
+    assert state["composer_busy"] is False
+
+
+def test_history_has_final_reply_and_accepted_user():
+    prompt = "when is homework 4 due?"
+    empty: list[dict] = []
+    assert app.user_prompt_already_accepted(empty, prompt) is False
+    assert app.history_has_final_reply(empty, prompt) is False
+    pending = [{"role": "user", "content": prompt}]
+    assert app.user_prompt_already_accepted(pending, prompt) is True
+    assert app.history_has_final_reply(pending, prompt) is False
+    done = pending + [{"role": "assistant", "content": "Friday."}]
+    assert app.history_has_final_reply(done, prompt) is True
+    tool_only = pending + [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "function": {"name": "list_my_courses", "arguments": "{}"}}],
+        }
+    ]
+    assert app.history_has_final_reply(tool_only, prompt) is False
+
+
 def test_tool_result_has_usable_evidence_distinguishes_empty_error_and_data():
     assert not app.tool_result_has_usable_evidence('{"courses": [], "count": 0}')
     assert not app.tool_result_has_usable_evidence('{"error": "Canvas returned HTTP 404"}')

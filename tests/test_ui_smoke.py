@@ -1260,3 +1260,272 @@ st.session_state["_stored"] = store.get_messages(cid)
         assert label not in contents
     assert stored[-1]["content"] == "You are enrolled in Course A."
 
+
+def test_thinking_indicator_survives_rerun_mid_turn(tmp_path):
+    """Files-rail-style st.rerun() aborts the script; session_state restores the spinner."""
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import files_rail
+import streamlit as st
+
+class InterruptDeepSeek:
+    def complete(self, messages, tools=None, temperature=0.2):
+        n = int(st.session_state.get("_calls") or 0) + 1
+        st.session_state["_calls"] = n
+        st.session_state[f"_think_{{n}}"] = dict(app.get_thinking_state())
+        st.session_state[f"_busy_{{n}}"] = bool(st.session_state.get("composer_busy"))
+        st.session_state[f"_turn_{{n}}"] = dict(app.get_turn_in_progress())
+        if n == 1:
+            st.session_state[files_rail.COMPONENT_KEY] = {{
+                "collapsed": True,
+                "selected": None,
+                "width_px": 320,
+            }}
+            st.rerun()
+        return {{"role": "assistant", "content": "Homework 4 is due Friday."}}
+
+class FakeCanvas:
+    tz = None
+
+store = app.ConversationStore({db_path!r})
+cid = store.create_conversation("Rerun chat")
+history = store.get_messages(cid)
+app.handle_user_prompt(
+    "when is homework 4 due?",
+    store=store,
+    conversation_id=cid,
+    history=history,
+    deepseek=InterruptDeepSeek(),
+    canvas=FakeCanvas(),
+    rerun=False,
+)
+st.session_state["_after"] = dict(app.get_thinking_state())
+st.session_state["_after_turn"] = dict(app.get_turn_in_progress())
+st.session_state["_after_busy"] = bool(st.session_state.get("composer_busy"))
+st.session_state["_stored"] = store.get_messages(cid)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    assert harness.session_state["_calls"] == 2
+    first = harness.session_state["_think_1"]
+    second = harness.session_state["_think_2"]
+    assert first["active"] is True
+    assert second["active"] is True
+    assert first["label"] in app.THINKING_LABELS
+    assert second["label"] in app.THINKING_LABELS
+    assert first["key"] == second["key"]
+    assert harness.session_state["_busy_1"] is True
+    assert harness.session_state["_busy_2"] is True
+    assert harness.session_state["_turn_1"]["active"] is True
+    assert harness.session_state["_turn_2"]["active"] is True
+    assert harness.session_state["_turn_2"]["prompt"] == "when is homework 4 due?"
+    after = harness.session_state["_after"]
+    assert after["active"] is False
+    assert harness.session_state["_after_turn"]["active"] is False
+    assert harness.session_state["_after_busy"] is False
+    assert harness.status == []
+    visible = _default_visible_text(harness)
+    assert "Homework 4 is due Friday." in visible
+    stored = harness.session_state["_stored"]
+    users = [message["content"] for message in stored if message.get("role") == "user"]
+    assistants = [message["content"] for message in stored if message.get("role") == "assistant"]
+    assert users == ["when is homework 4 due?"]
+    assert assistants == ["Homework 4 is due Friday."]
+    contents = [message.get("content") or "" for message in stored]
+    for label in app.THINKING_LABELS:
+        assert label not in contents
+    assert app.THINKING_ARIA_LABEL not in contents
+
+
+def test_thinking_indicator_restored_on_files_rail_value_change(tmp_path):
+    """Aborted turn + files-rail widget value: spinner comes back, still not in SQLite."""
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import files_rail
+import streamlit as st
+
+store = app.ConversationStore({db_path!r})
+cid = store.create_conversation("Rail chat")
+prompt = "when is homework 4 due?"
+if "seeded" not in st.session_state:
+    store.add_message(cid, {{"role": "user", "content": prompt}})
+    app.mark_turn_in_progress(conversation_id=cid, prompt=prompt, turn_seq=1)
+    st.session_state.composer_busy = True
+    st.session_state.command_picker_submit_seq = 3
+    st.session_state.seeded = True
+    st.session_state[files_rail.COMPONENT_KEY] = {{
+        "collapsed": False,
+        "selected": None,
+        "width_px": 320,
+    }}
+    st.rerun()
+
+st.session_state[files_rail.COMPONENT_KEY] = {{
+    "collapsed": True,
+    "selected": None,
+    "width_px": 360,
+}}
+history = store.get_messages(cid)
+app.apply_files_rail_value(
+    st.session_state.get(files_rail.COMPONENT_KEY),
+    conversation_id=cid,
+    files=[],
+)
+app.render_conversation(history)
+thinking = app.restore_thinking_for_active_turn(cid, history)
+st.session_state["_thinking"] = dict(app.get_thinking_state())
+st.session_state["_turn"] = dict(app.get_turn_in_progress())
+st.session_state["_busy"] = bool(st.session_state.get("composer_busy"))
+st.session_state["_stored"] = store.get_messages(cid)
+st.session_state["_has_thinking"] = thinking is not None
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    assert harness.session_state["_has_thinking"] is True
+    assert harness.session_state["_thinking"]["active"] is True
+    assert harness.session_state["_thinking"]["label"] in app.THINKING_LABELS
+    assert harness.session_state["_thinking"]["key"] == app.thinking_placeholder_key(
+        harness.session_state["_turn"]["conversation_id"], 1
+    )
+    assert harness.session_state["_turn"]["active"] is True
+    assert harness.session_state["_busy"] is True
+    assert len(harness.status) == 1
+    assert harness.status[0].icon == "spinner"
+    rendered = " ".join(str(element.value) for element in harness.markdown)
+    assert app.THINKING_ARIA_LABEL in rendered
+    stored = harness.session_state["_stored"]
+    assert [message["role"] for message in stored] == ["user"]
+    contents = [message.get("content") or "" for message in stored]
+    for label in app.THINKING_LABELS:
+        assert label not in contents
+    assert app.THINKING_ARIA_LABEL not in contents
+    assert harness.session_state.files_sidebar_collapsed is True
+
+
+def test_thinking_indicator_hidden_after_resume_completes(tmp_path):
+    """After a restored turn finishes (success), the spinner is gone and a second prompt works."""
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+class InstantDeepSeek:
+    def complete(self, messages, tools=None, temperature=0.2):
+        n = int(st.session_state.get("_turns") or 0) + 1
+        st.session_state["_turns"] = n
+        return {{"role": "assistant", "content": f"Answer {{n}}."}}
+
+class FakeCanvas:
+    tz = None
+
+store = app.ConversationStore({db_path!r})
+cid = store.create_conversation("Resume finish")
+prompt = "when is homework 4 due?"
+store.add_message(cid, {{"role": "user", "content": prompt}})
+app.mark_turn_in_progress(conversation_id=cid, prompt=prompt, turn_seq=1)
+st.session_state.command_picker_submit_seq = 1
+history = store.get_messages(cid)
+app.handle_user_prompt(
+    prompt,
+    store=store,
+    conversation_id=cid,
+    history=history,
+    deepseek=InstantDeepSeek(),
+    canvas=FakeCanvas(),
+    rerun=False,
+)
+st.session_state["_after_first"] = dict(app.get_thinking_state())
+st.session_state["_after_first_busy"] = bool(st.session_state.get("composer_busy"))
+st.session_state["_after_first_turn"] = dict(app.get_turn_in_progress())
+history = store.get_messages(cid)
+app.handle_user_prompt(
+    "and homework 5?",
+    store=store,
+    conversation_id=cid,
+    history=history,
+    deepseek=InstantDeepSeek(),
+    canvas=FakeCanvas(),
+    rerun=False,
+)
+st.session_state["_after"] = dict(app.get_thinking_state())
+st.session_state["_stored"] = store.get_messages(cid)
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    assert harness.session_state["_after_first"]["active"] is False
+    assert harness.session_state["_after_first_busy"] is False
+    assert harness.session_state["_after_first_turn"]["active"] is False
+    assert harness.session_state["_after"]["active"] is False
+    assert harness.status == []
+    stored = harness.session_state["_stored"]
+    users = [message["content"] for message in stored if message.get("role") == "user"]
+    assistants = [message["content"] for message in stored if message.get("role") == "assistant"]
+    assert users == ["when is homework 4 due?", "and homework 5?"]
+    assert assistants == ["Answer 1.", "Answer 2."]
+    contents = [message.get("content") or "" for message in stored]
+    for label in app.THINKING_LABELS:
+        assert label not in contents
+
+
+def test_resume_does_not_call_deepseek_when_answer_already_stored(tmp_path):
+    repo = str(Path(__file__).resolve().parents[1])
+    db_path = str(tmp_path / "history.db")
+    script = f"""
+import sys
+sys.path.insert(0, {repo!r})
+import app
+import streamlit as st
+
+class BoomIfCalled:
+    def complete(self, messages, tools=None, temperature=0.2):
+        st.session_state["_called"] = True
+        raise RuntimeError("should not call DeepSeek again")
+
+class FakeCanvas:
+    tz = None
+
+store = app.ConversationStore({db_path!r})
+cid = store.create_conversation("Already done")
+prompt = "when is homework 4 due?"
+store.add_message(cid, {{"role": "user", "content": prompt}})
+store.add_message(cid, {{"role": "assistant", "content": "Friday."}})
+app.mark_turn_in_progress(conversation_id=cid, prompt=prompt, turn_seq=2)
+st.session_state.command_picker_submit_seq = 4
+history = store.get_messages(cid)
+app.handle_user_prompt(
+    prompt,
+    store=store,
+    conversation_id=cid,
+    history=history,
+    deepseek=BoomIfCalled(),
+    canvas=FakeCanvas(),
+    rerun=False,
+)
+st.session_state["_called"] = bool(st.session_state.get("_called"))
+st.session_state["_after"] = dict(app.get_thinking_state())
+st.session_state["_stored"] = store.get_messages(cid)
+st.session_state["_turn"] = dict(app.get_turn_in_progress())
+"""
+    harness = AppTest.from_string(script, default_timeout=30).run()
+    assert not harness.exception, harness.exception
+    assert harness.session_state["_called"] is False
+    assert harness.session_state["_after"]["active"] is False
+    assert harness.session_state["_turn"]["active"] is False
+    stored = harness.session_state["_stored"]
+    users = [message["content"] for message in stored if message.get("role") == "user"]
+    assistants = [message["content"] for message in stored if message.get("role") == "assistant"]
+    assert users == ["when is homework 4 due?"]
+    assert assistants == ["Friday."]
+    assert harness.status == []
+
