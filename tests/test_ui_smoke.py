@@ -1292,7 +1292,9 @@ class FakeCanvas:
     tz = None
 
 store = app.ConversationStore({db_path!r})
-cid = store.create_conversation("Rerun chat")
+if "cid" not in st.session_state:
+    st.session_state.cid = store.create_conversation("Rerun chat")
+cid = st.session_state.cid
 history = store.get_messages(cid)
 app.handle_user_prompt(
     "when is homework 4 due?",
@@ -1353,7 +1355,9 @@ import files_rail
 import streamlit as st
 
 store = app.ConversationStore({db_path!r})
-cid = store.create_conversation("Rail chat")
+if "cid" not in st.session_state:
+    st.session_state.cid = store.create_conversation("Rail chat")
+cid = st.session_state.cid
 prompt = "when is homework 4 due?"
 if "seeded" not in st.session_state:
     store.add_message(cid, {{"role": "user", "content": prompt}})
