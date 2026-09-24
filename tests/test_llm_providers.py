@@ -372,12 +372,13 @@ def test_dispatch_tool_source_does_not_branch_on_provider():
 
 def test_run_agent_turn_uses_normalized_fields_not_provider_names():
     source = inspect.getsource(app.run_agent_turn)
-    assert "reply.tool_call" in source
-    assert "tool_name" in source
-    assert "tool_arguments" in source
-    assert "LLM_PROVIDER" not in source
-    assert "from_anthropic" not in source
-    assert "/chat/completions" not in source
+    body = source.split('"""', 2)[-1]
+    assert "reply.tool_call" in body
+    assert "tool_name" in body
+    assert "tool_arguments" in body
+    assert "LLM_PROVIDER" not in body
+    assert "from_anthropic" not in body
+    assert "/chat/completions" not in body
 
 
 def test_app_py_has_no_provider_http():
