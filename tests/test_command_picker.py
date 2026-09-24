@@ -55,7 +55,16 @@ def clean_streamlit_caches():
 
 
 def run_app(monkeypatch, tmp_path, env: dict[str, str]) -> AppTest:
-    for name in ("DEEPSEEK_API_KEY", "CANVAS_API_TOKEN", "CANVAS_BASE_URL", "CANVAS_ASSISTANT_TZ"):
+    for name in (
+        "DEEPSEEK_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "LLM_PROVIDER",
+        "LLM_MODEL",
+        "CANVAS_API_TOKEN",
+        "CANVAS_BASE_URL",
+        "CANVAS_ASSISTANT_TZ",
+    ):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -420,6 +429,7 @@ def test_main_second_submit_works_after_first_prompt(monkeypatch, tmp_path):
             self.tz = tz
 
     monkeypatch.setattr(command_picker, "mount", fake_mount)
+    monkeypatch.setattr(app, "get_llm_client", lambda *args, **kwargs: InstantDeepSeek())
     monkeypatch.setattr(app, "get_deepseek_client", lambda *args, **kwargs: InstantDeepSeek())
     monkeypatch.setattr(app, "get_canvas_client", lambda *args, **kwargs: FakeCanvas())
     harness = run_app(monkeypatch, tmp_path, DUMMY_ENV)

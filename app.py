@@ -7,8 +7,8 @@ courses, assignments and due dates. Run it with:
 
 Everything is local: the Streamlit UI, the SQLite conversation history and the
 Canvas API calls. Outbound traffic goes to the Canvas host you configure, to
-the DeepSeek API, and — only when the model calls open_url — to a public https
-URL, with no Canvas token attached.
+the configured LLM provider (DeepSeek, OpenAI, or Anthropic), and — only when
+the model calls open_url — to a public https URL, with no Canvas token attached.
 
 Safety: every Canvas request goes through ReadOnlySession, which refuses any
 HTTP method other than GET and refuses any host other than the configured
@@ -46,6 +46,22 @@ from streamlit.errors import StreamlitAPIException
 
 import command_picker
 import files_rail
+from llm.client import (
+    DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_DEEPSEEK_BASE_URL,
+    DEFAULT_DEEPSEEK_MODEL,
+    DEFAULT_OPENAI_BASE_URL,
+    DEFAULT_PROVIDER,
+    LLMClient,
+    LLMConfigError,
+    LLMError,
+    PROVIDER_API_KEY_ENV,
+    build_llm_client,
+    coerce_llm_response,
+    provider_key_value,
+    resolve_model,
+    resolve_provider,
+)
 
 # ---------------------------------------------------------------------------
 # Secret handling
@@ -87,8 +103,7 @@ logger.addFilter(RedactingFilter())
 # ---------------------------------------------------------------------------
 
 DEFAULT_CANVAS_BASE_URL = "https://canvas.cmu.edu"
-DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-flash"
+DEEPSEEK_MODEL = DEFAULT_DEEPSEEK_MODEL
 DEFAULT_DB_PATH = "canvas_assistant.db"
 DEFAULT_TIMEZONE = "America/New_York"
 USER_AGENT = "cmu-canvas-study-assistant/1.0"
@@ -135,41 +150,114 @@ BLOCKED_HOSTNAMES = {
 # Assignment prompts can be long; keep enough to be useful in a prompt budget.
 MAX_DESCRIPTION_CHARS = 8_000
 
-REQUIRED_ENV_VARS = ("DEEPSEEK_API_KEY", "CANVAS_API_TOKEN")
+REQUIRED_ENV_VARS = ("CANVAS_API_TOKEN",)
+SETTINGS_SOURCE_KEYS = (
+    "LLM_PROVIDER",
+    "LLM_MODEL",
+    "DEEPSEEK_MODEL",
+    "DEEPSEEK_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "DEEPSEEK_BASE_URL",
+    "OPENAI_BASE_URL",
+    "ANTHROPIC_BASE_URL",
+    "CANVAS_API_TOKEN",
+    "CANVAS_BASE_URL",
+    "CANVAS_ASSISTANT_DB",
+    "CANVAS_ASSISTANT_TZ",
+)
 
 
 @dataclass(frozen=True)
 class Settings:
     deepseek_api_key: str
     canvas_api_token: str
+    openai_api_key: str = ""
+    anthropic_api_key: str = ""
     canvas_base_url: str = DEFAULT_CANVAS_BASE_URL
     deepseek_base_url: str = DEFAULT_DEEPSEEK_BASE_URL
+    openai_base_url: str = DEFAULT_OPENAI_BASE_URL
+    anthropic_base_url: str = DEFAULT_ANTHROPIC_BASE_URL
+    llm_provider: str = DEFAULT_PROVIDER
     model: str = DEEPSEEK_MODEL
     db_path: str = DEFAULT_DB_PATH
     timezone: str = DEFAULT_TIMEZONE
+    config_error: str | None = None
 
     @property
     def missing(self) -> list[str]:
-        values = {
-            "DEEPSEEK_API_KEY": self.deepseek_api_key,
-            "CANVAS_API_TOKEN": self.canvas_api_token,
-        }
-        return [name for name in REQUIRED_ENV_VARS if not values[name].strip()]
+        names: list[str] = []
+        key_env = PROVIDER_API_KEY_ENV.get(self.llm_provider)
+        if key_env and not provider_key_value(self, self.llm_provider):
+            names.append(key_env)
+        if not self.canvas_api_token.strip():
+            names.append("CANVAS_API_TOKEN")
+        return names
+
+    def llm_api_key(self) -> str:
+        return provider_key_value(self, self.llm_provider)
+
+
+def _streamlit_secret_values() -> dict[str, str]:
+    """Read known settings keys from Streamlit secrets when a file is present."""
+    try:
+        secrets = st.secrets
+    except Exception:
+        return {}
+    found: dict[str, str] = {}
+    for key in SETTINGS_SOURCE_KEYS:
+        try:
+            value = secrets.get(key)
+        except Exception:
+            continue
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            found[key] = text
+    return found
+
+
+def settings_source(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Env vars win; Streamlit secrets fill blanks only when ``env`` is omitted."""
+    if env is not None:
+        return {str(key): str(value) for key, value in env.items() if value is not None}
+    source = {key: value for key, value in os.environ.items()}
+    for key, value in _streamlit_secret_values().items():
+        if not (source.get(key) or "").strip():
+            source[key] = value
+    return source
 
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
     """Build Settings from environment variables. Secrets are never defaulted."""
-    source = os.environ if env is None else env
+    source = settings_source(env)
+    raw_provider = source.get("LLM_PROVIDER", "")
+    provider, provider_error = resolve_provider(raw_provider)
+    model, model_error = resolve_model(
+        provider,
+        source.get("LLM_MODEL"),
+        source.get("DEEPSEEK_MODEL"),
+    )
+    config_error = provider_error or model_error
     settings = Settings(
         deepseek_api_key=source.get("DEEPSEEK_API_KEY", "").strip(),
+        openai_api_key=source.get("OPENAI_API_KEY", "").strip(),
+        anthropic_api_key=source.get("ANTHROPIC_API_KEY", "").strip(),
         canvas_api_token=source.get("CANVAS_API_TOKEN", "").strip(),
         canvas_base_url=(source.get("CANVAS_BASE_URL") or DEFAULT_CANVAS_BASE_URL).strip().rstrip("/"),
         deepseek_base_url=(source.get("DEEPSEEK_BASE_URL") or DEFAULT_DEEPSEEK_BASE_URL).strip().rstrip("/"),
-        model=(source.get("DEEPSEEK_MODEL") or DEEPSEEK_MODEL).strip(),
+        openai_base_url=(source.get("OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL).strip().rstrip("/"),
+        anthropic_base_url=(source.get("ANTHROPIC_BASE_URL") or DEFAULT_ANTHROPIC_BASE_URL).strip().rstrip("/"),
+        llm_provider=provider,
+        model=model,
         db_path=(source.get("CANVAS_ASSISTANT_DB") or DEFAULT_DB_PATH).strip(),
         timezone=resolve_timezone_name(source.get("CANVAS_ASSISTANT_TZ")),
+        config_error=config_error,
     )
     register_secret(settings.deepseek_api_key)
+    register_secret(settings.openai_api_key)
+    register_secret(settings.anthropic_api_key)
     register_secret(settings.canvas_api_token)
     return settings
 
@@ -2916,65 +3004,27 @@ def dispatch_tool(client: CanvasClient, name: str, arguments: dict[str, Any]) ->
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek client
+# LLM client (provider adapters live in llm/)
 # ---------------------------------------------------------------------------
 
-
-class DeepSeekError(RuntimeError):
-    """The DeepSeek chat completion call failed."""
+DeepSeekError = LLMError
 
 
-class DeepSeekClient:
-    """Minimal OpenAI-compatible chat completions client for DeepSeek.
+def __getattr__(name: str) -> Any:
+    """Lazy re-export so unused provider packages are never imported."""
+    if name == "DeepSeekClient":
+        from llm.deepseek import DeepSeekClient
 
-    This talks to DeepSeek, not Canvas, so it uses a plain session and POSTs.
-    The read-only guarantee applies to Canvas, whose traffic never touches this
-    session.
-    """
+        return DeepSeekClient
+    if name == "OpenAIClient":
+        from llm.openai import OpenAIClient
 
-    def __init__(self, api_key: str, base_url: str, model: str, timeout: float = 120.0) -> None:
-        self._api_key = api_key
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout = timeout
-        self.session = requests.Session()
+        return OpenAIClient
+    if name == "AnthropicClient":
+        from llm.anthropic import AnthropicClient
 
-    def complete(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        temperature: float = 0.2,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-        try:
-            response = self.session.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=self.timeout,
-            )
-        except requests.RequestException as exc:
-            raise DeepSeekError(f"Could not reach DeepSeek: {redact(exc)}") from exc
-
-        if response.status_code == 401:
-            raise DeepSeekError("DeepSeek rejected the API key (401). Check DEEPSEEK_API_KEY in your .env.")
-        if response.status_code >= 400:
-            raise DeepSeekError(f"DeepSeek returned HTTP {response.status_code}: {redact(response.text)[:300]}")
-        try:
-            data = response.json()
-            return data["choices"][0]["message"]
-        except (ValueError, KeyError, IndexError) as exc:
-            raise DeepSeekError("DeepSeek returned an unexpected response shape.") from exc
+        return AnthropicClient
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -3759,7 +3809,7 @@ def restore_thinking_for_active_turn(
 
 
 def run_agent_turn(
-    deepseek: DeepSeekClient,
+    llm: LLMClient,
     canvas: CanvasClient,
     history: list[dict[str, Any]],
     on_message: Callable[[dict[str, Any]], None] | None = None,
@@ -3774,8 +3824,11 @@ def run_agent_turn(
     ``on_activity`` receives generic stage keys (thinking / canvas / answer) so
     the UI can keep a spinner alive without exposing tool traces.
     A leading slash command is parsed locally (no extra model call) and only
-    the remaining request text is sent to DeepSeek. Skill files are loaded
-    before the first model call; a missing file raises ``SkillLoadError``.
+    the remaining request text is sent to the configured LLM. Skill files are
+    loaded before the first model call; a missing file raises ``SkillLoadError``.
+    Provider responses are normalized to text / tool_call / tool_name /
+    tool_arguments before Canvas tools run, so this loop does not branch on
+    ``LLM_PROVIDER``.
     """
 
     def activity(stage: str) -> None:
@@ -3808,14 +3861,9 @@ def run_agent_turn(
             on_message(message)
 
     for _ in range(max_tool_rounds):
-        reply = deepseek.complete(working, tools=TOOL_SCHEMAS)
-        tool_calls = reply.get("tool_calls") or []
-        assistant_message: dict[str, Any] = {
-            "role": "assistant",
-            "content": reply.get("content") or "",
-        }
-        if tool_calls:
-            assistant_message["tool_calls"] = tool_calls
+        reply = coerce_llm_response(llm.complete(working, tools=TOOL_SCHEMAS))
+        assistant_message = reply.as_assistant_message()
+        if reply.tool_call:
             emit(assistant_message)
         else:
             if not (assistant_message["content"] or "").strip() and produced:
@@ -3826,13 +3874,9 @@ def run_agent_turn(
             return produced
 
         activity(THINKING_STAGE_CANVAS)
-        for call in tool_calls:
-            function = call.get("function") or {}
-            name = function.get("name", "")
-            try:
-                arguments = json.loads(function.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
+        for call in reply.tool_calls:
+            name = call.tool_name
+            arguments = call.tool_arguments
             try:
                 result = dispatch_tool(canvas, name, arguments)
             except Exception as exc:
@@ -3840,7 +3884,7 @@ def run_agent_turn(
             emit(
                 {
                     "role": "tool",
-                    "tool_call_id": call.get("id"),
+                    "tool_call_id": call.id,
                     "name": name,
                     "content": json.dumps(result, default=str),
                 }
@@ -3878,8 +3922,13 @@ def get_canvas_client(_settings: Settings, cache_key: str) -> CanvasClient:
 
 
 @st.cache_resource(show_spinner=False)
-def get_deepseek_client(_settings: Settings, cache_key: str) -> DeepSeekClient:
-    return DeepSeekClient(_settings.deepseek_api_key, _settings.deepseek_base_url, _settings.model)
+def get_llm_client(_settings: Settings, cache_key: str) -> LLMClient:
+    return build_llm_client(_settings)
+
+
+@st.cache_resource(show_spinner=False)
+def get_deepseek_client(_settings: Settings, cache_key: str) -> LLMClient:
+    return get_llm_client(_settings, cache_key)
 
 
 @st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
@@ -4854,7 +4903,7 @@ def handle_user_prompt(
     store: ConversationStore,
     conversation_id: int,
     history: list[dict[str, Any]],
-    deepseek: DeepSeekClient,
+    deepseek: LLMClient,
     canvas: CanvasClient,
     rerun: bool = True,
 ) -> None:
@@ -5216,11 +5265,14 @@ def render_file_panel(
 def render_sidebar(settings: Settings, store: ConversationStore) -> None:
     with st.sidebar:
         st.subheader("Configuration")
-        for name, value in (
-            ("DEEPSEEK_API_KEY", settings.deepseek_api_key),
-            ("CANVAS_API_TOKEN", settings.canvas_api_token),
-        ):
+        provider_key = PROVIDER_API_KEY_ENV.get(settings.llm_provider)
+        status_rows: list[tuple[str, str]] = []
+        if provider_key:
+            status_rows.append((provider_key, settings.llm_api_key()))
+        status_rows.append(("CANVAS_API_TOKEN", settings.canvas_api_token))
+        for name, value in status_rows:
             st.write(f"{'OK' if value else 'MISSING'} — `{name}`")
+        st.write(f"Provider: `{settings.llm_provider}`")
         st.write(f"Canvas: `{settings.canvas_base_url}`")
         st.write(f"Model: `{settings.model}`")
         st.caption("Token values are never shown here, logged, or sent to non-Canvas URLs.")
@@ -5288,6 +5340,10 @@ def main() -> None:
     store = get_store(settings.db_path)
     render_sidebar(settings, store)
 
+    if settings.config_error:
+        st.error(settings.config_error)
+        st.stop()
+
     if settings.missing:
         st.error(
             "Missing environment variables: "
@@ -5305,7 +5361,15 @@ def main() -> None:
 
     canvas = get_canvas_client(settings, settings.canvas_base_url)
     canvas.set_timezone(st.session_state.get("timezone") or settings.timezone)
-    deepseek = get_deepseek_client(settings, f"{settings.deepseek_base_url}:{settings.model}")
+    try:
+        deepseek = get_llm_client(
+            settings,
+            f"{settings.llm_provider}:{settings.model}:"
+            f"{settings.deepseek_base_url}:{settings.openai_base_url}:{settings.anthropic_base_url}",
+        )
+    except LLMConfigError as exc:
+        st.error(str(exc))
+        st.stop()
 
     history = store.get_messages(conversation_id)
     remember_opened_files_from_messages(store, conversation_id, history)

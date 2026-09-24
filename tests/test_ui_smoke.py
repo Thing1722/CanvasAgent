@@ -34,7 +34,16 @@ def clean_streamlit_caches():
 
 
 def run_app(monkeypatch, tmp_path, env: dict[str, str]) -> AppTest:
-    for name in ("DEEPSEEK_API_KEY", "CANVAS_API_TOKEN", "CANVAS_BASE_URL", "CANVAS_ASSISTANT_TZ"):
+    for name in (
+        "DEEPSEEK_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "LLM_PROVIDER",
+        "LLM_MODEL",
+        "CANVAS_API_TOKEN",
+        "CANVAS_BASE_URL",
+        "CANVAS_ASSISTANT_TZ",
+    ):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -59,6 +68,41 @@ def test_app_explains_missing_configuration(monkeypatch, tmp_path):
     message = harness.error[0].value
     assert "DEEPSEEK_API_KEY" in message and "CANVAS_API_TOKEN" in message
     assert not harness.chat_input
+
+
+def test_app_explains_missing_openai_key_without_asking_for_deepseek(monkeypatch, tmp_path):
+    harness = run_app(
+        monkeypatch,
+        tmp_path,
+        {
+            "LLM_PROVIDER": "openai",
+            "LLM_MODEL": "gpt-4o-mini",
+            "CANVAS_API_TOKEN": DUMMY_ENV["CANVAS_API_TOKEN"],
+        },
+    )
+    assert not harness.exception
+    message = harness.error[0].value
+    assert "OPENAI_API_KEY" in message
+    assert "DEEPSEEK_API_KEY" not in message
+    assert DUMMY_ENV["CANVAS_API_TOKEN"] not in message
+
+
+def test_app_explains_unknown_provider_without_falling_back(monkeypatch, tmp_path):
+    harness = run_app(
+        monkeypatch,
+        tmp_path,
+        {
+            **DUMMY_ENV,
+            "LLM_PROVIDER": "grok",
+            "LLM_MODEL": "anything",
+        },
+    )
+    assert not harness.exception
+    message = harness.error[0].value
+    assert "Unknown LLM_PROVIDER" in message
+    assert "grok" in message
+    assert "does not switch" in message.lower() or "not switch" in message.lower()
+    assert DUMMY_ENV["DEEPSEEK_API_KEY"] not in message
 
 
 def test_sidebar_never_renders_secret_values(monkeypatch, tmp_path):
