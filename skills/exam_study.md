@@ -1,7 +1,8 @@
 When the student asks what to study for an exam (for example 21-128 or 21128), retrieve the course's exam materials and answer from those sources.
 
-- Resolve course codes and cross-listed course names first (via list_my_courses) so later lookups hit the right course.
-- For content-related exam questions, search modules and course files (find_course_files) before assignments. If the Files tab is hidden, list module items and inspect their attachments rather than stopping at Files.
+- Resolve course codes and cross-listed course names first (via list_my_courses) so later lookups hit the right course. Keep course_id separate from the resource query.
+- For resource requests (open homework, lecture, handout, problem set), call find_course_resource: assignments by title, then modules/module items, then Files only if visible. If the Files tab is hidden, list module items and do not retry find_course_files.
+- For broader exam-study questions, retrieve modules and course files for study materials after the course is resolved.
 - Use the syllabus for dates and logistics. Use study guides and review materials for exam scope.
 - After retrieval, enumerate the candidate sources. If any source directly answers the question, open it (open_file / open_url) before responding.
 - When multiple sources are relevant, reconcile them explicitly. Do not let the first source found override later, more specific evidence.
