@@ -46,6 +46,7 @@ from streamlit.errors import StreamlitAPIException
 
 import command_picker
 import files_rail
+import resource_lookup
 from llm.client import (
     DEFAULT_ANTHROPIC_BASE_URL,
     DEFAULT_DEEPSEEK_BASE_URL,
@@ -590,6 +591,11 @@ LOOKUP_OUTCOMES = (
     LOOKUP_OUTCOME_SUCCESSFUL,
 )
 
+titles_match = resource_lookup.titles_match
+title_match_score = resource_lookup.title_match_score
+parse_resource_request = resource_lookup.parse_resource_request
+human_search_query = resource_lookup.human_search_query
+
 GENERIC_LOOKUP_FALLBACK = (
     "Here's what I found. Ask if you want more detail, for example about a single course."
 )
@@ -628,11 +634,14 @@ def match_enrolled_courses(courses: list[dict[str, Any]], query: str) -> list[di
     for course in courses:
         name = str(course.get("name") or "")
         code = str(course.get("course_code") or "")
+        course_id = str(course.get("course_id") or "")
         haystack = f"{name} {code}".lower()
         compact_hay = compact_course_key(haystack)
         if (
             term in haystack
             or (compact and compact in compact_hay)
+            or compact == compact_course_key(course_id)
+            or term == course_id
             or matches_all_words(haystack, term)
         ):
             matched.append(course)
@@ -822,7 +831,7 @@ INTENT_ASSIGNMENT_SUMMARY = "assignment_summary"
 INTENT_EXAM_STUDY = "exam_study"
 INTENT_COURSE_CONTENT = "course_content"
 SOURCE_RECORD_FIELDS = ("title", "source_type", "canonical_url")
-EXPLICIT_OPEN_TOOLS = frozenset({"open_file", "open_url"})
+EXPLICIT_OPEN_TOOLS = frozenset({"open_file", "open_url", "find_course_resource", "find_course_modules"})
 _MATH_SCRIPT_RE = re.compile(
     r'<script([^>]*type=["\']math/tex[^"\']*["\'][^>]*)>(.*?)</script>',
     re.IGNORECASE | re.DOTALL,
@@ -1003,9 +1012,24 @@ class CanvasClient:
         # Public https URLs. GET only, no Canvas token, no cookies.
         self.external_session = ExternalGetSession()
         self.external_session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+        self.lookup_session = resource_lookup.ResourceLookupSession()
+        self._courses_cache: list[dict[str, Any]] | None = None
 
     def set_timezone(self, tz: str | ZoneInfo | None) -> None:
         self.tz = as_zoneinfo(tz)
+
+    def reset_lookup_turn(self, user_text: str = "") -> resource_lookup.ResourceLookupSession:
+        """Start a tool loop: keep hidden-Files memory, drop duplicate-search keys."""
+        hidden = set(self.lookup_session.files_tab_hidden)
+        prefer = set(self.lookup_session.prefer_modules)
+        session = resource_lookup.ResourceLookupSession(
+            files_tab_hidden=hidden,
+            prefer_modules=prefer,
+        )
+        if user_text:
+            session.bind_user_text(user_text)
+        self.lookup_session = session
+        return session
 
     def _describe_due(self, due: datetime | None, now: datetime | None = None) -> dict[str, Any]:
         return describe_due(due, now=now, tz=self.tz)
@@ -1082,6 +1106,8 @@ class CanvasClient:
     # -- data -------------------------------------------------------------
 
     def list_courses(self, include_concluded: bool = False) -> list[dict[str, Any]]:
+        if not include_concluded and self._courses_cache is not None:
+            return [dict(row) for row in self._courses_cache]
         params: dict[str, Any] = {"include[]": "term"}
         if include_concluded:
             params["state[]"] = ["available", "completed"]
@@ -1102,6 +1128,8 @@ class CanvasClient:
                     "html_url": f"{self.base_url}/courses/{row.get('id')}",
                 }
             )
+        if not include_concluded:
+            self._courses_cache = [dict(row) for row in courses]
         return courses
 
     def list_assignments(
@@ -1124,10 +1152,14 @@ class CanvasClient:
     ) -> list[dict[str, Any]]:
         courses = self.list_courses()
         if course_id is not None:
-            return [c for c in courses if c["course_id"] == int(course_id)]
+            matched = [c for c in courses if c["course_id"] == int(course_id)]
+            if matched:
+                self.lookup_session.remember_course(matched[0])
+            return matched
         if course and str(course).strip():
             matched = match_enrolled_courses(courses, str(course))
             if len(matched) == 1:
+                self.lookup_session.remember_course(matched[0])
                 return matched
             raise CourseLookupError(
                 (
@@ -1487,24 +1519,39 @@ class CanvasClient:
                 )
         return found
 
-    def collect_course_files(self, course: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    def collect_course_files(
+        self,
+        course: dict[str, Any],
+        *,
+        skip_files_tab: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         """Gather a course's files from every place a student can see them."""
         course_id = course["course_id"]
         name = course.get("name") or f"course {course_id}"
         candidates: dict[Any, dict[str, Any]] = {}
         notes: list[str] = []
+        files_hidden = skip_files_tab or self.lookup_session.files_are_hidden(course_id)
 
-        try:
-            for row in self._files_from_files_tab(course_id):
-                candidates[row.get("id")] = row
-        except CanvasAccessError:
-            notes.append(f"{name}: the Files tab is hidden, so only files posted in Modules are visible.")
-        except CanvasError as exc:
-            notes.append(f"{name}: could not list Files ({exc})")
+        if files_hidden:
+            notes.append(
+                f"{name}: the Files tab is hidden, so only files posted in Modules are visible."
+            )
+        else:
+            try:
+                for row in self._files_from_files_tab(course_id):
+                    candidates[row.get("id")] = row
+            except CanvasAccessError:
+                self.lookup_session.mark_files_hidden(int(course_id))
+                files_hidden = True
+                notes.append(
+                    f"{name}: the Files tab is hidden, so only files posted in Modules are visible."
+                )
+            except CanvasError as exc:
+                notes.append(f"{name}: could not list Files ({exc})")
 
         # Modules are the fallback when Files is hidden or empty, which is how
         # most courses that "have no files" actually publish their handouts.
-        if not candidates:
+        if not candidates or files_hidden:
             try:
                 for row in self._files_from_modules(course_id):
                     candidates.setdefault(row["id"], row)
@@ -1540,7 +1587,8 @@ class CanvasClient:
         course: str | None = None,
     ) -> dict[str, Any]:
         """Search files/modules and also collect near-miss titles for suggestions."""
-        term = (query or "").strip()
+        session = self.lookup_session
+        term = session.sanitize_query(query, course_id=course_id, course=course)
         notes: list[str] = []
         matched: list[tuple[dict[str, Any], dict[str, Any]]] = []
         near_miss_titles: list[str] = []
@@ -1550,10 +1598,27 @@ class CanvasClient:
                 notes = [f"Course {course_id} is not one of your active courses."]
             else:
                 notes = ["No active courses were returned by Canvas."]
-            return {"files": [], "notes": notes, "suggestions": []}
+            return {
+                "files": [],
+                "notes": notes,
+                "suggestions": [],
+                "query": term,
+            }
+
+        if resource_lookup.looks_like_course_id_query(
+            query, course_id=course_id or session.course_id, course=course, course_code=session.course_code
+        ) and not term:
+            notes.append(
+                "The file search query looked like a course id, so it was ignored. "
+                "Pass the resource name (for example 'hw 4') in query and the Canvas id in course_id."
+            )
+            return {"files": [], "notes": notes, "suggestions": [], "query": term}
 
         for enrolled in courses:
-            candidates, course_notes = self.collect_course_files(enrolled)
+            skip_files = session.files_are_hidden(enrolled["course_id"])
+            candidates, course_notes = self.collect_course_files(
+                enrolled, skip_files_tab=skip_files
+            )
             notes.extend(course_notes)
             for row in candidates:
                 haystack = " ".join(
@@ -1566,7 +1631,11 @@ class CanvasClient:
                     if part
                 )
                 title = str(row.get("display_name") or row.get("filename") or "").strip()
-                if term and not matches_all_words(haystack, term):
+                if term and not (
+                    resource_lookup.titles_match(term, title)
+                    or resource_lookup.titles_match(term, haystack)
+                    or matches_all_words(haystack, term)
+                ):
                     if title:
                         near_miss_titles.append(title)
                     continue
@@ -1588,7 +1657,486 @@ class CanvasClient:
                     pass
             files.append(self._normalize_file(row, enrolled))
         suggestions = suggest_close_labels(term, near_miss_titles) if term and not files else []
-        return {"files": files, "notes": notes, "suggestions": suggestions}
+        return {"files": files, "notes": notes, "suggestions": suggestions, "query": term}
+
+    def _list_module_rows(self, course_id: int) -> list[dict[str, Any]]:
+        """GET /api/v1/courses/{id}/modules?include[]=items, following items_url."""
+        rows: list[dict[str, Any]] = []
+        for module in self.get_list(f"courses/{int(course_id)}/modules", {"include[]": "items"}):
+            items = module.get("items")
+            if items is None and module.get("items_url"):
+                try:
+                    items = self.get_list(module["items_url"])
+                except CanvasError:
+                    items = []
+            rows.append({**module, "items": list(items or [])})
+        return rows
+
+    def _normalize_module_item(
+        self, item: dict[str, Any], module: dict[str, Any], course: dict[str, Any]
+    ) -> dict[str, Any]:
+        item_type = str(item.get("type") or "")
+        return {
+            "title": item.get("title") or item.get("page_url"),
+            "type": item_type,
+            "content_id": item.get("content_id"),
+            "module": module.get("name"),
+            "module_id": module.get("id"),
+            "page_url": item.get("page_url"),
+            "external_url": item.get("external_url") or item.get("url"),
+            "html_url": item.get("html_url"),
+            "course_id": course.get("course_id"),
+            "course_name": course.get("name"),
+            "course_code": course.get("course_code"),
+        }
+
+    def find_assignments_by_title(
+        self,
+        query: str | None = None,
+        course_id: int | None = None,
+        course: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """GET assignments and match titles locally (hw 4 == Homework 4)."""
+        session = self.lookup_session
+        term = session.sanitize_query(query, course_id=course_id, course=course)
+        courses = self._course_lookup(course_id, course)
+        notes: list[str] = []
+        if not courses:
+            if course_id is not None:
+                notes = [f"Course {course_id} is not one of your active courses."]
+            else:
+                notes = ["No active courses were returned by Canvas."]
+            return {"assignments": [], "notes": notes, "query": term}
+        if resource_lookup.looks_like_course_id_query(
+            query, course_id=course_id or session.course_id, course=course, course_code=session.course_code
+        ) and not term:
+            return {
+                "assignments": [],
+                "notes": [
+                    "The search query looked like a course id, so it was ignored. "
+                    "Pass the assignment name in query."
+                ],
+                "query": term,
+            }
+        scored: list[tuple[int, dict[str, Any]]] = []
+        near: list[str] = []
+        for enrolled in courses:
+            session.remember_course(enrolled)
+            try:
+                rows = self.list_assignments(enrolled["course_id"])
+            except CanvasError as exc:
+                notes.append(f"{course_display_name(enrolled)}: could not list assignments ({exc})")
+                continue
+            for row in rows:
+                title = str(row.get("name") or "")
+                score = resource_lookup.title_match_score(term, title) if term else 1
+                if term and score == 0:
+                    if title:
+                        near.append(title)
+                    continue
+                scored.append((score, self._normalize_assignment(row, enrolled)))
+        scored.sort(key=lambda pair: (-pair[0], str(pair[1].get("title") or "")))
+        assignments = [item for _score, item in scored[: max(1, int(limit))]]
+        suggestions = suggest_close_labels(term or "", near) if term and not assignments else []
+        return {
+            "assignments": assignments,
+            "notes": notes,
+            "suggestions": suggestions,
+            "query": term,
+        }
+
+    def find_course_modules(
+        self,
+        query: str | None = None,
+        course_id: int | None = None,
+        course: str | None = None,
+        limit: int = 40,
+    ) -> dict[str, Any]:
+        """GET modules with items and match item titles locally."""
+        session = self.lookup_session
+        term = session.sanitize_query(query, course_id=course_id, course=course)
+        courses = self._course_lookup(course_id, course)
+        notes: list[str] = []
+        if not courses:
+            if course_id is not None:
+                notes = [f"Course {course_id} is not one of your active courses."]
+            else:
+                notes = ["No active courses were returned by Canvas."]
+            return {"modules": [], "items": [], "notes": notes, "query": term}
+        if resource_lookup.looks_like_course_id_query(
+            query, course_id=course_id or session.course_id, course=course, course_code=session.course_code
+        ) and not term:
+            return {
+                "modules": [],
+                "items": [],
+                "notes": [
+                    "The search query looked like a course id, so it was ignored. "
+                    "Pass the resource name in query."
+                ],
+                "query": term,
+            }
+        scored: list[tuple[int, dict[str, Any]]] = []
+        modules_out: list[dict[str, Any]] = []
+        near: list[str] = []
+        for enrolled in courses:
+            session.remember_course(enrolled)
+            try:
+                module_rows = self._list_module_rows(enrolled["course_id"])
+            except CanvasAccessError:
+                notes.append(f"{course_display_name(enrolled)}: Modules are not visible.")
+                continue
+            except CanvasError as exc:
+                notes.append(f"{course_display_name(enrolled)}: could not read Modules ({exc})")
+                continue
+            for module in module_rows:
+                modules_out.append(
+                    {
+                        "module_id": module.get("id"),
+                        "name": module.get("name"),
+                        "course_id": enrolled.get("course_id"),
+                        "course_name": enrolled.get("name"),
+                        "item_count": len(module.get("items") or []),
+                    }
+                )
+                for item in module.get("items") or []:
+                    if str(item.get("type") or "") == "SubHeader":
+                        continue
+                    normalized = self._normalize_module_item(item, module, enrolled)
+                    title = str(normalized.get("title") or "")
+                    score = resource_lookup.title_match_score(term, title) if term else 1
+                    if term and score == 0:
+                        if title:
+                            near.append(title)
+                        continue
+                    scored.append((score, normalized))
+        scored.sort(key=lambda pair: (-pair[0], str(pair[1].get("title") or "")))
+        items = [item for _score, item in scored[: max(1, int(limit))]]
+        suggestions = suggest_close_labels(term or "", near) if term and not items else []
+        return {
+            "modules": modules_out,
+            "items": items,
+            "notes": notes,
+            "suggestions": suggestions,
+            "query": term,
+        }
+
+    def get_course_page(self, course_id: int, page_url: str) -> dict[str, Any]:
+        """GET /api/v1/courses/{id}/pages/{url} (read-only)."""
+        slug = (page_url or "").strip().strip("/")
+        if not slug:
+            raise CanvasError("A Canvas page url is required.")
+        response = self._get(self._url(f"courses/{int(course_id)}/pages/{slug}"))
+        try:
+            row = response.json()
+        except ValueError as exc:
+            raise CanvasError(f"Canvas returned a non-JSON response for page {slug!r}.") from exc
+        body = row.get("body") or ""
+        text, links, url_links = html_to_text_and_links(body, base_url=self.base_url)
+        return {
+            "title": row.get("title") or slug,
+            "page_url": row.get("url") or slug,
+            "html_url": row.get("html_url"),
+            "body_text": text or None,
+            "attached_files": [{"file_id": file_id, "filename": name} for file_id, name in links],
+            "linked_urls": url_links,
+            "course_id": int(course_id),
+        }
+
+    def get_quiz(self, course_id: int, quiz_id: int) -> dict[str, Any]:
+        """GET /api/v1/courses/{id}/quizzes/{id} when Canvas allows it."""
+        response = self._get(self._url(f"courses/{int(course_id)}/quizzes/{int(quiz_id)}"))
+        try:
+            row = response.json()
+        except ValueError as exc:
+            raise CanvasError(f"Canvas returned a non-JSON response for quiz {quiz_id}.") from exc
+        description = row.get("description") or ""
+        text, _links, url_links = html_to_text_and_links(description, base_url=self.base_url)
+        return {
+            "quiz_id": row.get("id") or quiz_id,
+            "title": row.get("title"),
+            "html_url": row.get("html_url"),
+            "question_count": row.get("question_count"),
+            "time_limit": row.get("time_limit"),
+            "description": text or None,
+            "linked_urls": url_links,
+            "course_id": int(course_id),
+        }
+
+    def pick_best_title_match(
+        self, query: str | None, rows: list[dict[str, Any]], title_key: str = "title"
+    ) -> dict[str, Any] | None:
+        """Return the unique best title match, or None when tied/absent."""
+        if not query or not rows:
+            return None
+        scored = sorted(
+            ((resource_lookup.title_match_score(query, str(row.get(title_key) or "")), row) for row in rows),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
+        if not scored or scored[0][0] <= 0:
+            return None
+        best = scored[0][0]
+        winners = [row for score, row in scored if score == best]
+        if len(winners) != 1:
+            return None
+        return winners[0]
+
+    def find_course_resource(
+        self,
+        query: str | None = None,
+        course_id: int | None = None,
+        course: str | None = None,
+    ) -> dict[str, Any]:
+        """Search assignments, then modules, then files. Open the first good match."""
+        session = self.lookup_session
+        term = session.sanitize_query(query, course_id=course_id, course=course)
+        types_searched: list[str] = []
+        notes: list[str] = []
+        results: list[dict[str, Any]] = []
+        courses = self._course_lookup(course_id, course)
+        if not courses:
+            if course_id is not None:
+                raise CanvasError(f"Course {course_id} is not one of your active courses.")
+            return {
+                "query": term,
+                "notes": ["No active courses were returned by Canvas."],
+                "resource_types_searched": types_searched,
+                "results": [],
+                "opened": False,
+            }
+        enrolled = courses[0]
+        if len(courses) > 1 and course_id is None and not (course and str(course).strip()):
+            # Unscoped search: try each course until one unique match opens.
+            enrolled = courses[0]
+        session.remember_course(enrolled)
+        if resource_lookup.looks_like_course_id_query(
+            query, course_id=enrolled.get("course_id"), course=course, course_code=session.course_code
+        ) and not term:
+            return {
+                "query": None,
+                "course_id": enrolled.get("course_id"),
+                "course_name": enrolled.get("name"),
+                "notes": [
+                    "The search query looked like a course id, so it was ignored. "
+                    "Pass the resource name (for example 'hw 4') in query."
+                ],
+                "resource_types_searched": types_searched,
+                "results": [],
+                "opened": False,
+            }
+        if not term:
+            return {
+                "query": term,
+                "course_id": enrolled.get("course_id"),
+                "course_name": enrolled.get("name"),
+                "notes": ["A resource name is required, for example 'hw 4' or 'lecture 5'."],
+                "resource_types_searched": types_searched,
+                "results": [],
+                "opened": False,
+            }
+
+        targets = [enrolled] if (course_id is not None or (course and str(course).strip())) else courses
+        for candidate in targets:
+            session.remember_course(candidate)
+            cid = candidate["course_id"]
+            found = self._search_one_course_resource(candidate, term, types_searched, notes, results)
+            if found:
+                found["query"] = term
+                found["course_id"] = cid
+                found["course_name"] = candidate.get("name")
+                found["course_code"] = candidate.get("course_code") or session.course_code
+                found["resource_types_searched"] = list(types_searched)
+                found["notes"] = notes
+                found["results"] = results
+                found["opened"] = True
+                return found
+
+        return {
+            "query": term,
+            "course_id": session.course_id or enrolled.get("course_id"),
+            "course_name": session.course_name or enrolled.get("name"),
+            "course_code": session.course_code,
+            "notes": notes,
+            "resource_types_searched": types_searched,
+            "results": results,
+            "opened": False,
+        }
+
+    def _search_one_course_resource(
+        self,
+        course: dict[str, Any],
+        term: str,
+        types_searched: list[str],
+        notes: list[str],
+        results: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        course_id = course["course_id"]
+        session = self.lookup_session
+
+        if "assignments" not in types_searched:
+            types_searched.append("assignments")
+        assignments = self.find_assignments_by_title(term, course_id=course_id)
+        notes.extend(assignments.get("notes") or [])
+        for row in assignments.get("assignments") or []:
+            results.append({"type": "Assignment", "title": row.get("title"), "id": row.get("assignment_id")})
+        best_assignment = self.pick_best_title_match(term, assignments.get("assignments") or [])
+        if best_assignment and best_assignment.get("assignment_id") is not None:
+            details = self.get_assignment_details(
+                int(best_assignment["assignment_id"]), course_id=course_id
+            )
+            return {
+                "selected_resource": {
+                    "type": "Assignment",
+                    "title": details.get("title"),
+                    "assignment_id": details.get("assignment_id"),
+                    "course_id": course_id,
+                },
+                "assignment": details,
+                "displayed_to_student": False,
+                "note": (
+                    "Opened the matching assignment. Answer from these details. "
+                    "Do not search Files next."
+                ),
+            }
+
+        if "modules" not in types_searched:
+            types_searched.append("modules")
+        if "module_items" not in types_searched:
+            types_searched.append("module_items")
+        modules = self.find_course_modules(term, course_id=course_id)
+        notes.extend(modules.get("notes") or [])
+        for row in modules.get("items") or []:
+            results.append(
+                {
+                    "type": row.get("type"),
+                    "title": row.get("title"),
+                    "id": row.get("content_id"),
+                    "module": row.get("module"),
+                }
+            )
+        best_item = self.pick_best_title_match(term, modules.get("items") or [])
+        if best_item:
+            opened = self.open_module_item(course, best_item)
+            opened["selected_resource"] = {
+                "type": best_item.get("type"),
+                "title": best_item.get("title"),
+                "content_id": best_item.get("content_id"),
+                "module": best_item.get("module"),
+                "course_id": course_id,
+            }
+            opened["note"] = (
+                str(opened.get("note") or "")
+                + " Matching module item opened. Stop searching."
+            ).strip()
+            return opened
+
+        files_hidden = session.files_are_hidden(course_id)
+        if files_hidden:
+            notes.append(
+                f"{course_display_name(course)}: Files tab is hidden; not searching Files."
+            )
+            return None
+        if "files" not in types_searched:
+            types_searched.append("files")
+        searched = self.search_course_files(query=term, course_id=course_id)
+        notes.extend(searched.get("notes") or [])
+        for row in searched.get("files") or []:
+            results.append({"type": "File", "title": row.get("filename"), "id": row.get("file_id")})
+        best_file = self.pick_best_title_match(
+            term, searched.get("files") or [], title_key="filename"
+        )
+        if best_file and best_file.get("file_id") is not None:
+            opened = _open_file_result(self, int(best_file["file_id"]))
+            opened["selected_resource"] = {
+                "type": "File",
+                "title": best_file.get("filename"),
+                "file_id": best_file.get("file_id"),
+                "course_id": course_id,
+            }
+            return opened
+        return None
+
+    def open_module_item(self, course: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a module item by type and open the linked resource (GET only)."""
+        item_type = str(item.get("type") or "")
+        course_id = int(course.get("course_id") or item.get("course_id"))
+        content_id = item.get("content_id")
+        title = item.get("title") or "module item"
+        if item_type == "File" and content_id not in (None, ""):
+            result = _open_file_result(self, int(content_id))
+            result["opened_via"] = "module_item"
+            return result
+        if item_type == "Assignment" and content_id not in (None, ""):
+            details = self.get_assignment_details(int(content_id), course_id=course_id)
+            return {
+                "assignment": details,
+                "displayed_to_student": False,
+                "opened_via": "module_item",
+                "note": (
+                    "This module item is an assignment. Answer from the details. "
+                    "html_url is metadata until the final answer."
+                ),
+            }
+        if item_type == "Page":
+            slug = str(item.get("page_url") or "").strip()
+            if not slug:
+                raise CanvasError(f"Module page {title!r} has no page url to open.")
+            page = self.get_course_page(course_id, slug)
+            result: dict[str, Any] = {
+                "page": page,
+                "displayed_to_student": False,
+                "opened_via": "module_item",
+                "note": "Opened the Canvas page. Answer from body_text; do not invent contents.",
+            }
+            if page.get("body_text"):
+                result["text_excerpt"] = page["body_text"]
+            return result
+        if item_type == "ExternalUrl":
+            url = str(item.get("external_url") or item.get("html_url") or "").strip()
+            if not url:
+                raise CanvasError(f"Module item {title!r} has no external URL.")
+            result = _open_url_result(self, url)
+            result["opened_via"] = "module_item"
+            return result
+        if item_type == "Quiz":
+            if content_id in (None, ""):
+                return {
+                    "quiz": {"title": title, "course_id": course_id},
+                    "opened": False,
+                    "note": (
+                        f"Quiz {title!r} was found in Modules, but details were not opened "
+                        "because no quiz id was provided."
+                    ),
+                }
+            try:
+                quiz = self.get_quiz(course_id, int(content_id))
+            except CanvasError:
+                return {
+                    "quiz": {"title": title, "quiz_id": content_id, "course_id": course_id},
+                    "opened": False,
+                    "note": (
+                        f"Quiz {title!r} was found in Modules, but details were not opened. "
+                        "This app only uses GET and does not invent quiz contents."
+                    ),
+                }
+            result = {
+                "quiz": quiz,
+                "displayed_to_student": False,
+                "opened_via": "module_item",
+                "note": "Opened quiz details (GET only). Do not invent questions that are not listed.",
+            }
+            if quiz.get("description"):
+                result["text_excerpt"] = quiz["description"]
+            return result
+        return {
+            "module_item": item,
+            "opened": False,
+            "note": (
+                f"Module item {title!r} is type {item_type or 'unknown'}. "
+                "It was found but not opened."
+            ),
+        }
 
     def get_file_metadata(self, file_id: int) -> dict[str, Any]:
         response = self._get(self._url(f"files/{int(file_id)}"))
@@ -1857,19 +2405,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "find_course_files",
             "description": (
-                "Find files posted in the student's courses — lecture slides, PDFs, handouts, "
-                "syllabi — searching both the Files area and Modules. Returns file ids and "
-                "metadata, not the file contents. Use open_file afterwards to show a file. "
-                "Call with no query to list everything available. If it returns nothing, read "
-                "the 'notes' field: it says which courses could not be searched and why. Files "
-                "attached to a specific assignment appear in get_assignment_details instead."
+                "Supplemental file search only. query is the resource name such as 'hw 4' or "
+                "'syllabus' — never the Canvas course_id. Resolve the course once with "
+                "list_my_courses and pass course_id separately. Prefer find_course_resource "
+                "for 'open hw 4' / lecture / handout / problem set requests. If notes say the "
+                "Files tab is hidden or resources are posted in Modules, do not call this "
+                "again; use find_course_modules. Call with no query to list available files."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Text to search for in file names, for example 'syllabus' or 'lecture 5'.",
+                        "description": (
+                            "Resource name to search for, for example 'hw 4' or 'lecture 5'. "
+                            "Never pass a course_id here."
+                        ),
                     },
                     "course_id": {
                         "type": "integer",
@@ -1888,6 +2439,98 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_assignments_by_title",
+            "description": (
+                "Search assignment titles in a course (GET /assignments). query is the "
+                "human name ('hw 4', 'problem set 4'), never the course_id. Matches "
+                "Homework 4 / HW4. Use this before Files when the student asks to open "
+                "homework or a problem set."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Assignment title text, for example 'hw 4'. Never a course_id.",
+                    },
+                    "course_id": {
+                        "type": "integer",
+                        "description": "Canvas course id from list_my_courses.",
+                    },
+                    "course": {
+                        "type": "string",
+                        "description": "Course name or code such as '21-128' or '21128'.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_course_modules",
+            "description": (
+                "List module items (GET /modules?include[]=items) and match titles. Primary "
+                "search when the Files tab is hidden or notes say materials live in Modules. "
+                "query is 'hw 4' / 'lecture 5', never a course_id. Returns File, Assignment, "
+                "Page, ExternalUrl, and Quiz items. Do not call find_course_files after this "
+                "if Files is hidden."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Module item title to match. Never a course_id.",
+                    },
+                    "course_id": {
+                        "type": "integer",
+                        "description": "Canvas course id from list_my_courses.",
+                    },
+                    "course": {
+                        "type": "string",
+                        "description": "Course name or code such as '21-128' or '21128'.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_course_resource",
+            "description": (
+                "Preferred lookup for 'open hw 4', 'show the Putnam handout', 'find lecture 5', "
+                "or 'open problem set 4'. Resolves the course code once to course_id, keeps "
+                "query as the resource name, then searches assignments, then module items, "
+                "then Files only if the Files tab is visible. Opens the matching resource and "
+                "stops. query must never be the course_id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Resource name such as 'hw 4'. Never a course_id.",
+                    },
+                    "course_id": {
+                        "type": "integer",
+                        "description": "Canvas course id after resolving the course code once.",
+                    },
+                    "course": {
+                        "type": "string",
+                        "description": "Course name or code such as '21128' or '21-128'.",
+                    },
+                },
+                "required": ["query"],
             },
         },
     },
@@ -2304,6 +2947,9 @@ TOOL_ENDPOINTS: dict[str, str] = {
     "list_my_courses": "GET /api/v1/courses",
     "list_upcoming_assignments": "GET /api/v1/courses/{course_id}/assignments",
     "find_due_dates": "GET /api/v1/courses/{course_id}/assignments",
+    "find_assignments_by_title": "GET /api/v1/courses/{course_id}/assignments",
+    "find_course_modules": "GET /api/v1/courses/{course_id}/modules?include[]=items",
+    "find_course_resource": "GET /api/v1/courses/{course_id}/assignments",
     "find_course_files": "GET /api/v1/courses/{course_id}/files",
     "open_file": "GET /api/v1/files/{file_id}",
     "get_assignment_details": "GET /api/v1/courses/{course_id}/assignments/{assignment_id}",
@@ -2315,6 +2961,9 @@ TOOL_RESOURCE_TYPES: dict[str, list[str]] = {
     "list_my_courses": ["courses"],
     "list_upcoming_assignments": ["assignments"],
     "find_due_dates": ["assignments"],
+    "find_assignments_by_title": ["assignments"],
+    "find_course_modules": ["modules", "module_items"],
+    "find_course_resource": ["assignments", "modules", "module_items"],
     "find_course_files": ["files", "modules"],
     "open_file": ["files"],
     "get_assignment_details": ["assignments"],
@@ -2351,7 +3000,15 @@ def _optional_course_id(args: dict[str, Any]) -> int | None:
     return int(raw)
 
 
-def _lookup_query(name: str, args: dict[str, Any]) -> str | None:
+def _lookup_query(name: str, args: dict[str, Any], result: dict[str, Any] | None = None) -> str | None:
+    payload = result or {}
+    from_result = payload.get("query")
+    if from_result not in (None, ""):
+        text = str(from_result).strip()
+        if not resource_lookup.looks_like_course_id_query(
+            text, course_id=_optional_course_id(args) if args.get("course_id") not in (None, "") else None
+        ):
+            return text
     if name == "open_url":
         raw = str(args.get("url") or "").strip()
         return raw or None
@@ -2364,30 +3021,44 @@ def _lookup_query(name: str, args: dict[str, Any]) -> str | None:
     raw = args.get("query")
     if raw in (None, ""):
         return _optional_course_arg(args)
-    return str(raw).strip() or None
+    text = str(raw).strip()
+    if resource_lookup.looks_like_course_id_query(
+        text,
+        course_id=_optional_course_id(args) if args.get("course_id") not in (None, "") else None,
+        course=_optional_course_arg(args),
+    ):
+        return None
+    return text or None
 
 
 def _lookup_course_text(args: dict[str, Any], result: dict[str, Any] | None = None) -> str | None:
     named = _optional_course_arg(args)
-    if named:
+    if named and not str(named).strip().isdigit():
         return named
     payload = result or {}
-    for key in ("assignment", "submission", "file"):
+    if payload.get("course_name"):
+        return str(payload["course_name"])
+    for key in ("assignment", "submission", "file", "page", "quiz", "selected_resource"):
         obj = payload.get(key)
         if isinstance(obj, dict) and obj.get("course_name"):
             return str(obj["course_name"])
-    for collection in ("courses", "assignments", "files"):
+    for collection in ("courses", "assignments", "files", "items", "modules", "results"):
         rows = payload.get(collection)
         if isinstance(rows, list) and rows and isinstance(rows[0], dict) and rows[0].get("course_name"):
             return str(rows[0]["course_name"])
         if isinstance(rows, list) and rows and isinstance(rows[0], dict) and rows[0].get("name") and collection == "courses":
             return str(rows[0]["name"])
-    if args.get("course_id") not in (None, ""):
-        return str(args["course_id"])
+    if named and not str(named).strip().isdigit():
+        return named
     return None
 
 
 def _selected_resource_title(result: dict[str, Any]) -> str | None:
+    selected = result.get("selected_resource")
+    if isinstance(selected, dict):
+        title = str(selected.get("title") or selected.get("filename") or "").strip()
+        if title:
+            return title
     file_obj = result.get("file")
     if isinstance(file_obj, dict):
         return str(file_obj.get("filename") or file_obj.get("title") or "").strip() or None
@@ -2397,6 +3068,12 @@ def _selected_resource_title(result: dict[str, Any]) -> str | None:
     assignment = result.get("assignment")
     if isinstance(assignment, dict):
         return str(assignment.get("title") or "").strip() or None
+    page = result.get("page")
+    if isinstance(page, dict):
+        return str(page.get("title") or "").strip() or None
+    quiz = result.get("quiz")
+    if isinstance(quiz, dict):
+        return str(quiz.get("title") or "").strip() or None
     submission = result.get("submission")
     if isinstance(submission, dict):
         return str(submission.get("title") or "").strip() or None
@@ -2413,11 +3090,19 @@ def _result_count(name: str, result: dict[str, Any]) -> int:
     count = result.get("count")
     if isinstance(count, int):
         return count
-    for key in ("courses", "assignments", "files"):
+    for key in ("courses", "assignments", "files", "items", "results"):
         value = result.get(key)
         if isinstance(value, list):
             return len(value)
-    if result.get("assignment") or result.get("submission") or result.get("file") or result.get("resource"):
+    if (
+        result.get("assignment")
+        or result.get("submission")
+        or result.get("file")
+        or result.get("resource")
+        or result.get("page")
+        or result.get("quiz")
+        or result.get("selected_resource")
+    ):
         return 1
     return 0
 
@@ -2430,19 +3115,30 @@ def _notes_block_search(notes: list[str]) -> bool:
             "could not list",
             "could not read",
             "not visible",
-            "files tab is hidden",
             "could not reach",
         )
     )
 
 
 def _resource_types_for(name: str, result: dict[str, Any]) -> list[str]:
+    listed = result.get("resource_types_searched")
+    if isinstance(listed, list) and listed:
+        return [str(item) for item in listed if item]
     if name == "open_url":
         if result.get("opened_via") == "open_file" or result.get("file"):
             return ["files"]
         if result.get("assignment"):
             return ["assignments"]
         return ["pages"]
+    if name == "find_course_resource":
+        types: list[str] = []
+        if result.get("assignment"):
+            types.append("assignments")
+        if result.get("page") or result.get("quiz") or result.get("module_item"):
+            types.extend(["modules", "module_items"])
+        if result.get("file"):
+            types.append("files")
+        return types or list(TOOL_RESOURCE_TYPES.get(name, []))
     return list(TOOL_RESOURCE_TYPES.get(name, []))
 
 
@@ -2471,6 +3167,13 @@ def build_lookup(
     resource_types_searched: list[str] | None = None,
     matching_courses: list[str] | None = None,
     suggested_alternatives: list[str] | None = None,
+    course_id: int | None = None,
+    course_name: str | None = None,
+    course_code: str | None = None,
+    results: list[dict[str, Any]] | None = None,
+    selected_resource: dict[str, Any] | None = None,
+    original_user_query: str | None = None,
+    normalized_search_query: str | None = None,
 ) -> dict[str, Any]:
     """Structured lookup metadata attached to every Canvas tool result."""
     if outcome not in LOOKUP_OUTCOMES:
@@ -2479,14 +3182,30 @@ def build_lookup(
         category = None
     else:
         category = error_category or outcome
+    display_query = resource_lookup.human_search_query(
+        {
+            "query": query,
+            "course_id": course_id,
+            "course_code": course_code,
+            "normalized_search_query": normalized_search_query or query,
+            "original_user_query": original_user_query,
+        }
+    ) or query
     return {
         "outcome": outcome,
         "tool": tool,
         "endpoint": endpoint or TOOL_ENDPOINTS.get(tool) or tool,
         "course": course,
-        "query": query,
+        "course_name": course_name,
+        "course_id": course_id,
+        "course_code": course_code,
+        "query": display_query,
+        "original_user_query": original_user_query,
+        "normalized_search_query": normalized_search_query or display_query,
         "result_count": int(result_count or 0),
         "selected_resource_title": selected_resource_title,
+        "selected_resource": selected_resource,
+        "results": list(results or []),
         "opened": opened,
         "readable_text": readable_text,
         "error_category": category,
@@ -2600,6 +3319,18 @@ def infer_lookup(
     if isinstance(result.get("lookup"), dict) and result["lookup"].get("outcome"):
         return result["lookup"]
 
+    if result.get("skipped"):
+        return build_lookup(
+            outcome=LOOKUP_OUTCOME_SUCCESSFUL,
+            tool=name,
+            course=_lookup_course_text(args, result),
+            query=_lookup_query(name, args, result),
+            result_count=0,
+            resource_types_searched=_resource_types_for(name, result),
+            course_id=result.get("course_id"),
+            course_name=result.get("course_name"),
+        )
+
     error = result.get("error")
     if error:
         lookup = _lookup_from_error_text(name, args, str(error))
@@ -2610,7 +3341,7 @@ def infer_lookup(
         return lookup
 
     course = _lookup_course_text(args, result)
-    query = _lookup_query(name, args)
+    query = _lookup_query(name, args, result)
     title = _selected_resource_title(result)
     count = _result_count(name, result)
     types = _resource_types_for(name, result)
@@ -2649,11 +3380,22 @@ def infer_lookup(
             resource_types_searched=types,
         )
 
-    if name in {"open_file", "open_url"}:
-        opened = bool(result.get("file") or result.get("resource") or result.get("assignment"))
+    if name in {"open_file", "open_url"} or (
+        name in {"find_course_resource", "find_course_modules"}
+        and (result.get("file") or result.get("resource") or result.get("page") or result.get("assignment") or result.get("quiz"))
+    ):
+        opened = bool(
+            result.get("file")
+            or result.get("resource")
+            or result.get("assignment")
+            or result.get("page")
+            or (result.get("quiz") and result.get("opened") is not False)
+        )
         readable = bool(
             result.get("text_excerpt")
             or (isinstance(result.get("assignment"), dict) and result["assignment"].get("instructions"))
+            or (isinstance(result.get("page"), dict) and result["page"].get("body_text"))
+            or (isinstance(result.get("quiz"), dict) and result["quiz"].get("description"))
         )
         if not opened:
             return build_lookup(
@@ -2725,6 +3467,62 @@ def infer_lookup(
     )
 
 
+def _enrich_lookup(
+    lookup: dict[str, Any],
+    args: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Fill course_id / query fields without letting course_id replace the search string."""
+    if lookup.get("course_id") is None:
+        raw = result.get("course_id")
+        if raw in (None, "") and args.get("course_id") not in (None, ""):
+            raw = args.get("course_id")
+        try:
+            if raw not in (None, ""):
+                lookup["course_id"] = int(raw)
+        except (TypeError, ValueError):
+            pass
+    if not lookup.get("course_name"):
+        name = result.get("course_name")
+        if name and not str(name).strip().isdigit():
+            lookup["course_name"] = str(name)
+    if not lookup.get("course"):
+        named = _optional_course_arg(args)
+        lookup["course"] = named if named and not str(named).strip().isdigit() else (
+            lookup.get("course_name") or _lookup_course_text(args, result)
+        )
+    if not lookup.get("course_code") and result.get("course_code"):
+        lookup["course_code"] = result.get("course_code")
+    if lookup.get("selected_resource") is None and isinstance(result.get("selected_resource"), dict):
+        lookup["selected_resource"] = result["selected_resource"]
+    if not lookup.get("results"):
+        for key in ("results", "items", "files", "assignments"):
+            value = result.get(key)
+            if isinstance(value, list):
+                lookup["results"] = value
+                break
+        else:
+            lookup.setdefault("results", [])
+    query = resource_lookup.human_search_query(
+        lookup,
+        fallback=str(result.get("query") or args.get("query") or "") or None,
+    )
+    if query:
+        lookup["query"] = query
+        lookup["normalized_search_query"] = lookup.get("normalized_search_query") or query
+    if resource_lookup.looks_like_course_id_query(
+        str(lookup.get("query") or ""),
+        course_id=lookup.get("course_id"),
+        course=str(lookup.get("course_code") or args.get("course") or ""),
+    ):
+        lookup["query"] = lookup.get("normalized_search_query") or result.get("query")
+    lookup.setdefault("selected_resource", None)
+    lookup.setdefault("results", [])
+    lookup.setdefault("course_id", None)
+    lookup.setdefault("course_name", None)
+    return lookup
+
+
 def attach_lookup(
     name: str,
     args: dict[str, Any],
@@ -2739,6 +3537,7 @@ def attach_lookup(
     if not isinstance(result.get("lookup"), dict) or not result["lookup"].get("outcome"):
         result["lookup"] = infer_lookup(name, args, result, course_error=course_error)
     lookup = result["lookup"]
+    _enrich_lookup(lookup, args, result)
     if lookup.get("error_category"):
         lookup["error_category"] = safe_error_text(lookup["error_category"])
     return result
@@ -2789,9 +3588,13 @@ def compose_lookup_reply(
     if not lookup:
         return None
     outcome = lookup.get("outcome")
-    query = str(lookup.get("query") or "").strip()
+    query = resource_lookup.human_search_query(lookup, user_text=user_text) or str(
+        lookup.get("query") or ""
+    ).strip()
     user_query = (user_text or "").strip()
-    course = str(lookup.get("course") or "").strip()
+    course = str(lookup.get("course_name") or lookup.get("course") or "").strip()
+    if course.isdigit():
+        course = ""
     title = str(lookup.get("selected_resource_title") or "").strip()
     types: list[str] = []
     for item in lookups:
@@ -2823,10 +3626,16 @@ def compose_lookup_reply(
         return f"Several courses match {target!r}: {names}. Which one did you mean?"
 
     if outcome == LOOKUP_OUTCOME_NO_MATCHING_RESOURCE:
-        target = query or title or course or user_query or "that request"
+        target = resource_lookup.human_search_query(lookup, user_text=user_query) or query or title or "that request"
+        if target.isdigit() and str(lookup.get("course_id") or "") == target:
+            target = user_query or "that request"
         type_text = ", ".join(types) if types else "the available Canvas materials"
+        where = ""
+        course_name = str(lookup.get("course_name") or course or "").strip()
+        if course_name and not course_name.isdigit():
+            where = f" in {course_name}"
         message = (
-            f"I couldn't find a Canvas resource matching {target!r}. "
+            f"I couldn't find a Canvas resource matching {target!r}{where}. "
             f"I searched {type_text}, but no matching item was returned."
         )
         return message + alt_clause()
@@ -2878,6 +3687,7 @@ def _invoke_canvas_tool(
     client: CanvasClient, name: str, args: dict[str, Any]
 ) -> dict[str, Any]:
     course_name = _optional_course_arg(args)
+    session = _client_lookup_session(client)
     if name == "list_my_courses":
         courses = client.list_courses(include_concluded=bool(args.get("include_concluded", False)))
         if course_name:
@@ -2898,6 +3708,10 @@ def _invoke_canvas_tool(
                     "_matching_courses": [course_display_name(course) for course in matched],
                 }
             courses = matched
+            if courses:
+                session.remember_course(courses[0])
+        if len(courses) == 1:
+            session.remember_course(courses[0])
         return {"courses": courses, "count": len(courses)}
     if name == "list_upcoming_assignments":
         assignments = client.list_upcoming_assignments(
@@ -2931,12 +3745,92 @@ def _invoke_canvas_tool(
         }
         if notes:
             payload["notes"] = notes
-        if not files:
+        payload["query"] = searched.get("query")
+        payload["course_id"] = session.course_id
+        payload["course_name"] = session.course_name
+        hidden = any("files tab is hidden" in str(note).lower() for note in notes)
+        if hidden:
             payload["hint"] = (
-                "No files matched. Try again with no query to see everything, or tell the "
-                "student the file may be attached to an assignment (check "
-                "get_assignment_details) or posted somewhere this app cannot read."
+                "The Files tab is hidden. Do not call find_course_files again. "
+                "Search module items with find_course_modules or find_course_resource."
             )
+        elif not files:
+            payload["hint"] = (
+                "No files matched. Search assignments and module items next "
+                "(find_course_resource or find_course_modules). Files attached to an "
+                "assignment appear in get_assignment_details."
+            )
+        return payload
+    if name == "find_assignments_by_title":
+        searched = client.find_assignments_by_title(
+            query=args.get("query"),
+            course_id=_optional_course_id(args) if args.get("course_id") not in (None, "") else None,
+            course=course_name,
+        )
+        assignments = searched.get("assignments") or []
+        payload = {
+            "assignments": assignments,
+            "count": len(assignments),
+            "query": searched.get("query"),
+            "course_id": session.course_id,
+            "course_name": session.course_name,
+            "_suggestions": searched.get("suggestions") or [],
+        }
+        if searched.get("notes"):
+            payload["notes"] = searched["notes"]
+        return payload
+    if name == "find_course_modules":
+        searched = client.find_course_modules(
+            query=args.get("query"),
+            course_id=_optional_course_id(args) if args.get("course_id") not in (None, "") else None,
+            course=course_name,
+        )
+        items = searched.get("items") or []
+        payload = {
+            "modules": searched.get("modules") or [],
+            "items": items,
+            "count": len(items),
+            "query": searched.get("query"),
+            "course_id": session.course_id,
+            "course_name": session.course_name,
+            "_suggestions": searched.get("suggestions") or [],
+        }
+        if searched.get("notes"):
+            payload["notes"] = searched["notes"]
+        best = client.pick_best_title_match(searched.get("query"), items) if searched.get("query") else None
+        if best and session.course_id is not None:
+            opened = client.open_module_item(
+                {
+                    "course_id": session.course_id,
+                    "name": session.course_name,
+                },
+                best,
+            )
+            payload.update(opened)
+            payload["selected_resource"] = {
+                "type": best.get("type"),
+                "title": best.get("title"),
+                "content_id": best.get("content_id"),
+                "course_id": session.course_id,
+            }
+            payload["hint"] = "Matching module item opened. Stop searching Files."
+        elif not items:
+            payload["hint"] = (
+                "No module items matched. If Files is hidden, do not retry find_course_files."
+            )
+        return payload
+    if name == "find_course_resource":
+        searched = client.find_course_resource(
+            query=args.get("query"),
+            course_id=_optional_course_id(args) if args.get("course_id") not in (None, "") else None,
+            course=course_name,
+        )
+        payload = dict(searched)
+        payload["count"] = 1 if searched.get("opened") or searched.get("selected_resource") else len(
+            searched.get("results") or []
+        )
+        if searched.get("opened"):
+            payload["hint"] = "Resource opened. Stop searching and answer from this result."
         return payload
     if name == "get_assignment_details":
         if args.get("assignment_id") in (None, ""):
@@ -2987,9 +3881,79 @@ def _invoke_canvas_tool(
     return {"error": f"Unknown tool {name!r}. Available tools: {', '.join(TOOL_NAMES)}."}
 
 
+def _client_lookup_session(client: Any) -> resource_lookup.ResourceLookupSession:
+    session = getattr(client, "lookup_session", None)
+    if isinstance(session, resource_lookup.ResourceLookupSession):
+        return session
+    session = resource_lookup.ResourceLookupSession()
+    try:
+        client.lookup_session = session
+    except Exception:
+        pass
+    return session
+
+
+def _sanitize_tool_args(client: Any, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Keep query as the resource name; course_id stays a separate field."""
+    args = dict(arguments or {})
+    session = _client_lookup_session(client)
+    course_id = None
+    if args.get("course_id") not in (None, ""):
+        try:
+            course_id = int(args["course_id"])
+            session.course_id = course_id
+        except (TypeError, ValueError):
+            course_id = None
+    if name in resource_lookup.RESOURCE_SEARCH_TOOLS:
+        original_query = args.get("query")
+        cleaned = session.sanitize_query(
+            original_query, course_id=course_id, course=args.get("course")
+        )
+        if original_query not in (None, "") or cleaned:
+            args["query"] = cleaned
+        args["_original_tool_query"] = original_query
+        if args.get("course_id") in (None, "") and session.course_id is not None:
+            args["course_id"] = session.course_id
+        if not args.get("course") and session.course_code:
+            args["course"] = session.course_code
+    return args
+
+
+def _search_course_id(args: dict[str, Any], client: Any) -> int | None:
+    if args.get("course_id") not in (None, ""):
+        try:
+            return int(args["course_id"])
+        except (TypeError, ValueError):
+            return None
+    return _client_lookup_session(client).course_id
+
+
 def dispatch_tool(client: CanvasClient, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run one read-only Canvas tool and return a JSON-serializable result."""
-    args = arguments or {}
+    args = _sanitize_tool_args(client, name, arguments or {})
+    session = _client_lookup_session(client)
+    course_id = _search_course_id(args, client)
+    query = args.get("query") if name in resource_lookup.RESOURCE_SEARCH_TOOLS else None
+    endpoint = TOOL_ENDPOINTS.get(name, name)
+    if name in resource_lookup.RESOURCE_SEARCH_TOOLS and session.already_attempted(
+        endpoint, course_id, query
+    ):
+        skipped = {
+            "skipped": True,
+            "count": 0,
+            "query": query,
+            "course_id": course_id,
+            "course_name": session.course_name,
+            "notes": [
+                "Already searched this endpoint for this query. Do not repeat the same search."
+            ],
+            "hint": (
+                "Do not call this tool again with the same query. If Files is hidden, "
+                "search modules instead of Files."
+            ),
+            "resource_types_searched": list(TOOL_RESOURCE_TYPES.get(name, [])),
+        }
+        return attach_lookup(name, args, skipped)
     try:
         result = _invoke_canvas_tool(client, name, args)
     except Exception as exc:
@@ -2999,7 +3963,24 @@ def dispatch_tool(client: CanvasClient, name: str, arguments: dict[str, Any]) ->
         # not isinstance of the CanvasError bound here — catching only
         # CanvasError used to let the error crash the page.
         result = {"error": safe_error_text(exc)}
-        return attach_lookup(name, args, result, course_error=exc)
+        attached = attach_lookup(name, args, result, course_error=exc)
+        if name in resource_lookup.RESOURCE_SEARCH_TOOLS:
+            session.record_attempt(endpoint, course_id, query)
+            session.record_attempt(name, course_id, query)
+        return attached
+    if name in resource_lookup.RESOURCE_SEARCH_TOOLS:
+        session.record_attempt(endpoint, course_id, query)
+        session.record_attempt(name, course_id, query)
+        if name == "find_course_resource":
+            types = result.get("resource_types_searched") or []
+            if "assignments" in types:
+                session.record_attempt(
+                    TOOL_ENDPOINTS["find_assignments_by_title"], course_id, query
+                )
+            if "modules" in types or "module_items" in types:
+                session.record_attempt(TOOL_ENDPOINTS["find_course_modules"], course_id, query)
+            if "files" in types:
+                session.record_attempt(TOOL_ENDPOINTS["find_course_files"], course_id, query)
     return attach_lookup(name, args, result)
 
 
@@ -3853,6 +4834,7 @@ def run_agent_turn(
         if message.get("role") == "user":
             user_text = str(message.get("content") or "")
             break
+    canvas.reset_lookup_turn(user_text) if hasattr(canvas, "reset_lookup_turn") else None
 
     def emit(message: dict[str, Any]) -> None:
         produced.append(message)
@@ -4191,6 +5173,8 @@ def tool_result_should_preview_file(name: str | None, payload: Any) -> bool:
     """File previews only for files the agent explicitly opened."""
     if not isinstance(payload, dict) or payload.get("error"):
         return False
+    if payload.get("file") and payload.get("displayed_to_student"):
+        return True
     if name == "open_file" and payload.get("file"):
         return True
     if name == "open_url" and payload.get("file"):
@@ -4208,7 +5192,7 @@ def source_records_from_tool_message(message: dict[str, Any]) -> list[dict[str, 
     name = message.get("name") or ""
     records: list[dict[str, Any]] = []
 
-    if name in {"list_upcoming_assignments", "find_due_dates"}:
+    if name in {"list_upcoming_assignments", "find_due_dates", "find_assignments_by_title"}:
         for item in payload.get("assignments") or []:
             if not isinstance(item, dict):
                 continue
@@ -4246,7 +5230,9 @@ def source_records_from_tool_message(message: dict[str, Any]) -> list[dict[str, 
             )
         return records
 
-    if name == "get_assignment_details" and isinstance(payload.get("assignment"), dict):
+    if name in {"get_assignment_details", "find_course_resource", "find_course_modules"} and isinstance(
+        payload.get("assignment"), dict
+    ):
         assignment = payload["assignment"]
         url = _assignment_canonical_url(assignment)
         records.append(
@@ -4346,10 +5332,12 @@ def infer_source_intent(
         return skill
     names = [name for name in (tool_names or []) if name]
     name_set = set(names)
-    content_tools = {"find_course_files", "open_file"}
+    content_tools = {"find_course_files", "open_file", "find_course_modules", "find_course_resource"}
     if name_set & content_tools and "get_assignment_details" not in name_set:
         return INTENT_COURSE_CONTENT
     if "find_course_files" in name_set and "get_assignment_details" in name_set:
+        return INTENT_COURSE_CONTENT
+    if "find_course_resource" in name_set and name_set & {"get_assignment_details", "find_assignments_by_title"}:
         return INTENT_COURSE_CONTENT
     if "get_assignment_details" in name_set:
         return INTENT_ASSIGNMENT_SUMMARY
@@ -4564,9 +5552,16 @@ def opened_file_entries_from_tool_message(message: dict[str, Any]) -> list[dict[
         seen.add(entry["identity"])
         entries.append(entry)
 
-    if payload.get("file") and name in {"open_file", "open_url"}:
+    if payload.get("file") and name in {
+        "open_file",
+        "open_url",
+        "find_course_resource",
+        "find_course_modules",
+    }:
         add(_canvas_file_panel_entry(payload["file"], tool_call_id=tool_call_id))
-    elif name == "open_url" and isinstance(payload.get("resource"), dict):
+    elif name in {"open_url", "find_course_resource", "find_course_modules"} and isinstance(
+        payload.get("resource"), dict
+    ):
         add(
             _url_panel_entry(
                 payload["resource"],
@@ -4635,7 +5630,7 @@ def render_tool_message(message: dict[str, Any], canvas: CanvasClient | None = N
         return
     if name == "open_url" and payload.get("assignment"):
         return
-    if name == "open_url" and payload.get("url"):
+    if name in {"open_url", "find_course_resource", "find_course_modules"} and payload.get("url"):
         render_url_preview(canvas, payload, tool_call_id=tool_call_id)
         return
     if name == "get_assignment_details":

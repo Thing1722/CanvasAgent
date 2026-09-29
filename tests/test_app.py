@@ -734,6 +734,9 @@ def test_tool_schemas_are_well_formed():
         "list_upcoming_assignments",
         "find_due_dates",
         "find_course_files",
+        "find_assignments_by_title",
+        "find_course_modules",
+        "find_course_resource",
         "open_file",
         "get_assignment_details",
         "get_my_submission",
@@ -812,7 +815,7 @@ def test_dispatch_find_course_files_explains_an_empty_result(client_factory):
     result = app.dispatch_tool(client, "find_course_files", {"query": "CGA"})
     assert result["count"] == 0
     assert result["notes"]
-    assert "get_assignment_details" in result["hint"]
+    assert "find_course_modules" in result["hint"] or "do not call find_course_files" in result["hint"].lower()
 
 
 # --- assignment details ----------------------------------------------------
@@ -1991,8 +1994,8 @@ def test_system_prompt_includes_retrieval_routing():
     assert "cross-listed" in prompt
     assert "date-related" in prompt
     assert "content-related" in prompt
-    assert "modules and course files" in prompt
-    assert "before assignments" in prompt
+    assert "modules and course files" in prompt or "find_course_resource" in prompt
+    assert "assignments by title" in prompt
     assert "Files tab is hidden" in prompt
     assert "module items" in prompt
     assert "enumerate the candidate sources" in prompt
